@@ -354,11 +354,28 @@ fn run_with_timeout(mut command: Command, timeout: Duration, args: &[&str]) -> R
     Err(classify(&stderr, &stdout, args))
 }
 
+/// `lower` without the numbers after `line` and `column` (where a JSON parse error happened:
+/// `invalid type: null, expected a boolean at line 1 column 42912`), so they are never read as
+/// an HTTP status (429, 401, 404) below.
+fn without_parse_positions(lower: &str) -> String {
+    let mut words: Vec<&str> = Vec::new();
+    for word in lower.split_whitespace() {
+        let number = word.trim_end_matches(|c: char| c.is_ascii_punctuation());
+        let position = !number.is_empty()
+            && number.bytes().all(|b| b.is_ascii_digit())
+            && matches!(words.last(), Some(&("line" | "column")));
+        if !position {
+            words.push(word);
+        }
+    }
+    words.join(" ")
+}
+
 /// Maps spotify_player's stderr (`Bad request: …`) to a structured error.
 #[must_use]
 pub fn classify(stderr: &str, stdout: &str, args: &[&str]) -> Error {
     let text = if stderr.is_empty() { stdout } else { stderr };
-    let lower = text.to_ascii_lowercase();
+    let lower = without_parse_positions(&text.to_ascii_lowercase());
     let details = serde_json::json!({
         "command": format!("spotify_player {}", args.join(" ")),
         "stderr": crate::model::truncate(text, 600),
@@ -686,6 +703,16 @@ mod tests {
             "invalid_input"
         );
         assert_eq!(c("Bad request: something odd"), "spotify_player_failed");
+        // Where its own parser failed is no HTTP status (`spotify_player search`, 0.25).
+        for column in ["101264", "42912", "14011", "4040"] {
+            assert_eq!(
+                c(&format!(
+                    "Bad request: json parse error: invalid type: null, expected a boolean at line 1 column {column}: invalid type: null, expected a boolean at line 1 column {column}"
+                )),
+                "spotify_player_failed",
+                "column {column}"
+            );
+        }
         assert_eq!(
             c(
                 "Error: try to connect to a client\n\nCaused by:\n    Address already in use (os error 48)"

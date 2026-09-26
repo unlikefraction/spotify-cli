@@ -116,7 +116,7 @@ pub fn classify(message: &str, number: Option<i64>) -> Error {
         Some(-1743) => Error::new(
             "automation_permission_denied",
             "macOS blocked this process from controlling Spotify (Automation permission is off or was never granted).",
-            "Open System Settings → Privacy & Security → Automation, find spotify-daemon (or your terminal) and enable Spotify. If it is not listed, run `tccutil reset AppleEvents com.unlikefraction.spotify-daemon` (if macOS answers that there is no such bundle identifier, `tccutil reset AppleEvents` works but makes every app ask again) and retry so macOS asks. `spotify doctor` re-checks.",
+            "System Settings → Privacy & Security → Automation → spotify-daemon → turn on Spotify. If spotify-daemon is not listed, run `tccutil reset AppleEvents com.unlikefraction.spotify-daemon` (if macOS answers that there is no such bundle identifier, `tccutil reset AppleEvents` works but makes every app ask again) and retry so macOS asks. `spotify doctor` re-checks.",
         )
         .with_details(details),
         Some(-600 | -609) => Error::new(
@@ -514,9 +514,15 @@ mod tests {
         let stderr =
             "38:40: execution error: Not authorized to send Apple events to Spotify. (-1743)";
         assert_eq!(error_number(stderr), Some(-1743));
-        assert_eq!(
-            classify(stderr, error_number(stderr)).code,
-            "automation_permission_denied"
+        let denied = classify(stderr, error_number(stderr));
+        assert_eq!(denied.code, "automation_permission_denied");
+        // The exact place to turn it on.
+        assert!(
+            denied.hint.starts_with(
+                "System Settings → Privacy & Security → Automation → spotify-daemon → turn on Spotify"
+            ),
+            "{}",
+            denied.hint
         );
         assert_eq!(classify("x", Some(-1728)).code, "nothing_playing");
     }

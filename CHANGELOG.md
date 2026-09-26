@@ -1,5 +1,205 @@
 # Changelog
 
+## 0.1.6 — 2026-09-27
+
+Playback control:
+
+- Every start goes through the Spotify Web API first, so Spotify.app stays in the background:
+  songs, episodes, shows and Liked Songs directly (new), albums, playlists, artists and radios
+  through spotify_player (as before). Starts fall back to AppleScript, except a radio, which has
+  no AppleScript way; only exact seeks go to AppleScript first. The outcome says
+  `via: "web_api"` (new) once Spotify.app plays the item. Before, songs, episodes, shows and
+  Liked Songs started through AppleScript, which brought Spotify.app to the front.
+- `spotify play <track|episode>` (also `play --search`, `podcast play` and `search --play` when
+  they pick a song or episode, and a song with `--context`) plays in `--context` when given, else
+  in the song's album or the episode's show (looked up with `GET /v1/tracks/{id}` or
+  `/v1/episodes/{id}` in your market), from the start. The rest of the album then plays on, and
+  `next`/`previous` move through it. A relinked song starts from the release that plays in your
+  market. A start that lands on another album track, or whose uri the album refuses, is sent
+  again once by the track's position (counted across discs). Lookups are remembered for the life
+  of the daemon (up to 500 items).
+- `spotify play spotify:show:<id>` starts the show as its own list.
+- `spotify play --liked` starts the Liked Songs list itself at its first song, or with `--random`
+  at a random position below its size (`GET /v1/me/tracks?limit=1`). Once it plays, its shuffle
+  is set (`PUT /v1/me/player/shuffle`, or AppleScript's `set shuffling` when that does not show),
+  and in order it starts again at the first song when the list began elsewhere. An empty Liked
+  Songs is `not_found` at once, and nothing starts. AppleScript remains the fallback, with the
+  focus handed back.
+- `spotify play --liked --shuffle` does the same as `--liked --random`.
+- Where a start plays: the devices are listed at every start (`GET /v1/me/player/devices`). When
+  another device is active (a speaker or phone Spotify.app controls; never spotify_player's), the
+  start plays there instead of moving playback to this Mac, and the outcome's new `note` says so.
+  When Spotify.app plays on a device the Web API does not list, the start names no device.
+  Otherwise it goes to Spotify.app on this Mac: the Computer device named like this Mac
+  (`scutil --get ComputerName`), or, only when that name is unknown, the only Computer device;
+  another Mac and the Web Player are never picked.
+- A start answered with a server error (5xx), or not answered in time, is looked for in
+  Spotify.app before any fallback. When it plays, it counts (`via: web_api`, with a `note`) and
+  is not started a second time.
+- When the Web API start cannot run or does not take effect within `verify_timeout_ms`,
+  AppleScript starts the item, with `fallback: {"from": "web_api", "reason": …}`:
+  `rate_limited` (a 429, or the pause after one), `premium_required`, `device_restricted` (new:
+  the active device takes no Web API commands), `device_not_found` (new), `no_active_device`,
+  `unsupported` (not playable in your market; nothing is sent),
+  `spotify_auth_required`/`spotify_player_missing`, `web_api_failed` (new), `not_found`,
+  `transport` or `no_effect`. When AppleScript fails too, the Web API attempt is in
+  `details.first_attempt`. The AppleScript fallback plays a song in the album the lookup found
+  (from the release that plays in your market), so the album goes on after it, unless
+  `--context` was given or the album did not place the song. Strategy `applescript` never uses
+  the Web API; under strategy `spotify_player`, episodes, shows and songs with `--context` can
+  now start (through the Web API).
+- When an AppleScript start brings Spotify.app to the front (a fallback, an album or playlist
+  spotify_player could not start, the restore after a failed start, and the managed queue's
+  hand-offs and resumes), the focus goes back to the app that had it, and Spotify.app is hidden
+  again if it was hidden. The front is watched during the start and for 1 s after it;
+  `lsappinfo setfront` is tried, then `open -a` for regular apps that still run (never Finder).
+  No new macOS permission is needed. The outcome carries
+  `refocused: {app, via: "setfront"|"open", hid_spotify?, error?}` (`details.refocused` on
+  errors); `focus_not_returned` (new) appears only inside it. Measured: Spotify.app in front for
+  about 0.5 s instead of staying there.
+- The Web API rate-limit pause (`Retry-After`, 1 s to 10 minutes, 30 s without one) is one
+  process-wide pause, shared by the daemon's lookups, searches and starts.
+- The `automation_permission_denied` hint starts with the exact place: System Settings →
+  Privacy & Security → Automation → spotify-daemon → turn on Spotify.
+- `play --liked` waits for Spotify to apply Liked Songs' saved shuffle setting (it switches a
+  moment after the first song starts) before setting the order you asked for, and verifies it:
+  plain `--liked` always starts in order at the first liked song, `--random` at a random song.
+- A song or episode Spotify will not play for this account (`details.reason`: `market`,
+  `explicit` or `product`) fails at once with the new `not_playable` (exit 1) and leaves playback
+  alone; before, the AppleScript attempt emptied Spotify.app for seconds first.
+- A relinked song starts in its album with one request, named by the id the album lists, so the
+  album's first song no longer plays for a moment.
+
+Search and queue:
+
+- When spotify_player's search fails (such as its "invalid type: null, expected a boolean" parse
+  error), `search`, `podcast search` and `play --search` fall back to the Web API's own
+  `GET /v1/search`. Replies say `via` (`spotify_player` or `web_api`, new) and carry
+  `fallback: {from: "spotify_player", reason}` when the Web API answered; when both fail, the
+  error is the Web API's with `details.first_attempt`. spotify_player errors that end in a JSON
+  parse position (`line 1 column 42912`) are no longer mistaken for HTTP 429 or 401.
+- `spotify queue` / `queue list` JSON has a new top-level `warnings` array. It holds
+  `no_active_device` when Spotify reports nothing playing on any device and Spotify.app does not
+  play either, so Spotify's upcoming list is empty for that reason. The human output prints each
+  warning as `note: <message> (<code>)`, with its hint on the next line.
+- `queue list` has the aliases `queue show` and `queue ls`.
+
+Lyrics:
+
+- `spotify lyrics <uri|link|id>` shows any track's lyrics, whether or not anything plays, and with
+  a target Spotify.app need not run; `spotify lyrics` alone is the song playing now. It takes a
+  track, not search words: to find a song by name, run `spotify search '<words>' --type track`,
+  then `spotify lyrics <uri>`. One word that is no id (`spotify lyrics 505`) is `invalid_input`
+  ("`505` is not a track URI, link or id.") with a hint naming `spotify search 505 --type track`
+  and `details.search`; several words are a usage error whose hint names
+  `spotify search '<words>' --type track`.
+
+Finding commands:
+
+- `spotify` with no arguments prints an orientation instead of the help (exit 0, was 2): what is
+  set up and what is missing, each with its fix, what is playing, and up to five things to try
+  (such as `spotify lyrics spotify:track:0BxE4FqsDD1Ot4YuBXwAPp` when nothing plays). Local
+  checks only; the daemon is asked only when it already runs, never started. `--json` gives
+  `{version, ready, now_playing, checks, try, help}`.
+- `spotify --help` lists the commands grouped by goal (Listen, Find, Lyrics & details, Queue,
+  Playlists, Podcasts, Triggers (Ting), Account & login, Setup & diagnose), each with a summary
+  and an example. Most summaries were rewritten to say what the command can do, and every
+  command's `--help` now ends with Examples. A command's own flags are under `Options:`, followed
+  by `Global options:` (`--json`, `--org`, `--api-url`, `-h`/`--help`, `-V`/`--version`); the root
+  help's heading is `Global options (every command takes them):`. `-V` on a subcommand prints
+  `spotify <version>` (was `spotify-queue …`).
+- New `spotify how "<question>"` [`--limit 1-10`] [`--json`]: answers offline with the best
+  commands and ready-to-run examples, the guide section to read and matching error codes. It
+  indexes the help, the guides, every setting and the error codes. A song or artist name in the
+  question never outweighs what you want to do, and it becomes made examples: lyrics get
+  `spotify search '<name>' --type track` then `spotify lyrics <uri>`, play, queue add and search
+  `--search '<name>'`; settings questions get `spotify config set '{"<key>": <value>}'`,
+  completion questions both install lines, docs questions `spotify docs --search '<flag>'`.
+  Questions that only ask to see something put read-only commands first. JSON:
+  `{question, name, terms, commands, guides, errors, more}`. An empty question is
+  `invalid_input`.
+- `Next:` suggestions after human output, on stderr, with the real URIs and ids just printed
+  (search, podcast search, status, the play commands, track, lyrics, library, queue, queue add,
+  playlist list/show/create/fork, devices, trigger add/list, login, login status, doctor, config
+  set, how). Never with `--json`; the new environment variable `SPOTIFY_HINTS=0` turns them off.
+  They replace the search footer on stdout ("Play one: … · queue it: … · look inside: …"), and the
+  hints after `trigger add` and `login` changed to match.
+- `spotify commands --json` keeps every field and adds, per command, `path`, `summary`,
+  `details`, `goal`, `goal_title`, `capabilities`, `keywords`, `subcommands`, `arg_groups`,
+  `examples`, `output`, `errors`, `requirements`, `requirement_notes`, `help`, `mutates` (true
+  when it can change something or send something out), `changes` (from `playback`, `library`,
+  `playlists`, `config`, `triggers`, `daemon`, `session`) and `read_only_when` (e.g. `volume`
+  without a level); per argument, `flag`, `value_name`, `takes_value`, `multiple`, `type`,
+  `allowed_values`, `default`, `min`, `max`, `conflicts_with` and `requires`; and at the top level
+  `goals`, `errors` (from `spotify docs errors`), `exit_codes`, `requirements`, `argument_types`,
+  `changes`, `mutates` (how to read them) and `output_contract`. `usage` now includes the full
+  path (`Usage: spotify search …`, was `Usage: search …`). `spotify commands` for people is
+  grouped by goal. Read-only commands:
+  `spotify commands --json | jq -r '.commands[] | select(.mutates == false).command'`.
+- New `spotify completions <zsh|bash|fish|powershell>`: the completion script; `--help` has
+  install lines that work as written (zsh: `~/.zfunc` plus an `fpath`/`compinit` line in
+  `~/.zshrc`; bash: a `~/.bash_completion.d` file sourced from `~/.bashrc`, also on macOS's bash
+  3.2; fish; PowerShell), and `--json` gives `{shell, script, install}`.
+- New `spotify docs <topic> --section '<heading>'`: one section and its subsections (a whole
+  heading, then its start, then any part); an unknown one is `not_found` listing the sections.
+  `spotify docs <topic> --search <text>` searches only that guide (the JSON gains `topic`);
+  `--search` takes text that starts with a hyphen, cannot be combined with `--section`, and an
+  empty text is `invalid_input`.
+- An unknown subcommand of a group exits 2 with a hint listing the real subcommands and their
+  aliases (`queue next` adds "To skip to the next track: spotify next."; a top-level command's
+  name says it is a command of its own).
+- `iam` is Silicon IAM's own CLI, separate from spotify-cli: `spotify login --help`, the root
+  help's Authentication lines and `spotify iam` now say so and how to get it
+  (`cargo install silicon-iam-cli`), and `spotify iam --json` gains
+  `iam_cli: {name, description, install}`.
+- The CLI no longer panics (exit 101) when the reader of its output goes away early (`| head`).
+- `spotify track` shows the album with its URI (`album: <name> (<uri>)`); items gain
+  `album_uri` (tracks) or the show's URI (episodes) in `--json`.
+- `Next:` hints print only when output goes to a terminal (never before piped content);
+  `SPOTIFY_HINTS=always` keeps them, `SPOTIFY_HINTS=0` turns them off.
+- Typos suggest the closest command first (`spotify lyircs` → `lyrics`).
+- `spotify login <word>` with a short plain word (such as `spotify login stauts`) is rejected
+  locally, suggesting `spotify login status`, instead of being sent to the backend as an SLT.
+- `spotify auth login --help` and `auth status --help` have examples and say what a headless
+  Silicon should do.
+
+Configuration:
+
+- New `keep_spotify_in_background` (boolean, default true): give the focus back after an
+  AppleScript start brought Spotify.app forward. `verify_timeout_ms` now also bounds the wait for
+  a Web API start, and the look for a start whose answer was lost.
+
+Library (`silicon-spotify-client`):
+
+- New modules `webapi` (the `WebApi` trait, `HttpWebApi`; `start` for a track or episode,
+  `start_list` for Liked Songs or a show, `choose_device` and `target` for where a start goes,
+  `set_shuffle`, `liked_songs`, `search`, `item_facts` and `cached_facts`, `unanswered`, the
+  shared rate-limit pause and `cached_access_tokens`) and `focus` (the `Focus` trait,
+  `LaunchServices`, `keep_in_background`). `Via::WebApi` is new, `Outcome` gains `refocused`,
+  `note` and `Outcome::new`, and `model::Item::from_web_json` reads Web API search hits.
+- Breaking for code that builds a `Controller`: it has two new fields, `web` and `focus`. Pass
+  `web: Err(…)` and `focus: None` to keep 0.1.5's behaviour (`spotify docs development`).
+- The `control` example takes `--no-web` (refuses the Web API's playback commands; lookups still
+  answer), `--no-refocus` and `--trace`, and new commands `front`, `handoff <uri> [context]`,
+  `lookup <uri>`, `webstate`, `devices`, `websearch <query>` and `raw <GET|PUT> <path> …`.
+
+Daemon protocol:
+
+- `player.play` outcomes may carry `via: "web_api"`, `note` and `refocused`; `search` replies
+  carry `via` and, after a fallback, `fallback`; `queue.list` replies carry `warnings`.
+
+Docs:
+
+- New guide sections: "Find anything" and "The command manifest" (`spotify docs usage`), "Web
+  API first: songs, episodes, shows and Liked Songs" (with "Where a start plays" and "When the
+  answer is lost") and "Keeping Spotify.app in the background" (`spotify docs playback`). New
+  codes in `spotify docs errors`: `web_api_failed`, `device_not_found`, `device_restricted`,
+  `focus_not_returned`. `spotify playlist fork --help` says what a copy keeps: without `--name`
+  the source's name, description, visibility and collaborative setting (a public source gives a
+  public copy); with `--name` it is private and not collaborative. Tests now fail when a guide or
+  README shows a command, flag, value, config key or topic the CLI does not have, or when a help
+  example does not parse.
+
 ## 0.1.5 — 2026-09-26
 
 Signing (macOS):

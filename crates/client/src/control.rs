@@ -24,15 +24,31 @@
 //! without retrying: spotify_player would save or remove the substitute's id, not the one
 //! Spotify.app shows.
 //!
-//! Three actions go to AppleScript first, because spotify_player's way of doing them is worse on
-//! the desktop app: seeking (spotify_player can only seek by an offset, which it adds to a
-//! position it fetches from the Web API when the command runs, seconds later when the Web API is
-//! rate limiting), starting a single track and starting Liked Songs (the Web API starts both as a
-//! list of track ids, which leaves Spotify.app stopped with nothing loaded; AppleScript plays the
-//! track, or the Liked Songs list itself). Those two starts never fall back to spotify_player:
-//! it starts them only when AppleScript is not allowed (strategy `spotify_player`) or, for Liked
-//! Songs, when the list's uri is unknown. When a start still leaves Spotify.app empty, what was
-//! loaded before is put back.
+//! Seeking goes to AppleScript first, because spotify_player's way of doing it is worse on the
+//! desktop app: spotify_player can only seek by an offset, which it adds to a position it fetches
+//! from the Web API when the command runs, seconds later when the Web API is rate limiting.
+//!
+//! A track or episode, Liked Songs and a show start through the Spotify Web API directly
+//! ([`crate::webapi`]): a track or episode in the caller's context, else in its album or show;
+//! Liked Songs as its own list (`spotify:user:<id>:collection`, the id spotify_player is signed
+//! in as), a show as its own. The start goes to the device Spotify.app on this Mac controls: a
+//! speaker or phone it is the remote for, else Spotify.app itself by device id. That keeps
+//! Spotify.app in the background, where AppleScript's `play track` brings it to the front. It
+//! counts once Spotify.app plays it (for a track or episode: the item asked for, or the same song
+//! relinked), read through AppleScript, which does not bring it forward. A start the Web API
+//! answered with a 5xx, or never answered, is looked for in Spotify.app too: when it went
+//! through, it counts (with a `note`) and is not started again. Otherwise (a rate limit or the
+//! pause after one, no Premium, no device to start on, no effect in time) AppleScript starts it
+//! and `fallback` says why (`from: web_api`); a track then plays in the album the Web API's
+//! lookup named (or the caller's context), so the album goes on after it. Whenever an
+//! AppleScript start brings Spotify.app to the front, the focus goes back to the app that had it
+//! ([`crate::focus`]; `refocused`). When a start still leaves Spotify.app empty, what was loaded
+//! before is put back.
+//!
+//! spotify_player never starts Liked Songs or a single track as the fallback of a start
+//! AppleScript can make: it starts them as a list of track ids, which leaves Spotify.app stopped
+//! with nothing loaded. It does so only when AppleScript is not allowed (strategy
+//! `spotify_player`) or when Liked Songs' uri is unknown.
 
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -41,22 +57,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::applescript::{self, Runner};
+use crate::focus::{self, Focus, Refocus};
 use crate::model::{
     Playback, PlayerState, SameSong, Track, WebItem, WebPlayback, playing_item_uri,
 };
 use crate::player::SpotifyPlayer;
 use crate::timing::SeekTarget;
 use crate::uri::{Kind, SpotifyUri};
+use crate::webapi::{self, WebApi};
 use crate::{Error, Result};
 
 /// Which tool performs playback commands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Strategy {
-    /// spotify_player first, verified; AppleScript when it fails or has no effect (default).
+    /// spotify_player (or, to start a track or episode, the Web API directly) first, verified;
+    /// AppleScript when it fails or has no effect (default).
     #[default]
     Auto,
-    /// Only spotify_player (Spotify Web API). No fallback.
+    /// Only spotify_player and the Web API. No AppleScript fallback.
     SpotifyPlayer,
     /// Only AppleScript (Spotify.app on this Mac). Works without spotify_player or Premium.
     Applescript,
@@ -86,6 +105,9 @@ pub enum Via {
     SpotifyPlayer,
     /// AppleScript against Spotify.app.
     Applescript,
+    /// The Spotify Web API directly, with spotify_player's token (starts of tracks, episodes,
+    /// Liked Songs and shows).
+    WebApi,
 }
 
 /// Why the primary path was abandoned.
@@ -113,16 +135,32 @@ pub struct Outcome {
     pub result: Option<String>,
     /// Spotify.app right after the change.
     pub playback: Playback,
+    /// Spotify.app came to the front when AppleScript started the item, and the focus went back
+    /// to the app that had it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refocused: Option<Refocus>,
+    /// Something worth knowing about how it went: the start went to the speaker or phone
+    /// Spotify.app controls, or it counted although the Web API's answer never came.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl Outcome {
     fn unchanged(action: &str, playback: Playback) -> Self {
+        Self::new(action, Via::Applescript, playback)
+    }
+
+    /// An outcome without a fallback, result or refocus.
+    #[must_use]
+    pub fn new(action: &str, via: Via, playback: Playback) -> Self {
         Self {
             action: action.to_owned(),
-            via: Via::Applescript,
+            via,
             fallback: None,
             result: None,
             playback,
+            refocused: None,
+            note: None,
         }
     }
 }
@@ -295,12 +333,18 @@ impl PlayerView {
     }
 }
 
-/// Stateless controller over an AppleScript runner and an optional spotify_player.
+/// Stateless controller over an AppleScript runner, an optional spotify_player and the Web API.
 pub struct Controller<'a> {
     /// Runs AppleScript against Spotify.app.
     pub script: &'a dyn Runner,
     /// `Err` holds why spotify_player cannot be used (missing binary, not signed in).
     pub player: std::result::Result<&'a SpotifyPlayer, Error>,
+    /// Starts tracks and episodes without bringing Spotify.app forward (normally
+    /// [`webapi::HttpWebApi`] over spotify_player's token). `Err` holds why it cannot be used.
+    pub web: std::result::Result<&'a dyn WebApi, Error>,
+    /// Gives the focus back when an AppleScript start brings Spotify.app to the front (normally
+    /// [`focus::LaunchServices`]); `None` leaves the focus as it is.
+    pub focus: Option<&'a dyn Focus>,
     /// Which tool to use.
     pub strategy: Strategy,
     /// How long to wait for spotify_player's effect to show up in Spotify.app.
@@ -328,6 +372,11 @@ const REPEAT_STEP: Duration = Duration::from_millis(2000);
 const VIEW_POLL: Duration = Duration::from_millis(60);
 /// How long a start whose follow-up call was refused gets to show up in Spotify.app.
 const START_AFTER_REFUSAL: Duration = Duration::from_millis(1000);
+/// How long Spotify.app's shuffle must hold still, once a list (Liked Songs) plays, before it
+/// counts as the one Spotify keeps for that list ([`Controller::settle_shuffle`]).
+const SHUFFLE_QUIET: Duration = Duration::from_millis(450);
+/// The longest wait for that, from the first read that shows the list playing.
+const SHUFFLE_SETTLE: Duration = Duration::from_millis(1500);
 
 /// The spotify_player half of an action (absent when spotify_player cannot do it).
 type Primary<'a> = Option<&'a dyn Fn(&SpotifyPlayer) -> Result<()>>;
@@ -617,13 +666,7 @@ impl Controller<'_> {
             ok = (plan.check)(&playback, issued.elapsed());
         }
         if ok {
-            return Ok(Ok(Outcome {
-                action: plan.action.to_owned(),
-                via: Via::SpotifyPlayer,
-                fallback: None,
-                result: None,
-                playback,
-            }));
+            return Ok(Ok(Outcome::new(plan.action, Via::SpotifyPlayer, playback)));
         }
         Ok(Err(Error::new(
             "no_effect",
@@ -640,19 +683,33 @@ impl Controller<'_> {
         let Some(script) = plan.script else {
             return Ok(Err(Error::internal("no AppleScript for this action")));
         };
-        let issued = Instant::now();
-        script()?;
-        let (ok, playback) = self.wait_for(APPLESCRIPT_VERIFY, issued, plan.check)?;
-        if ok {
-            return Ok(Ok(Outcome {
-                action: plan.action.to_owned(),
-                via: Via::Applescript,
-                fallback: None,
-                result: None,
-                playback,
-            }));
-        }
-        Ok(Err(never_reflected(plan.action, &playback)))
+        // Spotify.app comes to the front when AppleScript starts something.
+        let focus = if plan.request.starts_with("Start") {
+            self.focus
+        } else {
+            None
+        };
+        let (tried, refocused) = focus::keep_in_background(focus, || -> Result<Tried> {
+            let issued = Instant::now();
+            script()?;
+            let (ok, playback) = self.wait_for(APPLESCRIPT_VERIFY, issued, plan.check)?;
+            if ok {
+                return Ok(Ok(Outcome::new(plan.action, Via::Applescript, playback)));
+            }
+            Ok(Err(never_reflected(plan.action, &playback)))
+        });
+        Ok(match (tried?, refocused) {
+            (Ok(mut outcome), refocused) => {
+                outcome.refocused = refocused;
+                Ok(outcome)
+            }
+            (Err(reason), Some(refocused)) => Err(with_detail(
+                reason,
+                "refocused",
+                serde_json::to_value(refocused).unwrap_or(Value::Null),
+            )),
+            (Err(reason), None) => Err(reason),
+        })
     }
 
     /// Checks that spotify_player believes playback is `playing`, as Spotify.app says: its
@@ -741,16 +798,63 @@ impl Controller<'_> {
             } => {
                 let target_uri = uri.uri();
                 let context_uri = context.as_ref().map(SpotifyUri::uri);
-                let script = applescript::play_uri(&target_uri, context_uri.as_deref());
-                let fallback = || applescript::expect_ok(&self.script.run(&script)?);
                 match uri.kind {
                     Kind::Track | Kind::Episode => {
+                        // The Web API first: it leaves Spotify.app in the background.
+                        let web_failure = if self.strategy == Strategy::Applescript {
+                            None
+                        } else {
+                            match self.start_with_web(before, uri, context.as_ref())? {
+                                Ok(outcome) => return Ok(outcome),
+                                // No release of it plays here: AppleScript's start would only
+                                // empty Spotify.app. Said at once, playback untouched.
+                                Err(reason) if reason.code == "not_playable" => {
+                                    return Err(reason);
+                                }
+                                Err(reason) => Some(Fallback {
+                                    from: Via::WebApi,
+                                    reason,
+                                }),
+                            }
+                        };
+                        // What the Web API's lookup found: the facts to recognise the track by
+                        // (Spotify.app may show the release it plays from), and the album the
+                        // AppleScript start plays it in (so the album goes on after it), named as
+                        // that album lists it (a relinked song by the id it links from: by the
+                        // id that plays, Spotify.app starts the album's first track instead).
+                        // Not when the Web API's start showed the album does not place the track
+                        // (refused, or another of its tracks played): the track alone then. The
+                        // caller's context always wins.
+                        let looked_up = (uri.kind == Kind::Track)
+                            .then(|| webapi::cached_facts(uri))
+                            .flatten();
+                        let in_album = looked_up.as_ref().filter(|facts| {
+                            context.is_none()
+                                && !web_failure
+                                    .as_ref()
+                                    .is_some_and(|failure| album_refused(&failure.reason))
+                                && facts
+                                    .context
+                                    .as_deref()
+                                    .is_some_and(|c| c.starts_with("spotify:album:"))
+                        });
+                        let script = match (&context_uri, in_album) {
+                            (Some(context), _) => applescript::play_uri(&target_uri, Some(context)),
+                            (None, Some(facts)) => {
+                                applescript::play_uri(&facts.listed_as, facts.context.as_deref())
+                            }
+                            (None, None) => applescript::play_uri(&target_uri, None),
+                        };
+                        let fallback = || applescript::expect_ok(&self.script.run(&script)?);
                         let expected = target_uri.clone();
-                        let replay = before_uri.as_deref() == Some(target_uri.as_str());
+                        let is_item = move |t: &Track| {
+                            t.uri == expected || looked_up.as_ref().is_some_and(|facts| facts.is(t))
+                        };
+                        let replay = before.track.as_ref().is_some_and(&is_item);
                         // Replaying the item already loaded only counts once it restarted.
                         let check = move |pb: &Playback, since: Duration| {
                             pb.state == PlayerState::Playing
-                                && pb.track.as_ref().is_some_and(|t| t.uri == expected)
+                                && pb.track.as_ref().is_some_and(&is_item)
                                 && (!replay
                                     || pb.position_ms
                                         < 4000 + u64::try_from(since.as_millis()).unwrap_or(0))
@@ -760,10 +864,11 @@ impl Controller<'_> {
                             p.run(&["playback", "start", "track", "--id", &id])
                                 .map(drop)
                         };
-                        // AppleScript only, unless it is not allowed: the Web API starts a track
-                        // as a list of ids, which leaves the desktop app stopped with nothing
-                        // loaded, so it is no fallback for a start AppleScript could not verify
-                        // (a slow first start after launching Spotify.app would be emptied).
+                        // Then AppleScript. spotify_player only when AppleScript is not allowed: it
+                        // starts a track as a list of ids, which leaves the desktop app stopped
+                        // with nothing loaded, so it is no fallback for a start AppleScript could
+                        // not verify (a slow first start after launching Spotify.app would be
+                        // emptied).
                         let primary: Primary<'_> = if uri.kind == Kind::Track
                             && context.is_none()
                             && self.strategy == Strategy::SpotifyPlayer
@@ -772,17 +877,57 @@ impl Controller<'_> {
                         } else {
                             None
                         };
-                        self.attempt(&Plan {
-                            action: "play",
-                            request: "StartTrack",
-                            route: Route::ScriptFirst,
-                            patience: Patience::Full,
-                            primary,
-                            script: Some(&fallback),
-                            check: &check,
-                        })
+                        after_web(
+                            self.attempt(&Plan {
+                                action: "play",
+                                request: "StartTrack",
+                                route: Route::ScriptFirst,
+                                patience: Patience::Full,
+                                primary,
+                                script: Some(&fallback),
+                                check: &check,
+                            }),
+                            web_failure,
+                        )
                     }
-                    Kind::Album | Kind::Playlist | Kind::Artist | Kind::Show => {
+                    Kind::Show => {
+                        // The Web API first, as for a track: AppleScript would bring Spotify.app
+                        // forward. spotify_player cannot start a show.
+                        let web_failure = if self.strategy == Strategy::Applescript {
+                            None
+                        } else {
+                            match self.list_with_web(
+                                "play",
+                                &target_uri,
+                                None,
+                                was_playing,
+                                &started,
+                            )? {
+                                Ok((outcome, _)) => return Ok(outcome),
+                                Err(reason) => Some(Fallback {
+                                    from: Via::WebApi,
+                                    reason,
+                                }),
+                            }
+                        };
+                        let script = applescript::play_uri(&target_uri, None);
+                        let fallback = || applescript::expect_ok(&self.script.run(&script)?);
+                        after_web(
+                            self.attempt(&Plan {
+                                action: "play",
+                                request: "StartContext",
+                                route: Route::ScriptFirst,
+                                patience: Patience::Full,
+                                primary: None,
+                                script: Some(&fallback),
+                                check: &started,
+                            }),
+                            web_failure,
+                        )
+                    }
+                    Kind::Album | Kind::Playlist | Kind::Artist => {
+                        let script = applescript::play_uri(&target_uri, context_uri.as_deref());
+                        let fallback = || applescript::expect_ok(&self.script.run(&script)?);
                         let id = uri.id.clone();
                         let kind = uri.kind.as_str().to_owned();
                         let shuffle = *shuffle;
@@ -800,25 +945,21 @@ impl Controller<'_> {
                             }
                             p.run(&args).map(drop)
                         };
-                        let (primary, route): (Primary<'_>, _) = if uri.kind == Kind::Show {
-                            // spotify_player cannot start a show.
-                            (None, Route::ScriptFirst)
-                        } else {
-                            (Some(&primary), Route::PlayerFirst)
-                        };
                         self.attempt(&Plan {
                             action: "play",
                             request: "StartContext",
-                            route,
+                            route: Route::PlayerFirst,
                             patience: Patience::Full,
-                            primary,
+                            primary: Some(&primary),
                             script: Some(&fallback),
                             check: &started,
                         })
                     }
                 }
             }
-            PlayTarget::Liked { limit, random } => self.play_liked(*limit, *random, &started),
+            PlayTarget::Liked { limit, random } => {
+                self.play_liked(*limit, *random, was_playing, &started)
+            }
             PlayTarget::Radio { uri } => {
                 let id = uri.id.clone();
                 let kind = uri.kind.as_str().to_owned();
@@ -851,20 +992,223 @@ impl Controller<'_> {
         }
     }
 
-    /// Liked Songs. AppleScript plays the Liked Songs list itself (`spotify:user:<id>:collection`,
-    /// the id spotify_player is signed in as), so it keeps going and `next` works; spotify_player
-    /// can only start a list of track ids, which the desktop app answers by stopping.
-    ///
-    /// Spotify keeps a shuffle setting per list and switches to Liked Songs' own when it starts.
-    /// Shuffled, the list starts at the song its kept order starts with, the same one every time;
-    /// in order, at its first song. So without `random` a kept shuffle is turned off and the list
-    /// started again, and with `random` shuffle is switched off and on (Spotify then draws a new
-    /// order) before one skip. Each step is checked in Spotify.app, and none is taken before
-    /// Liked Songs plays: shuffle and the skip would otherwise land on what was playing.
+    /// Starts a track or episode through the Web API ([`webapi::start`]) and waits (up to the
+    /// verify timeout) until Spotify.app plays it: the item asked for, or the same song under
+    /// another id (relinked), from its start. A start that lands on another item of the list is
+    /// sent again once by the track's position in its album; if that does not help either, the
+    /// caller falls back. A start whose answer was a 5xx or never came is looked for all the
+    /// same, so the fallback never starts it a second time.
+    fn start_with_web(
+        &self,
+        before: &Playback,
+        uri: &SpotifyUri,
+        context: Option<&SpotifyUri>,
+    ) -> Result<Tried> {
+        let web = match &self.web {
+            Ok(web) => *web,
+            Err(error) => return Ok(Err(error.clone())),
+        };
+        let mut issued = Instant::now();
+        // Starting the item already loaded only counts once it went back to its start.
+        let replay = |item: &webapi::ItemFacts| before.track.as_ref().is_some_and(|t| item.is(t));
+        let landed_on = |item: &webapi::ItemFacts| {
+            let replay = replay(item);
+            let item = item.clone();
+            move |pb: &Playback, since: Duration| {
+                pb.state == PlayerState::Playing
+                    && pb.track.as_ref().is_some_and(|t| item.is(t))
+                    && (!replay
+                        || pb.position_ms < 4000 + u64::try_from(since.as_millis()).unwrap_or(0))
+            }
+        };
+        let app_playing = before.state == PlayerState::Playing;
+        let mut started = match webapi::start(web, uri, context, app_playing) {
+            Ok(started) => started,
+            Err(error) if webapi::unanswered(&error) => {
+                return match webapi::cached_facts(uri) {
+                    Some(item) => self.confirm_unanswered("play", error, issued, &landed_on(&item)),
+                    None => Ok(Err(error)),
+                };
+            }
+            Err(error) => return Ok(Err(error)),
+        };
+        let before_uri = before.track.as_ref().map(|t| t.uri.clone());
+        loop {
+            let landed = landed_on(&started.item);
+            let item = &started.item;
+            // Another item of the list plays: the start named the wrong one.
+            let elsewhere = |pb: &Playback| {
+                pb.state == PlayerState::Playing
+                    && pb
+                        .track
+                        .as_ref()
+                        .is_some_and(|t| !item.is(t) && Some(&t.uri) != before_uri.as_ref())
+            };
+            let deadline = Instant::now() + self.verify_timeout;
+            let mut playback = loop {
+                let playback = self.status()?;
+                if landed(&playback, issued.elapsed())
+                    || elsewhere(&playback)
+                    || Instant::now() >= deadline
+                {
+                    break playback;
+                }
+                sleep(POLL);
+            };
+            if !landed(&playback, issued.elapsed()) && !elsewhere(&playback) {
+                // A late start would land after AppleScript's: one more look first.
+                sleep(LATE_GRACE);
+                playback = self.status()?;
+            }
+            if landed(&playback, issued.elapsed()) {
+                let mut outcome = Outcome::new("play", Via::WebApi, playback);
+                outcome.note = remote_note(started.remote, &started.device);
+                return Ok(Ok(outcome));
+            }
+            let observed = playback.track.as_ref().map(|t| t.uri.clone());
+            if elsewhere(&playback) {
+                let again_at = Instant::now();
+                match started.by_position(web) {
+                    Ok(Some(again)) => {
+                        started = again;
+                        issued = again_at;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) if webapi::unanswered(&error) => {
+                        return self.confirm_unanswered("play", error, again_at, &landed);
+                    }
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+            let ms = self.verify_timeout.as_millis();
+            let message = match (&observed, elsewhere(&playback)) {
+                (Some(other), true) => format!(
+                    "The Spotify Web API started {} in {}, but Spotify.app plays {other} instead.",
+                    started.item.requested, started.context
+                ),
+                _ => format!(
+                    "The Spotify Web API accepted the start of {} in {}, but Spotify.app did not play it within {ms} ms.",
+                    started.item.requested, started.context
+                ),
+            };
+            return Ok(Err(Error::new(
+                "no_effect",
+                message,
+                "Under strategy auto AppleScript starts it instead; nothing to do.",
+            )
+            .with_details(json!({
+                "context": started.context,
+                "device": started.device.name,
+                "offset": match &started.offset {
+                    webapi::Offset::Uri(uri) => json!({"uri": uri}),
+                    webapi::Offset::Position(position) => json!({"position": position}),
+                },
+                "observed": observed,
+                // The album did not place the track: the fallback does not start it there.
+                "landed_elsewhere": elsewhere(&playback),
+            }))));
+        }
+    }
+
+    /// After a start whose answer was a 5xx or never came ([`webapi::unanswered`]): looks for it
+    /// in Spotify.app (the verify timeout, then one more look). When `landed` shows, the start
+    /// went through: that is the outcome, through the Web API with a note, and nothing starts it
+    /// again. Otherwise `error`, and the caller falls back.
+    fn confirm_unanswered(
+        &self,
+        action: &str,
+        error: Error,
+        issued: Instant,
+        landed: &dyn Fn(&Playback, Duration) -> bool,
+    ) -> Result<Tried> {
+        let (mut ok, mut playback) = self.wait_for(self.verify_timeout, issued, landed)?;
+        if !ok {
+            sleep(LATE_GRACE);
+            playback = self.status()?;
+            ok = landed(&playback, issued.elapsed());
+        }
+        if !ok {
+            return Ok(Err(error));
+        }
+        let answer = error
+            .details
+            .as_ref()
+            .and_then(|d| d.get("status"))
+            .and_then(Value::as_u64)
+            .map_or_else(
+                || "no answer in time".to_owned(),
+                |status| format!("HTTP {status}"),
+            );
+        let mut outcome = Outcome::new(action, Via::WebApi, playback);
+        outcome.note = Some(format!(
+            "The Spotify Web API gave {answer} to the start, but Spotify.app plays it: the start went through, so it was not started again."
+        ));
+        Ok(Ok(outcome))
+    }
+
+    /// Starts the list `context` (Liked Songs, a show) through the Web API
+    /// ([`webapi::start_list`]; `app_playing`: whether Spotify.app played before) and waits (up
+    /// to the verify timeout, then one more look) until Spotify.app shows `check`. The outcome and
+    /// where the start went (`None` when its answer never came and it showed all the same), or
+    /// why it did not work.
+    fn list_with_web(
+        &self,
+        action: &str,
+        context: &str,
+        position: Option<u32>,
+        app_playing: bool,
+        check: &dyn Fn(&Playback, Duration) -> bool,
+    ) -> Result<std::result::Result<(Outcome, Option<webapi::ListStarted>), Error>> {
+        let web = match &self.web {
+            Ok(web) => *web,
+            Err(error) => return Ok(Err(error.clone())),
+        };
+        let issued = Instant::now();
+        let started = match webapi::start_list(web, context, position, app_playing) {
+            Ok(started) => started,
+            Err(error) if webapi::unanswered(&error) => {
+                return Ok(self
+                    .confirm_unanswered(action, error, issued, check)?
+                    .map(|outcome| (outcome, None)));
+            }
+            Err(error) => return Ok(Err(error)),
+        };
+        let (mut ok, mut playback) = self.wait_for(self.verify_timeout, issued, check)?;
+        if !ok {
+            // A late start would land after AppleScript's: one more look first.
+            sleep(LATE_GRACE);
+            playback = self.status()?;
+            ok = check(&playback, issued.elapsed());
+        }
+        if !ok {
+            return Ok(Err(Error::new(
+                "no_effect",
+                format!(
+                    "The Spotify Web API accepted the start of {context}, but Spotify.app did not play it within {} ms.",
+                    self.verify_timeout.as_millis()
+                ),
+                "Under strategy auto AppleScript starts it instead; nothing to do.",
+            )
+            .with_details(json!({
+                "context": context,
+                "device": started.device.name,
+                "position": position,
+                "observed": playback.track.as_ref().map(|t| t.uri.clone()),
+            }))));
+        }
+        let mut outcome = Outcome::new(action, Via::WebApi, playback);
+        outcome.note = remote_note(started.remote, &started.device);
+        Ok(Ok((outcome, Some(started))))
+    }
+
+    /// Liked Songs, the Web API first, then AppleScript: see [`Self::liked_with_web`] and
+    /// [`Self::liked_with_script`].
     fn play_liked(
         &self,
         limit: u32,
         random: bool,
+        app_playing: bool,
         check: &dyn Fn(&Playback, Duration) -> bool,
     ) -> Result<Outcome> {
         let collection = self
@@ -873,8 +1217,248 @@ impl Controller<'_> {
             .ok()
             .and_then(|p| p.username())
             .map(|user| format!("spotify:user:{user}:collection"));
+        // The Web API first: it leaves Spotify.app in the background.
+        let web_failure = match &collection {
+            Some(collection) if self.strategy != Strategy::Applescript => {
+                match self.liked_with_web(collection, random, app_playing, check)? {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(reason) => Some(Fallback {
+                        from: Via::WebApi,
+                        reason,
+                    }),
+                }
+            }
+            _ => None,
+        };
+        after_web(
+            self.liked_with_script(collection.as_deref(), limit, random, check),
+            web_failure,
+        )
+    }
+
+    /// Liked Songs through the Web API: the list started at its first song (in order) or at a
+    /// random position (`random`; its size from `GET /v1/me/tracks`), then its shuffle set.
+    /// Spotify switches to the shuffle it keeps for Liked Songs when the list starts (a shuffle
+    /// set before would only change the list playing before; see [`webapi::start_list`]), and
+    /// a moment after its first song shows. So shuffle is checked in Spotify.app once it plays
+    /// and has settled, and set when it differs: on for `random` (a random song, then shuffled),
+    /// off in order, where a list that began elsewhere (it started shuffled) is started again
+    /// from its first song; the result is checked again ([`Self::liked_settle`]). Once Liked Songs plays, those
+    /// follow-up steps' failures are errors, not fallbacks: a fallback would start the list a
+    /// second time.
+    fn liked_with_web(
+        &self,
+        collection: &str,
+        random: bool,
+        app_playing: bool,
+        check: &dyn Fn(&Playback, Duration) -> bool,
+    ) -> Result<Tried> {
+        let web = match &self.web {
+            Ok(web) => *web,
+            Err(error) => return Ok(Err(error.clone())),
+        };
+        let liked = match webapi::liked_songs(web) {
+            Ok(liked) => liked,
+            Err(error) => return Ok(Err(error)),
+        };
+        if liked.total == 0 {
+            return Err(Error::not_found(
+                "Liked Songs is empty, so there is nothing to play.",
+                "Like songs first (`spotify like` while one plays), or play something else: `spotify play --search '<query>'`.",
+            ));
+        }
+        let position = if random { random_below(liked.total) } else { 0 };
+        let (mut outcome, started) = match self.list_with_web(
+            "play_liked",
+            collection,
+            Some(position),
+            app_playing,
+            check,
+        )? {
+            Ok(done) => done,
+            Err(error) => return Ok(Err(error)),
+        };
+        // Without a device (the start's answer never came), the one playing now.
+        let device = started.map(|s| s.device).unwrap_or_default();
+        outcome.playback = self.liked_settle(
+            web,
+            &device,
+            collection,
+            random,
+            liked.first.as_ref(),
+            outcome.playback,
+        )?;
+        Ok(Ok(outcome))
+    }
+
+    /// Liked Songs, just started through the Web API and playing as `now`: once its shuffle has
+    /// settled ([`Self::settle_shuffle`]: Spotify switches to the shuffle it keeps for Liked Songs
+    /// a moment after the first song shows), sets it to `random` when it differs, and in order
+    /// (`!random`) starts the list again from `first` when it began elsewhere (it started
+    /// shuffled). Whenever it changed something it lets the shuffle settle again and checks the
+    /// result, up to twice (a late switch can undo the first round), so what it returns is what
+    /// Spotify.app keeps: shuffle as asked and, in order, the first song.
+    ///
+    /// # Errors
+    /// `verification_failed` (retryable) when a step does not show or the result does not hold.
+    fn liked_settle(
+        &self,
+        web: &dyn WebApi,
+        device: &crate::model::Device,
+        collection: &str,
+        random: bool,
+        first: Option<&webapi::ItemFacts>,
+        now: Playback,
+    ) -> Result<Playback> {
+        let at_first = |pb: &Playback| {
+            random || first.is_none_or(|first| pb.track.as_ref().is_some_and(|t| first.is(t)))
+        };
+        let in_place = |pb: &Playback| pb.shuffling == Some(random) && at_first(pb);
+        let mut now = self.settle_shuffle(now)?;
+        for _ in 0..2 {
+            if in_place(&now) {
+                return Ok(now);
+            }
+            if now.shuffling != Some(random) {
+                now = self.set_list_shuffle(web, device, random)?;
+            }
+            if let Some(first) = first.filter(|_| !at_first(&now)) {
+                // It began where the shuffle it kept starts: from the first song, now in order.
+                now = self.liked_again_from_first(web, collection, first, now)?;
+            }
+            now = self.settle_shuffle(now)?;
+        }
+        if in_place(&now) {
+            return Ok(now);
+        }
+        let word = if random { "on" } else { "off" };
+        Err(Error::new(
+            "verification_failed",
+            if now.shuffling == Some(random) {
+                "Liked Songs plays with shuffle off, but Spotify.app did not stay on its first song.".to_owned()
+            } else {
+                format!(
+                    "Liked Songs plays, but Spotify.app's shuffle did not stay {word}: Spotify switched it back after it was set."
+                )
+            },
+            format!(
+                "Check Spotify.app, then retry `spotify play --liked{}` or run `spotify shuffle {word}`.",
+                if random { " --random" } else { "" }
+            ),
+        )
+        .retryable()
+        .with_details(json!({"observed": now, "first": first.map(|f| f.requested.clone())})))
+    }
+
+    /// Starts Liked Songs (playing, just set in order) again at its first song through the Web
+    /// API and waits until Spotify.app plays `first`. Returns Spotify.app then.
+    fn liked_again_from_first(
+        &self,
+        web: &dyn WebApi,
+        collection: &str,
+        first: &webapi::ItemFacts,
+        now: Playback,
+    ) -> Result<Playback> {
+        let issued = Instant::now();
+        // Liked Songs plays now, on the device it was started on.
+        let (ok, again) = match webapi::start_list(web, collection, Some(0), true) {
+            // A lost answer may still have started it.
+            Err(error) if !webapi::unanswered(&error) => (false, now),
+            _ => self.wait_for(APPLESCRIPT_VERIFY, issued, &|pb, _| {
+                pb.state == PlayerState::Playing && pb.track.as_ref().is_some_and(|t| first.is(t))
+            })?,
+        };
+        if ok {
+            return Ok(again);
+        }
+        Err(Error::new(
+            "verification_failed",
+            "Liked Songs plays in order, but Spotify.app did not start it again from its first song.",
+            "Check Spotify.app, then retry `spotify play --liked`.",
+        )
+        .retryable()
+        .with_details(json!({"observed": again, "first": first.requested})))
+    }
+
+    /// Waits until Spotify.app's shuffle holds still after a list started (Liked Songs), from
+    /// `now`, the first read that showed it: Spotify switches to the shuffle it keeps for the
+    /// list a moment after its first song shows (seen 2026-09: 75 ms later, so that first read
+    /// can still carry the shuffle of the list before). Settled once neither shuffle nor the item
+    /// changed for [`SHUFFLE_QUIET`] (several reads in a row), at most [`SHUFFLE_SETTLE`] after
+    /// `now`. Returns the last read.
+    fn settle_shuffle(&self, now: Playback) -> Result<Playback> {
+        let begun = Instant::now();
+        let mut still_since = begun;
+        let mut last = now;
+        while still_since.elapsed() < SHUFFLE_QUIET && begun.elapsed() < SHUFFLE_SETTLE {
+            sleep(POLL);
+            let read = self.status()?;
+            let item = |pb: &Playback| pb.track.as_ref().map(|t| t.uri.clone());
+            if read.shuffling != last.shuffling || item(&read) != item(&last) {
+                still_since = Instant::now();
+            }
+            last = read;
+        }
+        Ok(last)
+    }
+
+    /// Sets shuffle for the list Spotify.app plays (just started through the Web API) through the
+    /// Web API and waits until Spotify.app shows it; AppleScript sets it when that does not show
+    /// (except under strategy spotify_player). Returns Spotify.app after that.
+    fn set_list_shuffle(
+        &self,
+        web: &dyn WebApi,
+        device: &crate::model::Device,
+        on: bool,
+    ) -> Result<Playback> {
+        let sent = webapi::set_shuffle(web, device, on);
+        if sent.is_ok() {
+            let (ok, now) = self.wait_for(APPLESCRIPT_VERIFY, Instant::now(), &|pb, _| {
+                pb.shuffling == Some(on)
+            })?;
+            if ok {
+                return Ok(now);
+            }
+        }
+        if self.strategy == Strategy::SpotifyPlayer {
+            return Err(sent.err().unwrap_or_else(|| {
+                Error::new(
+                    "verification_failed",
+                    format!(
+                        "Liked Songs is playing, but Spotify.app did not turn its shuffle {}.",
+                        if on { "on" } else { "off" }
+                    ),
+                    "Check Spotify.app, then retry.",
+                )
+                .retryable()
+            }));
+        }
+        self.liked_shuffle(on)?;
+        self.status()
+    }
+
+    /// Liked Songs through AppleScript, which plays the Liked Songs list itself
+    /// (`spotify:user:<id>:collection`, the id spotify_player is signed in as), so it keeps going
+    /// and `next` works; spotify_player can only start a list of track ids, which the desktop app
+    /// answers by stopping.
+    ///
+    /// Spotify keeps a shuffle setting per list and switches to Liked Songs' own when it starts.
+    /// Shuffled, the list starts at the song its kept order starts with, the same one every time;
+    /// in order, at its first song. So without `random` a kept shuffle is turned off and the list
+    /// started again, and with `random` shuffle is switched off and on (Spotify then draws a new
+    /// order) before one skip. Each step is checked in Spotify.app, and none is taken before
+    /// Liked Songs plays and its shuffle has settled ([`Self::settle_shuffle`]): shuffle and the
+    /// skip would otherwise land on what was playing, or be undone by the shuffle Spotify switches
+    /// to a moment after the start.
+    fn liked_with_script(
+        &self,
+        collection: Option<&str>,
+        limit: u32,
+        random: bool,
+        check: &dyn Fn(&Playback, Duration) -> bool,
+    ) -> Result<Outcome> {
         let play_list = || -> Result<()> {
-            let Some(collection) = collection.as_deref() else {
+            let Some(collection) = collection else {
                 return Err(Error::internal("Liked Songs has no list uri"));
             };
             let start = applescript::play_uri(collection, None);
@@ -886,11 +1470,28 @@ impl Controller<'_> {
                 // shows only then would count without its shuffle step.
                 return Err(never_reflected("play_liked", &now));
             }
+            // Spotify switches to the shuffle it keeps for Liked Songs a moment later.
+            let now = self.settle_shuffle(now)?;
             match now.shuffling {
-                Some(_) if random => self.liked_at_random(&now),
-                Some(true) => self.liked_in_order(collection, &now),
-                _ => Ok(()),
+                Some(_) if random => self.liked_at_random(&now)?,
+                Some(true) => self.liked_in_order(collection, &now)?,
+                _ => return Ok(()),
             }
+            // What it keeps now, after the steps: shuffle as asked.
+            let end = self.settle_shuffle(self.status()?)?;
+            if end.shuffling == Some(random) {
+                return Ok(());
+            }
+            Err(Error::new(
+                "verification_failed",
+                format!(
+                    "Liked Songs plays, but Spotify.app's shuffle did not stay {}: Spotify switched it back after it was set.",
+                    if random { "on" } else { "off" }
+                ),
+                "Check Spotify.app, then retry.",
+            )
+            .retryable()
+            .with_details(json!({"observed": end})))
         };
         let limit = limit.to_string();
         let primary = |p: &SpotifyPlayer| {
@@ -1005,7 +1606,9 @@ impl Controller<'_> {
             Ok(now) if now.track.is_none() && now.state != PlayerState::NotRunning => {}
             _ => return error,
         }
-        match self.restore(before, track, context) {
+        let (restored, _) =
+            focus::keep_in_background(self.focus, || self.restore(before, track, context));
+        match restored {
             Ok(playback) => with_detail(
                 error,
                 "restored",
@@ -1347,13 +1950,7 @@ impl Controller<'_> {
             match &self.player {
                 Ok(player) => match self.repeat_with_player(player, target, &before) {
                     Ok(playback) => {
-                        return Ok(Outcome {
-                            action: "repeat".into(),
-                            via: Via::SpotifyPlayer,
-                            fallback: None,
-                            result: None,
-                            playback,
-                        });
+                        return Ok(Outcome::new("repeat", Via::SpotifyPlayer, playback));
                     }
                     Err(error) => {
                         first_failure = Some(error);
@@ -1399,14 +1996,11 @@ impl Controller<'_> {
             .retryable());
         }
         Ok(Outcome {
-            action: "repeat".into(),
-            via: Via::Applescript,
             fallback: first_failure.map(|reason| Fallback {
                 from: Via::SpotifyPlayer,
                 reason,
             }),
-            result: None,
-            playback,
+            ..Outcome::new("repeat", Via::Applescript, playback)
         })
     }
 
@@ -1551,13 +2145,7 @@ impl Controller<'_> {
             )
             .with_details(json!({"spotify_app": track.uri, "spotify_player": after})));
         }
-        Ok(Outcome {
-            action: action.into(),
-            via: Via::SpotifyPlayer,
-            fallback: None,
-            result: None,
-            playback: before,
-        })
+        Ok(Outcome::new(action, Via::SpotifyPlayer, before))
     }
 
     /// Makes sure spotify_player's current track is `track` by id, letting it catch up once:
@@ -1797,6 +2385,68 @@ fn web_behind(web: &WebPlayback, playback: &Playback) -> Error {
     .retryable()
 }
 
+/// Whether a Web API track start's failure shows that its album does not place the track: the
+/// start by uri (or by position) was refused (400, 404), or another track of the album played.
+/// Its AppleScript fallback then plays the track alone, where `play track … in context` would
+/// meet the same album.
+fn album_refused(reason: &Error) -> bool {
+    let detail = |key: &str| reason.details.as_ref().and_then(|d| d.get(key));
+    match reason.code.as_str() {
+        "no_effect" => detail("landed_elsewhere").and_then(Value::as_bool) == Some(true),
+        "not_found" | "web_api_failed" => {
+            detail("request").and_then(Value::as_str) == Some("PUT /me/player/play")
+                && matches!(detail("status").and_then(Value::as_u64), Some(400 | 404))
+        }
+        _ => false,
+    }
+}
+
+/// The note on a start that went to another device Spotify.app controls (a speaker, a phone).
+fn remote_note(remote: bool, device: &crate::model::Device) -> Option<String> {
+    remote.then(|| {
+        let name = if device.name.is_empty() {
+            "the active device"
+        } else {
+            device.name.as_str()
+        };
+        format!(
+            "Started on {name}, the device Spotify.app on this Mac is playing on, so playback stays there."
+        )
+    })
+}
+
+/// A random number below `n` (0 when `n` is 0), from the standard library's randomly seeded
+/// hasher.
+fn random_below(n: u64) -> u32 {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    u32::try_from(hasher.finish() % n.max(1)).unwrap_or(0)
+}
+
+/// The result of the path tried after the Web API: its outcome names the Web API's failure as the
+/// `fallback` (unless it had one of its own), its error names it as `first_attempt`.
+fn after_web(result: Result<Outcome>, web_failure: Option<Fallback>) -> Result<Outcome> {
+    let Some(web_failure) = web_failure else {
+        return result;
+    };
+    match result {
+        Ok(mut outcome) => {
+            outcome.fallback.get_or_insert(web_failure);
+            Ok(outcome)
+        }
+        Err(error) => Err(with_detail(
+            error,
+            "first_attempt",
+            serde_json::to_value(&web_failure).unwrap_or(Value::Null),
+        )),
+    }
+}
+
 /// Adds `key: value` to an error's details, keeping what is there.
 fn with_detail(mut error: Error, key: &str, value: Value) -> Error {
     let mut map = match error.details.take() {
@@ -1863,7 +2513,18 @@ mod tests {
         volume: u8,
         shuffling: bool,
         repeating: bool,
+        /// A shuffle Spotify.app switches to late: after this many more reads, `shuffling`
+        /// becomes the value (as Spotify applies the shuffle it keeps for a list a moment after
+        /// the list's first song shows).
+        late_shuffle: Option<(u32, bool)>,
+        /// Liked Songs' kept shuffle when Spotify.app switches to it only [`LATE_READS`] reads
+        /// after an AppleScript start of the list (`None`: at once, as `shuffling` already is).
+        late_kept: Option<bool>,
     }
+
+    /// Reads that still show the shuffle of the list before, after a list started: more than
+    /// "two reads in a row agree" would wait for.
+    const LATE_READS: u32 = 3;
 
     /// A fake Spotify.app: AppleScript commands mutate state; status reads it. With `shared`, it
     /// also applies what the fake spotify_player did (lines in `shared/app`).
@@ -1875,6 +2536,8 @@ mod tests {
         frozen: bool,
         /// Commands (by prefix) it takes without acting on them.
         ignores: &'static [&'static str],
+        /// Songs it plays under another id (relinked): `play track` of the first shows the second.
+        relinked: &'static [(&'static str, &'static str)],
     }
 
     /// Spotify.app keeps 16-bit volume and reads it back rounded down.
@@ -1928,6 +2591,14 @@ mod tests {
             self.apply_player_effects(&mut app);
             let s = applescript::SEP;
             if source.contains("character id 31") {
+                match app.late_shuffle {
+                    Some((0, on)) => {
+                        app.shuffling = on;
+                        app.late_shuffle = None;
+                    }
+                    Some((reads, on)) => app.late_shuffle = Some((reads - 1, on)),
+                    None => {}
+                }
                 let head = format!(
                     "{}{s}{}{s}{}{s}{}",
                     app.state, app.volume, app.shuffling, app.repeating
@@ -1964,10 +2635,19 @@ mod tests {
                     let uri = rest.split('"').next().unwrap_or_default();
                     // Liked Songs starts at the song its kept shuffle order starts with (the same
                     // one every time), or in order at its first song.
+                    // With `late_kept`, it starts in the shuffle of the list before and
+                    // switches to the kept one a few reads later.
+                    if let Some(kept) = app.late_kept.filter(|_| uri.ends_with(":collection")) {
+                        app.late_shuffle = Some((LATE_READS, kept));
+                    }
                     let uri = match (uri.ends_with(":collection"), app.shuffling) {
                         (true, true) => "spotify:track:kept-shuffle-start",
                         (true, false) => "spotify:track:first-liked",
-                        (false, _) => uri,
+                        (false, _) => self
+                            .relinked
+                            .iter()
+                            .find(|(asked, _)| *asked == uri)
+                            .map_or(uri, |(_, shown)| *shown),
                     };
                     app.uri = Some(uri.to_owned());
                     app.state = "playing".into();
@@ -2002,6 +2682,10 @@ mod tests {
                     }
                 } else if let Some(on) = line.strip_prefix("set shuffling to ") {
                     app.shuffling = on == "true";
+                    // Set while Liked Songs plays, it is the one Liked Songs keeps.
+                    if app.late_kept.is_some() {
+                        app.late_kept = Some(app.shuffling);
+                    }
                 } else if let Some(on) = line.strip_prefix("set repeating to ") {
                     app.repeating = on == "true";
                 }
@@ -2019,11 +2703,14 @@ mod tests {
                 volume: 50,
                 shuffling: false,
                 repeating: false,
+                late_shuffle: None,
+                late_kept: None,
             }),
             log: Mutex::new(Vec::new()),
             shared: None,
             frozen: false,
             ignores: &[],
+            relinked: &[],
         }
     }
 
@@ -2031,6 +2718,8 @@ mod tests {
         Controller {
             script: runner,
             player: Err(crate::player::missing()),
+            web: Err(crate::player::missing()),
+            focus: None,
             strategy: Strategy::Auto,
             verify_timeout: Duration::from_millis(200),
             launch_spotify: false,
@@ -2184,7 +2873,7 @@ exit 0
     }
 
     #[test]
-    fn plays_a_track_by_uri_through_applescript() {
+    fn plays_a_track_through_applescript_without_the_web_api() {
         let fake = app();
         let uri = SpotifyUri::parse("spotify:track:0BxE4FqsDD1Ot4YuBXwAPp", None).expect("uri");
         let outcome = controller(&fake)
@@ -2198,10 +2887,1372 @@ exit 0
             outcome.playback.track.map(|t| t.id),
             Some("0BxE4FqsDD1Ot4YuBXwAPp".to_owned())
         );
-        assert!(
-            outcome.fallback.is_none(),
-            "AppleScript goes first for tracks"
+        assert_eq!(outcome.via, Via::Applescript);
+        let fallback = outcome.fallback.expect("says why");
+        assert_eq!(fallback.from, Via::WebApi);
+        assert_eq!(fallback.reason.code, "spotify_player_missing");
+        // Nothing looked it up: the track alone.
+        assert_eq!(
+            fake.commands(),
+            ["play track \"spotify:track:0BxE4FqsDD1Ot4YuBXwAPp\""]
         );
+    }
+
+    /// The Web API in front of a fake Spotify.app: a start it accepts plays there what `plays`
+    /// picks from the request body (`None`: the start takes no effect).
+    struct WebOnApp<'a> {
+        web: crate::webapi::tests::FakeWeb,
+        app: &'a FakeApp,
+        plays: fn(&Value) -> Option<String>,
+    }
+
+    impl WebApi for WebOnApp<'_> {
+        fn send(
+            &self,
+            method: webapi::Method,
+            path: &str,
+            query: &[(&str, &str)],
+            body: Option<&Value>,
+        ) -> Result<webapi::Reply> {
+            let reply = self.web.send(method, path, query, body)?;
+            if method == webapi::Method::Put
+                && reply.status < 300
+                && let Some(uri) = body.and_then(self.plays)
+            {
+                let mut app = self.app.app.lock().expect("lock");
+                app.uri = Some(uri);
+                app.state = "playing".into();
+                app.position = 0;
+            }
+            Ok(reply)
+        }
+
+        fn pause_left(&self) -> Duration {
+            self.web.pause_left()
+        }
+
+        fn rate_limited(&self, retry_after: Option<&str>) {
+            self.web.rate_limited(retry_after);
+        }
+    }
+
+    fn offset_uri(body: &Value) -> Option<String> {
+        body.pointer("/offset/uri")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    /// A desktop where iTerm2 is in front until an AppleScript start brings Spotify.app forward.
+    struct Desk<'a> {
+        app: &'a FakeApp,
+        given_back: Mutex<usize>,
+        activated: Mutex<Vec<String>>,
+    }
+
+    impl<'a> Desk<'a> {
+        fn new(app: &'a FakeApp) -> Self {
+            Self {
+                app,
+                given_back: Mutex::new(0),
+                activated: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn starts(&self) -> usize {
+            self.app
+                .commands()
+                .iter()
+                .filter(|c| c.starts_with("play track"))
+                .count()
+        }
+    }
+
+    impl Focus for Desk<'_> {
+        fn frontmost(&self) -> Option<crate::focus::App> {
+            let spotify = self.starts() > *self.given_back.lock().expect("lock");
+            Some(crate::focus::App {
+                name: if spotify { "Spotify" } else { "iTerm2" }.into(),
+                bundle_id: Some(
+                    if spotify {
+                        crate::focus::SPOTIFY_BUNDLE_ID
+                    } else {
+                        "com.googlecode.iterm2"
+                    }
+                    .into(),
+                ),
+                pid: Some(if spotify { 1 } else { 7 }),
+                ..crate::focus::App::default()
+            })
+        }
+
+        fn spotify_hidden(&self) -> Option<bool> {
+            Some(false)
+        }
+
+        fn activate(&self, app: &crate::focus::App) -> Result<&'static str> {
+            *self.given_back.lock().expect("lock") = self.starts();
+            self.activated.lock().expect("lock").push(app.name.clone());
+            Ok("setfront")
+        }
+
+        fn hide_spotify(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn track_uri(id: &str) -> SpotifyUri {
+        SpotifyUri::parse(&format!("spotify:track:{id}"), None).expect("uri")
+    }
+
+    fn play_uri(uri: &SpotifyUri, context: Option<&str>) -> PlayTarget {
+        PlayTarget::Uri {
+            uri: uri.clone(),
+            context: context.map(|c| SpotifyUri::parse(c, None).expect("context")),
+            shuffle: false,
+        }
+    }
+
+    /// A Web API that knows `id` (album `ALBW`, first track) and this Mac.
+    fn web_for<'a>(
+        app: &'a FakeApp,
+        id: &str,
+        plays: fn(&Value) -> Option<String>,
+    ) -> WebOnApp<'a> {
+        use crate::webapi::tests::{FakeWeb, devices, ok, track_json};
+        WebOnApp {
+            web: FakeWeb::default()
+                .on("GET /tracks/", ok(track_json(id, "ALBW", 1, 1)))
+                .on("GET /me/player/devices", ok(devices()))
+                .on("PUT /me/player/play", ok(Value::Null)),
+            app,
+            plays,
+        }
+    }
+
+    #[test]
+    fn a_track_starts_through_the_web_api_and_spotify_stays_in_the_background() {
+        let fake = app();
+        let desk = Desk::new(&fake);
+        let id = "6000000000000000000000";
+        let web = web_for(&fake, id, offset_uri);
+        let c = Controller {
+            web: Ok(&web),
+            focus: Some(&desk),
+            ..controller(&fake)
+        };
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(outcome.via, Via::WebApi);
+        assert_eq!(outcome.fallback, None);
+        assert_eq!(outcome.refocused, None);
+        assert_eq!(
+            outcome.playback.track.map(|t| t.uri),
+            Some(format!("spotify:track:{id}"))
+        );
+        // No AppleScript start, so nothing came forward.
+        assert!(!fake.commands().iter().any(|c| c.starts_with("play track")));
+        assert!(desk.activated.lock().expect("lock").is_empty());
+        assert_eq!(
+            web.web.bodies("PUT"),
+            [
+                json!({"context_uri": "spotify:album:ALBW", "offset": {"uri": format!("spotify:track:{id}")}, "position_ms": 0})
+            ]
+        );
+    }
+
+    #[test]
+    fn a_web_start_without_effect_falls_back_and_gives_the_focus_back() {
+        let fake = app();
+        let desk = Desk::new(&fake);
+        let id = "7000000000000000000000";
+        let web = web_for(&fake, id, |_| None);
+        let c = Controller {
+            web: Ok(&web),
+            focus: Some(&desk),
+            ..controller(&fake)
+        };
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(outcome.via, Via::Applescript);
+        let fallback = outcome.fallback.expect("says why");
+        assert_eq!(fallback.from, Via::WebApi);
+        assert_eq!(fallback.reason.code, "no_effect");
+        assert_eq!(outcome.refocused.map(|r| r.app).as_deref(), Some("iTerm2"));
+        assert_eq!(*desk.activated.lock().expect("lock"), ["iTerm2"]);
+        // Without the hand-back, Spotify.app keeps the front.
+        let fake = app();
+        let web = web_for(&fake, id, |_| None);
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(outcome.refocused, None);
+    }
+
+    #[test]
+    fn rate_limits_and_missing_premium_go_to_applescript_at_once() {
+        use crate::webapi::tests::{FakeWeb, devices, ok, status, track_json};
+        let id = "8000000000000000000000";
+        let fake = app();
+        let web = WebOnApp {
+            web: FakeWeb::default()
+                .on("GET /tracks/", ok(track_json(id, "ALB8", 1, 2)))
+                .on("GET /me/player/devices", ok(devices()))
+                .on(
+                    "PUT /me/player/play",
+                    status(429, "", "API rate limit exceeded"),
+                ),
+            app: &fake,
+            plays: offset_uri,
+        };
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let started = Instant::now();
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(outcome.via, Via::Applescript);
+        assert_eq!(
+            outcome.fallback.map(|f| f.reason.code).as_deref(),
+            Some("rate_limited")
+        );
+        // Not waited for: AppleScript started it right away.
+        assert!(started.elapsed() < Duration::from_millis(400));
+        // While the pause runs nothing more goes to the Web API.
+        let sent = web.web.sent().len();
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(
+            outcome.fallback.map(|f| f.reason.code).as_deref(),
+            Some("rate_limited")
+        );
+        assert_eq!(web.web.sent().len(), sent);
+
+        let fake = app();
+        let web = WebOnApp {
+            web: FakeWeb::default()
+                .on("GET /tracks/", ok(track_json(id, "ALB8", 1, 2)))
+                .on("GET /me/player/devices", ok(devices()))
+                .on(
+                    "PUT /me/player/play",
+                    status(
+                        403,
+                        "PREMIUM_REQUIRED",
+                        "Player command failed: Premium required",
+                    ),
+                ),
+            app: &fake,
+            plays: offset_uri,
+        };
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(
+            outcome.fallback.map(|f| f.reason.code).as_deref(),
+            Some("premium_required")
+        );
+    }
+
+    #[test]
+    fn a_relinked_song_counts_as_started() {
+        use crate::webapi::tests::{FakeWeb, devices, ok};
+        let requested = "9000000000000000000000";
+        let substitute = "9100000000000000000000";
+        let mut lookup = crate::webapi::tests::track_json(substitute, "ALB9", 1, 5);
+        lookup["linked_from"] =
+            json!({"id": requested, "type": "track", "uri": format!("spotify:track:{requested}")});
+        let fake = app();
+        let web = WebOnApp {
+            web: FakeWeb::default()
+                .on("GET /tracks/", ok(lookup))
+                .on("GET /me/player/devices", ok(devices()))
+                .on("PUT /me/player/play", ok(Value::Null)),
+            app: &fake,
+            // Spotify.app shows a third id with the same title, length and album.
+            plays: |_| Some("spotify:track:9200000000000000000000".into()),
+        };
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let outcome = c
+            .play(&play_uri(&track_uri(requested), None))
+            .expect("plays");
+        assert_eq!(outcome.via, Via::WebApi);
+        // Named as its album (the lookup's, the release asked for) lists it: by the id it links
+        // from.
+        assert_eq!(
+            web.web.bodies("PUT")[0]["offset"],
+            json!({"uri": format!("spotify:track:{requested}")})
+        );
+    }
+
+    #[test]
+    fn a_relinked_song_starts_in_its_album_with_one_request() {
+        use crate::webapi::tests::{FakeWeb, devices, ok};
+        // As seen live: the album lists the song under the id asked for; named by the id that
+        // plays, Spotify plays the album's first track, and only a second start by position
+        // reached the song.
+        let requested = "9300000000000000000000";
+        let substitute = "9400000000000000000000";
+        let mut lookup = crate::webapi::tests::track_json(substitute, "ALB93", 1, 4);
+        lookup["name"] = json!("Fourth Song");
+        lookup["linked_from"] =
+            json!({"id": requested, "type": "track", "uri": format!("spotify:track:{requested}")});
+        let fake = app();
+        fake.app.lock().expect("lock").state = "playing".into();
+        let web = WebOnApp {
+            web: FakeWeb::default()
+                .on("GET /tracks/", ok(lookup))
+                .on("GET /me/player/devices", ok(devices()))
+                .on("PUT /me/player/play", ok(Value::Null)),
+            app: &fake,
+            plays: |body| match offset_uri(body).as_deref() {
+                Some("spotify:track:9300000000000000000000") => {
+                    Some("spotify:track:9300000000000000000000".into())
+                }
+                _ => Some("spotify:track:album-track-one".into()),
+            },
+        };
+        let c = Controller {
+            web: Ok(&web),
+            verify_timeout: Duration::from_millis(2000),
+            ..controller(&fake)
+        };
+        let started = Instant::now();
+        let outcome = c
+            .play(&play_uri(&track_uri(requested), None))
+            .expect("plays");
+        assert_eq!(outcome.via, Via::WebApi);
+        assert_eq!(
+            outcome.playback.track.map(|t| t.uri),
+            Some(format!("spotify:track:{requested}"))
+        );
+        // One start, never the album's first track, no retry by position.
+        assert_eq!(
+            web.web.bodies("PUT"),
+            [
+                json!({"context_uri": "spotify:album:ALB93", "offset": {"uri": format!("spotify:track:{requested}")}, "position_ms": 0})
+            ]
+        );
+        assert!(fake.commands().is_empty(), "{:?}", fake.commands());
+        assert!(started.elapsed() < Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn a_song_not_playable_here_fails_at_once_and_leaves_playback_alone() {
+        use crate::webapi::tests::{FakeWeb, devices, ok};
+        let id = "9500000000000000000000";
+        let mut lookup = crate::webapi::tests::track_json(id, "ALB95", 1, 1);
+        lookup["name"] = json!("Fall (Acoustic Version)");
+        lookup["artists"] = json!([{"name": "Ana Rey"}, {"name": "The Tides"}]);
+        lookup["is_playable"] = json!(false);
+        for loaded in [true, false] {
+            let fake = app();
+            if !loaded {
+                let mut app = fake.app.lock().expect("lock");
+                app.state = "playing".into();
+            }
+            let desk = Desk::new(&fake);
+            let web = WebOnApp {
+                web: FakeWeb::default()
+                    .on("GET /tracks/", ok(lookup.clone()))
+                    .on("GET /me/player/devices", ok(devices()))
+                    .on("PUT /me/player/play", ok(Value::Null)),
+                app: &fake,
+                plays: offset_uri,
+            };
+            let c = Controller {
+                web: Ok(&web),
+                focus: Some(&desk),
+                verify_timeout: Duration::from_millis(2500),
+                ..controller(&fake)
+            };
+            let started = Instant::now();
+            let error = c
+                .play(&play_uri(&track_uri(id), None))
+                .expect_err("not playable");
+            assert_eq!(error.code, "not_playable");
+            assert_eq!(error.exit_code(), 1);
+            assert!(
+                error
+                    .message
+                    .contains("is not playable in your country/market"),
+                "{}",
+                error.message
+            );
+            assert!(error.hint.contains("spotify search"), "{}", error.hint);
+            // Nothing tried after it: no AppleScript start, no restore, no fallback.
+            assert!(fake.commands().is_empty(), "{:?}", fake.commands());
+            assert!(web.web.bodies("PUT").is_empty());
+            assert!(desk.activated.lock().expect("lock").is_empty());
+            let details = error.details.as_ref().expect("details");
+            assert!(details.get("restored").is_none() && details.get("first_attempt").is_none());
+            {
+                let now = fake.app.lock().expect("lock");
+                assert_eq!(now.uri.as_deref(), Some("spotify:track:a"));
+                assert_eq!(now.position, 1000);
+                assert_eq!(now.state, if loaded { "paused" } else { "playing" });
+            }
+            assert!(started.elapsed() < Duration::from_millis(500));
+        }
+    }
+
+    #[test]
+    fn a_start_on_the_wrong_album_track_is_sent_again_by_position() {
+        use crate::webapi::tests::{FakeWeb, devices, ok, track_json};
+        let id = "1100000000000000000000";
+        // Another title than the album's first track (the fake app names every track "Song").
+        let mut lookup = track_json(id, "ALB11", 1, 3);
+        lookup["name"] = json!("Third Song");
+        let fake = app();
+        let web = WebOnApp {
+            web: FakeWeb::default()
+                .on("GET /tracks/", ok(lookup))
+                .on("GET /me/player/devices", ok(devices()))
+                .on("PUT /me/player/play", ok(Value::Null)),
+            app: &fake,
+            // The offset by uri is ignored and the album plays from its first track.
+            plays: |body| match body.pointer("/offset/position") {
+                Some(_) => Some("spotify:track:1100000000000000000000".into()),
+                None => Some("spotify:track:first-of-album".into()),
+            },
+        };
+        {
+            let mut app = fake.app.lock().expect("lock");
+            app.state = "playing".into();
+        }
+        let c = Controller {
+            web: Ok(&web),
+            verify_timeout: Duration::from_millis(2000),
+            ..controller(&fake)
+        };
+        let started = Instant::now();
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(outcome.via, Via::WebApi);
+        let bodies = web.web.bodies("PUT");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[1]["offset"], json!({"position": 2}));
+        // Noticed at once, not after the whole verify timeout.
+        assert!(started.elapsed() < Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn episodes_and_callers_contexts_start_through_the_web_api() {
+        use crate::webapi::tests::{FakeWeb, devices, ok};
+        let id = "1200000000000000000000";
+        let fake = app();
+        let web = WebOnApp {
+            web: FakeWeb::default()
+                .on(
+                    "GET /episodes/",
+                    ok(
+                        json!({"id": id, "type": "episode", "name": "Ep", "duration_ms": 900_000,
+                        "show": {"uri": "spotify:show:SHOW12", "name": "Show"}}),
+                    ),
+                )
+                .on("GET /me/player/devices", ok(devices()))
+                .on("PUT /me/player/play", ok(Value::Null)),
+            app: &fake,
+            plays: offset_uri,
+        };
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let episode = SpotifyUri::parse(&format!("spotify:episode:{id}"), None).expect("uri");
+        let outcome = c.play(&play_uri(&episode, None)).expect("plays");
+        assert_eq!(outcome.via, Via::WebApi);
+        assert_eq!(
+            web.web.bodies("PUT")[0]["context_uri"],
+            "spotify:show:SHOW12"
+        );
+
+        let track = "1300000000000000000000";
+        let fake = app();
+        let web = web_for(&fake, track, offset_uri);
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let playlist = "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M";
+        let outcome = c
+            .play(&play_uri(&track_uri(track), Some(playlist)))
+            .expect("plays");
+        assert_eq!(outcome.via, Via::WebApi);
+        assert_eq!(web.web.bodies("PUT")[0]["context_uri"], playlist);
+    }
+
+    #[test]
+    fn replaying_the_loaded_track_counts_once_it_restarted() {
+        let id = "1400000000000000000000";
+        let fake = app();
+        {
+            let mut app = fake.app.lock().expect("lock");
+            app.uri = Some(format!("spotify:track:{id}"));
+            app.state = "playing".into();
+            app.position = 90_000;
+        }
+        let web = web_for(&fake, id, offset_uri);
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(outcome.via, Via::WebApi);
+        assert!(outcome.playback.position_ms < 4000);
+        // A start that did not restart it is not taken for one.
+        let fake = app();
+        {
+            let mut app = fake.app.lock().expect("lock");
+            app.uri = Some(format!("spotify:track:{id}"));
+            app.state = "playing".into();
+            app.position = 90_000;
+        }
+        let web = web_for(&fake, id, |_| None);
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(outcome.via, Via::Applescript);
+        assert_eq!(
+            outcome.fallback.map(|f| f.reason.code).as_deref(),
+            Some("no_effect")
+        );
+    }
+
+    #[test]
+    fn applescript_strategy_never_asks_the_web_api() {
+        let id = "1500000000000000000000";
+        let fake = app();
+        let web = web_for(&fake, id, offset_uri);
+        let c = Controller {
+            web: Ok(&web),
+            strategy: Strategy::Applescript,
+            ..controller(&fake)
+        };
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(outcome.via, Via::Applescript);
+        assert_eq!(outcome.fallback, None);
+        assert!(web.web.sent().is_empty());
+    }
+
+    /// Carries out every start through `inner`, then loses the answer: a `status` (5xx), or no
+    /// answer at all (0, a timeout).
+    struct LostAnswer<W> {
+        inner: W,
+        status: u16,
+    }
+
+    impl<W: WebApi> WebApi for LostAnswer<W> {
+        fn send(
+            &self,
+            method: webapi::Method,
+            path: &str,
+            query: &[(&str, &str)],
+            body: Option<&Value>,
+        ) -> Result<webapi::Reply> {
+            let reply = self.inner.send(method, path, query, body)?;
+            if method != webapi::Method::Put || path != "/me/player/play" {
+                return Ok(reply);
+            }
+            if self.status == 0 {
+                return Err(Error::new("transport", "operation timed out", "")
+                    .with_details(json!({"connect": false, "timeout": true})));
+            }
+            Ok(webapi::Reply {
+                status: self.status,
+                body: json!({"error": {"status": self.status, "message": "Bad gateway"}}),
+                retry_after: None,
+            })
+        }
+
+        fn pause_left(&self) -> Duration {
+            self.inner.pause_left()
+        }
+
+        fn rate_limited(&self, retry_after: Option<&str>) {
+            self.inner.rate_limited(retry_after);
+        }
+    }
+
+    #[test]
+    fn a_start_answered_5xx_or_not_at_all_that_went_through_is_not_started_again() {
+        for (status, answer) in [(502, "HTTP 502"), (0, "no answer in time")] {
+            let fake = app();
+            let desk = Desk::new(&fake);
+            let id = if status == 0 {
+                "1600000000000000000000"
+            } else {
+                "1610000000000000000000"
+            };
+            let web = LostAnswer {
+                inner: web_for(&fake, id, offset_uri),
+                status,
+            };
+            let c = Controller {
+                web: Ok(&web),
+                focus: Some(&desk),
+                ..controller(&fake)
+            };
+            let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+            assert_eq!(outcome.via, Via::WebApi, "{status}");
+            assert_eq!(outcome.fallback, None);
+            let note = outcome.note.expect("says so");
+            assert!(note.contains(answer), "{note}");
+            assert_eq!(
+                outcome.playback.track.map(|t| t.uri),
+                Some(format!("spotify:track:{id}"))
+            );
+            // One start, and Spotify.app never came forward.
+            assert_eq!(web.inner.web.bodies("PUT /me/player/play").len(), 1);
+            assert!(fake.commands().is_empty(), "{:?}", fake.commands());
+            assert!(desk.activated.lock().expect("lock").is_empty());
+        }
+    }
+
+    #[test]
+    fn a_start_answered_5xx_that_did_nothing_falls_back_once() {
+        use crate::webapi::tests::{FakeWeb, devices, ok, status, track_json};
+        let id = "1620000000000000000000";
+        let fake = app();
+        let web = WebOnApp {
+            web: FakeWeb::default()
+                .on("GET /tracks/", ok(track_json(id, "ALB162", 1, 3)))
+                .on("GET /me/player/devices", ok(devices()))
+                .on(
+                    "PUT /me/player/play",
+                    status(503, "", "Service unavailable"),
+                ),
+            app: &fake,
+            plays: offset_uri,
+        };
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(outcome.via, Via::Applescript);
+        let fallback = outcome.fallback.expect("says why");
+        assert_eq!(fallback.reason.code, "web_api_failed");
+        assert!(crate::webapi::unanswered(&fallback.reason));
+        assert_eq!(
+            fake.commands()
+                .iter()
+                .filter(|c| c.starts_with("play track"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_applescript_fallback_plays_a_track_in_its_album() {
+        use crate::webapi::tests::{FakeWeb, devices, ok, status, track_json};
+        // The Web API found the album, then refused the start: the album goes on after it.
+        let id = "1700000000000000000000";
+        let fake = app();
+        let web = WebOnApp {
+            web: FakeWeb::default()
+                .on("GET /tracks/", ok(track_json(id, "ALB17", 1, 4)))
+                .on("GET /me/player/devices", ok(devices()))
+                .on(
+                    "PUT /me/player/play",
+                    status(429, "", "API rate limit exceeded"),
+                ),
+            app: &fake,
+            plays: offset_uri,
+        };
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(outcome.via, Via::Applescript);
+        assert_eq!(
+            fake.commands(),
+            [format!(
+                "play track \"spotify:track:{id}\" in context \"spotify:album:ALB17\""
+            )]
+        );
+        // A relinked song: the lookup's album (the release asked for) lists it under the id it
+        // links from, which is started there (by the id that plays, Spotify.app would start the
+        // album's first track), and either id counts as the song asked for.
+        let requested = "1710000000000000000000";
+        let substitute = "1720000000000000000000";
+        let mut lookup = track_json(substitute, "ALB172", 1, 2);
+        lookup["linked_from"] =
+            json!({"id": requested, "type": "track", "uri": format!("spotify:track:{requested}")});
+        let fake = app();
+        let web = WebOnApp {
+            web: FakeWeb::default()
+                .on("GET /tracks/", ok(lookup))
+                .on("GET /me/player/devices", ok(devices()))
+                .on(
+                    "PUT /me/player/play",
+                    status(403, "PREMIUM_REQUIRED", "Premium required"),
+                ),
+            app: &fake,
+            plays: offset_uri,
+        };
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let outcome = c
+            .play(&play_uri(&track_uri(requested), None))
+            .expect("plays");
+        assert_eq!(outcome.via, Via::Applescript);
+        assert_eq!(
+            fake.commands(),
+            [format!(
+                "play track \"spotify:track:{requested}\" in context \"spotify:album:ALB172\""
+            )]
+        );
+        // The caller's context wins.
+        let id = "1730000000000000000000";
+        let fake = app();
+        let web = WebOnApp {
+            web: FakeWeb::default()
+                .on("GET /tracks/", ok(track_json(id, "ALB173", 1, 1)))
+                .on("GET /me/player/devices", ok(devices()))
+                .on("PUT /me/player/play", status(429, "", "limited")),
+            app: &fake,
+            plays: offset_uri,
+        };
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let playlist = "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M";
+        c.play(&play_uri(&track_uri(id), Some(playlist)))
+            .expect("plays");
+        assert_eq!(
+            fake.commands(),
+            [format!(
+                "play track \"spotify:track:{id}\" in context \"{playlist}\""
+            )]
+        );
+    }
+
+    #[test]
+    fn the_applescript_fallback_plays_a_track_alone_where_its_album_does_not_place_it() {
+        use crate::webapi::tests::{FakeWeb, devices, ok, status, track_json};
+        // The album refused the start by uri and by position: not in that album again.
+        let id = "1740000000000000000000";
+        let fake = app();
+        let web = WebOnApp {
+            web: FakeWeb::default()
+                .on("GET /tracks/", ok(track_json(id, "ALB174", 1, 4)))
+                .on("GET /me/player/devices", ok(devices()))
+                .on("PUT /me/player/play", status(404, "", "Not found.")),
+            app: &fake,
+            plays: offset_uri,
+        };
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(outcome.via, Via::Applescript);
+        assert_eq!(web.web.bodies("PUT").len(), 2, "by uri, then by position");
+        assert_eq!(
+            fake.commands(),
+            [format!("play track \"spotify:track:{id}\"")]
+        );
+        // Another track of the album played, by uri and by position alike.
+        let id = "1750000000000000000000";
+        let mut lookup = track_json(id, "ALB175", 1, 3);
+        lookup["name"] = json!("Third Song");
+        let fake = app();
+        let web = WebOnApp {
+            web: FakeWeb::default()
+                .on("GET /tracks/", ok(lookup))
+                .on("GET /me/player/devices", ok(devices()))
+                .on("PUT /me/player/play", ok(Value::Null)),
+            app: &fake,
+            plays: |_| Some("spotify:track:first-of-album".into()),
+        };
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(outcome.via, Via::Applescript);
+        let reason = outcome.fallback.expect("says why").reason;
+        assert_eq!(reason.code, "no_effect");
+        assert_eq!(
+            reason
+                .details
+                .as_ref()
+                .map(|d| d["landed_elsewhere"].clone()),
+            Some(json!(true))
+        );
+        assert_eq!(
+            fake.commands(),
+            [format!("play track \"spotify:track:{id}\"")]
+        );
+    }
+
+    #[test]
+    fn a_relinked_song_started_in_the_callers_context_by_applescript_counts() {
+        use crate::webapi::tests::{FakeWeb, devices, ok, status, track_json};
+        let requested = "1760000000000000000000";
+        let substitute = "spotify:track:1770000000000000000000";
+        let mut lookup = track_json(&substitute[14..], "ALB177", 1, 2);
+        lookup["name"] = json!("Relinked Song");
+        lookup["linked_from"] =
+            json!({"id": requested, "type": "track", "uri": format!("spotify:track:{requested}")});
+        let fake = FakeApp {
+            relinked: &[(
+                "spotify:track:1760000000000000000000",
+                "spotify:track:1770000000000000000000",
+            )],
+            ..app()
+        };
+        let web = WebOnApp {
+            web: FakeWeb::default()
+                .on("GET /tracks/", ok(lookup))
+                .on("GET /me/player/devices", ok(devices()))
+                .on("PUT /me/player/play", status(429, "", "limited")),
+            app: &fake,
+            plays: offset_uri,
+        };
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let playlist = "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M";
+        // Spotify.app shows the release it plays from: that is the song asked for.
+        let outcome = c
+            .play(&play_uri(&track_uri(requested), Some(playlist)))
+            .expect("plays");
+        assert_eq!(outcome.via, Via::Applescript);
+        assert_eq!(
+            outcome.playback.track.map(|t| t.uri).as_deref(),
+            Some(substitute)
+        );
+        assert_eq!(
+            fake.commands(),
+            [format!(
+                "play track \"spotify:track:{requested}\" in context \"{playlist}\""
+            )]
+        );
+    }
+
+    #[test]
+    fn a_start_while_spotify_plays_on_an_unlisted_device_names_no_device() {
+        let id = "1780000000000000000000";
+        let fake = app();
+        fake.app.lock().expect("lock").state = "playing".into();
+        // No listed device is active, yet Spotify.app plays.
+        let web = web_for(&fake, id, offset_uri);
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(outcome.via, Via::WebApi);
+        assert_eq!(outcome.note, None);
+        assert!(
+            web.web.sent().iter().any(|r| r == "PUT /me/player/play?"),
+            "{:?}",
+            web.web.sent()
+        );
+    }
+
+    #[test]
+    fn a_track_starts_on_the_speaker_spotify_app_controls_and_says_so() {
+        use crate::webapi::tests::{FakeWeb, devices_with, ok, track_json};
+        let id = "1800000000000000000000";
+        let fake = app();
+        let web = WebOnApp {
+            web: FakeWeb::default()
+                .on("GET /tracks/", ok(track_json(id, "ALB18", 1, 1)))
+                .on("GET /me/player/devices", ok(devices_with(Some("speaker"))))
+                .on("PUT /me/player/play", ok(Value::Null)),
+            app: &fake,
+            plays: offset_uri,
+        };
+        let c = Controller {
+            web: Ok(&web),
+            ..controller(&fake)
+        };
+        let outcome = c.play(&play_uri(&track_uri(id), None)).expect("plays");
+        assert_eq!(outcome.via, Via::WebApi);
+        assert!(
+            outcome
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("Kitchen")),
+            "{:?}",
+            outcome.note
+        );
+        assert!(
+            web.web
+                .sent()
+                .iter()
+                .any(|r| r == "PUT /me/player/play?device_id=speaker")
+        );
+    }
+
+    const FIRST_LIKED: &str = "spotify:track:F1RSTL1KED000000000000";
+    const LATEST_EPISODE: &str = "spotify:episode:LATEST0000000000000000";
+
+    /// The Web API in front of a fake Spotify.app for list starts. Liked Songs
+    /// (`…:collection`) plays the song at the offset's position, in order or in the shuffled
+    /// order Spotify.app keeps for it (`kept_shuffle`), which Spotify.app switches to when the
+    /// list starts; a show plays its latest episode; `PUT /me/player/shuffle` sets shuffle (and
+    /// the kept one while Liked Songs plays).
+    struct ListWeb<'a> {
+        web: crate::webapi::tests::FakeWeb,
+        app: &'a FakeApp,
+        kept_shuffle: Mutex<bool>,
+        liked_playing: Mutex<bool>,
+        /// Spotify.app switches to Liked Songs' kept shuffle only [`LATE_READS`] reads after the
+        /// list started: its first song shows in the shuffle of the list before (seen live).
+        late: bool,
+        /// Spotify switches this many of the next shuffle sets back, one read later.
+        undo_next_shuffle: Mutex<u32>,
+    }
+
+    impl<'a> ListWeb<'a> {
+        /// Liked Songs holds 527 songs, the first titled otherwise than [`FakeApp`]'s.
+        fn new(app: &'a FakeApp, kept_shuffle: bool, device: Option<&str>) -> Self {
+            use crate::webapi::tests::{FakeWeb, devices_with, ok};
+            let first = json!({"id": &FIRST_LIKED[14..], "uri": FIRST_LIKED, "type": "track",
+                "name": "First Liked", "duration_ms": 180_000, "album": {"name": "Other"}});
+            Self {
+                web: FakeWeb::default()
+                    .on("GET /me/player/devices", ok(devices_with(device)))
+                    .on(
+                        "GET /me/tracks",
+                        ok(json!({"total": 527, "items": [{"track": first}]})),
+                    )
+                    .on("PUT /me/player/shuffle", ok(Value::Null))
+                    .on("PUT /me/player/play", ok(Value::Null)),
+                app,
+                kept_shuffle: Mutex::new(kept_shuffle),
+                liked_playing: Mutex::new(false),
+                late: false,
+                undo_next_shuffle: Mutex::new(0),
+            }
+        }
+
+        /// Spotify.app shows the start in the shuffle of the list before, and switches to Liked
+        /// Songs' kept one only [`LATE_READS`] reads later.
+        fn late(self) -> Self {
+            Self { late: true, ..self }
+        }
+
+        /// Answers `request` with `reply` from now on, in place of the usual answer.
+        fn on(self, request: &str, reply: webapi::Reply) -> Self {
+            self.web
+                .answers
+                .lock()
+                .expect("lock")
+                .retain(|(prefix, _)| prefix != request);
+            Self {
+                web: self.web.on(request, reply),
+                ..self
+            }
+        }
+    }
+
+    impl WebApi for ListWeb<'_> {
+        fn send(
+            &self,
+            method: webapi::Method,
+            path: &str,
+            query: &[(&str, &str)],
+            body: Option<&Value>,
+        ) -> Result<webapi::Reply> {
+            let reply = self.web.send(method, path, query, body)?;
+            if method != webapi::Method::Put || reply.status >= 300 {
+                return Ok(reply);
+            }
+            let mut app = self.app.app.lock().expect("lock");
+            let mut kept = self.kept_shuffle.lock().expect("lock");
+            let mut liked = self.liked_playing.lock().expect("lock");
+            if path == "/me/player/shuffle" {
+                let on = query.contains(&("state", "true"));
+                app.shuffling = on;
+                if *liked {
+                    *kept = on;
+                }
+                let mut undo = self.undo_next_shuffle.lock().expect("lock");
+                if *undo > 0 {
+                    *undo -= 1;
+                    app.late_shuffle = Some((1, !on));
+                }
+                return Ok(reply);
+            }
+            let context = body
+                .and_then(|b| b.get("context_uri"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let position = body
+                .and_then(|b| b.pointer("/offset/position"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let uri = if context.ends_with(":collection") {
+                *liked = true;
+                if self.late {
+                    app.late_shuffle = Some((LATE_READS, *kept));
+                } else {
+                    app.shuffling = *kept;
+                }
+                match (app.shuffling, position) {
+                    (false, 0) => FIRST_LIKED.to_owned(),
+                    (false, p) => format!("spotify:track:L{p:021}"),
+                    (true, p) => format!("spotify:track:S{p:021}"),
+                }
+            } else if context.starts_with("spotify:show:") {
+                *liked = false;
+                LATEST_EPISODE.to_owned()
+            } else {
+                return Ok(reply);
+            };
+            app.uri = Some(uri);
+            app.state = "playing".into();
+            app.position = 0;
+            Ok(reply)
+        }
+
+        fn pause_left(&self) -> Duration {
+            self.web.pause_left()
+        }
+
+        fn rate_limited(&self, retry_after: Option<&str>) {
+            self.web.rate_limited(retry_after);
+        }
+    }
+
+    #[test]
+    fn plain_liked_songs_start_in_order_through_the_web_api() {
+        // Liked Songs kept a shuffle: it starts shuffled, is turned off and started again at its
+        // first song. Spotify.app never comes forward.
+        for kept in [true, false] {
+            let (fake, app) = liked_setup(false);
+            let desk = Desk::new(&app);
+            let web = ListWeb::new(&app, kept, None);
+            let c = Controller {
+                web: Ok(&web),
+                focus: Some(&desk),
+                ..with_player(&app, &fake.player)
+            };
+            let outcome = c.play(&liked(false)).expect("plays liked");
+            assert_eq!(outcome.via, Via::WebApi, "kept {kept}");
+            assert_eq!(outcome.action, "play_liked");
+            assert_eq!(outcome.fallback, None);
+            assert_eq!(outcome.playback.shuffling, Some(false));
+            assert_eq!(
+                outcome.playback.track.map(|t| t.uri).as_deref(),
+                Some(FIRST_LIKED),
+                "kept {kept}"
+            );
+            let starts = web.web.bodies("PUT /me/player/play");
+            assert_eq!(
+                starts[0],
+                json!({"context_uri": "spotify:user:user1:collection", "offset": {"position": 0}, "position_ms": 0})
+            );
+            assert_eq!(starts.len(), if kept { 2 } else { 1 }, "kept {kept}");
+            let shuffles: Vec<String> = web
+                .web
+                .sent()
+                .into_iter()
+                .filter(|r| r.starts_with("PUT /me/player/shuffle"))
+                .collect();
+            // Only once it plays shuffled: before the start it would change the list before.
+            assert_eq!(shuffles.len(), usize::from(kept), "{shuffles:?}");
+            assert!(shuffles.iter().all(|r| r.contains("state=false")));
+            // No AppleScript start, no spotify_player start, nothing came forward.
+            assert!(app.commands().is_empty(), "{:?}", app.commands());
+            assert!(fake.commands().is_empty(), "{:?}", fake.commands());
+            assert!(desk.activated.lock().expect("lock").is_empty());
+        }
+    }
+
+    #[test]
+    fn random_liked_songs_start_shuffled_at_a_random_position_through_the_web_api() {
+        let mut positions = std::collections::HashSet::new();
+        for kept in [false, true, false, true] {
+            let (fake, app) = liked_setup(false);
+            let web = ListWeb::new(&app, kept, None);
+            let c = Controller {
+                web: Ok(&web),
+                ..with_player(&app, &fake.player)
+            };
+            let outcome = c.play(&liked(true)).expect("plays liked");
+            assert_eq!(outcome.via, Via::WebApi);
+            assert_eq!(outcome.playback.shuffling, Some(true), "kept {kept}");
+            let starts = web.web.bodies("PUT /me/player/play");
+            assert_eq!(starts.len(), 1, "one start");
+            let position = starts[0]["offset"]["position"].as_u64().expect("position");
+            assert!(position < 527);
+            positions.insert(position);
+            // Shuffle on once it plays, when Spotify.app switched to a kept shuffle that is off.
+            let shuffles: Vec<String> = web
+                .web
+                .sent()
+                .into_iter()
+                .filter(|r| r.starts_with("PUT /me/player/shuffle"))
+                .collect();
+            assert_eq!(shuffles.len(), usize::from(!kept), "{shuffles:?}");
+            assert!(shuffles.iter().all(|r| r.contains("state=true")));
+            assert_eq!(
+                web.web.sent()[..2],
+                [
+                    "GET /me/tracks?limit=1&market=from_token".to_owned(),
+                    "GET /me/player/devices?".to_owned()
+                ]
+            );
+            assert!(app.commands().is_empty(), "{:?}", app.commands());
+        }
+        assert!(positions.len() > 1, "random: {positions:?}");
+    }
+
+    #[test]
+    fn a_kept_shuffle_spotify_switches_to_late_is_waited_for_then_set() {
+        // The QA case: in order, the first song showed with shuffle off (the list before's),
+        // Spotify switched to Liked Songs' kept shuffle a moment later, and the start reported
+        // `shuffling: false` while Liked Songs went on shuffled.
+        let (fake, app) = liked_setup(false);
+        let web = ListWeb::new(&app, true, None).late();
+        let c = Controller {
+            web: Ok(&web),
+            ..with_player(&app, &fake.player)
+        };
+        let outcome = c.play(&liked(false)).expect("plays liked");
+        assert_eq!(outcome.via, Via::WebApi);
+        assert_eq!(outcome.playback.shuffling, Some(false));
+        assert_eq!(
+            outcome.playback.track.map(|t| t.uri).as_deref(),
+            Some(FIRST_LIKED)
+        );
+        // What Spotify.app keeps, not only what was reported.
+        {
+            let now = app.app.lock().expect("lock");
+            assert!(!now.shuffling && now.late_shuffle.is_none());
+            assert_eq!(now.uri.as_deref(), Some(FIRST_LIKED));
+        }
+        let shuffles: Vec<String> = web
+            .web
+            .sent()
+            .into_iter()
+            .filter(|r| r.starts_with("PUT /me/player/shuffle"))
+            .collect();
+        assert_eq!(
+            shuffles,
+            [format!(
+                "PUT /me/player/shuffle?state=false&device_id={}",
+                crate::webapi::tests::MAC
+            )]
+        );
+        // The first song already played: shuffle off was enough, no second start.
+        assert_eq!(web.web.bodies("PUT /me/player/play").len(), 1);
+        assert!(app.commands().is_empty(), "{:?}", app.commands());
+
+        // Random: the start showed shuffle on (the list before's) and Spotify switched to Liked
+        // Songs' kept shuffle, off, a moment later: it is set on again.
+        let (fake, app) = liked_setup(true);
+        let web = ListWeb::new(&app, false, None).late();
+        let c = Controller {
+            web: Ok(&web),
+            ..with_player(&app, &fake.player)
+        };
+        let outcome = c.play(&liked(true)).expect("plays liked");
+        assert_eq!(outcome.playback.shuffling, Some(true));
+        assert!(app.app.lock().expect("lock").shuffling);
+        assert_eq!(web.web.bodies("PUT /me/player/play").len(), 1);
+        assert!(
+            web.web
+                .sent()
+                .iter()
+                .any(|r| r.starts_with("PUT /me/player/shuffle?state=true")),
+            "{:?}",
+            web.web.sent()
+        );
+    }
+
+    #[test]
+    fn a_shuffle_spotify_switches_back_after_it_was_set_is_set_again() {
+        // In order from a kept shuffle: the shuffled start is turned off, Spotify switches it
+        // back once, so it is checked again and set a second time; the list plays in order from
+        // its first song.
+        let (fake, app) = liked_setup(false);
+        let web = ListWeb::new(&app, true, None);
+        *web.undo_next_shuffle.lock().expect("lock") = 1;
+        let c = Controller {
+            web: Ok(&web),
+            ..with_player(&app, &fake.player)
+        };
+        let outcome = c.play(&liked(false)).expect("plays liked");
+        assert_eq!(outcome.playback.shuffling, Some(false));
+        assert_eq!(
+            outcome.playback.track.map(|t| t.uri).as_deref(),
+            Some(FIRST_LIKED)
+        );
+        assert!(!app.app.lock().expect("lock").shuffling);
+        let shuffles: Vec<String> = web
+            .web
+            .sent()
+            .into_iter()
+            .filter(|r| r.starts_with("PUT /me/player/shuffle"))
+            .collect();
+        assert_eq!(shuffles.len(), 2, "{shuffles:?}");
+        assert!(shuffles.iter().all(|r| r.contains("state=false")));
+        // Spotify keeps switching it back: said after two rounds, not claimed.
+        let (fake, app) = liked_setup(false);
+        let web = ListWeb::new(&app, true, None);
+        *web.undo_next_shuffle.lock().expect("lock") = 5;
+        let c = Controller {
+            web: Ok(&web),
+            ..with_player(&app, &fake.player)
+        };
+        let error = c.play(&liked(false)).expect_err("shuffle came back");
+        assert_eq!(error.code, "verification_failed");
+        assert!(error.retryable);
+        assert!(
+            error.message.contains("did not stay off"),
+            "{}",
+            error.message
+        );
+        let shuffles = web
+            .web
+            .sent()
+            .iter()
+            .filter(|r| r.starts_with("PUT /me/player/shuffle"))
+            .count();
+        assert_eq!(shuffles, 2, "{:?}", web.web.sent());
+    }
+
+    #[test]
+    fn liked_songs_fall_back_to_applescript_and_give_the_focus_back() {
+        use crate::webapi::tests::status;
+        let (fake, app) = liked_setup(false);
+        let desk = Desk::new(&app);
+        let web = ListWeb::new(&app, false, None).on(
+            "PUT /me/player/play",
+            status(403, "PREMIUM_REQUIRED", "Premium required"),
+        );
+        let c = Controller {
+            web: Ok(&web),
+            focus: Some(&desk),
+            ..with_player(&app, &fake.player)
+        };
+        let outcome = c.play(&liked(false)).expect("plays liked");
+        assert_eq!(outcome.via, Via::Applescript);
+        let fallback = outcome.fallback.expect("says why");
+        assert_eq!(
+            (fallback.from, fallback.reason.code.as_str()),
+            (Via::WebApi, "premium_required")
+        );
+        assert_eq!(outcome.refocused.map(|r| r.app).as_deref(), Some("iTerm2"));
+        assert_eq!(
+            app.commands(),
+            ["play track \"spotify:user:user1:collection\""]
+        );
+        assert!(fake.commands().is_empty(), "{:?}", fake.commands());
+    }
+
+    #[test]
+    fn a_liked_songs_start_whose_answer_was_lost_is_settled_not_started_again() {
+        let (fake, app) = liked_setup(false);
+        let web = LostAnswer {
+            inner: ListWeb::new(&app, true, None),
+            status: 504,
+        };
+        let c = Controller {
+            web: Ok(&web),
+            ..with_player(&app, &fake.player)
+        };
+        let outcome = c.play(&liked(false)).expect("plays liked");
+        assert_eq!(outcome.via, Via::WebApi);
+        assert!(
+            outcome
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("HTTP 504")),
+            "{:?}",
+            outcome.note
+        );
+        // Its shuffle still went off, on the active device, and it restarted in order.
+        assert_eq!(outcome.playback.shuffling, Some(false));
+        assert!(
+            web.inner
+                .web
+                .sent()
+                .contains(&"PUT /me/player/shuffle?state=false".to_owned()),
+            "{:?}",
+            web.inner.web.sent()
+        );
+        assert!(app.commands().is_empty(), "{:?}", app.commands());
+    }
+
+    #[test]
+    fn an_empty_liked_songs_is_said_at_once() {
+        use crate::webapi::tests::ok;
+        let (fake, app) = liked_setup(false);
+        let web = ListWeb::new(&app, false, None)
+            .on("GET /me/tracks", ok(json!({"total": 0, "items": []})));
+        let c = Controller {
+            web: Ok(&web),
+            ..with_player(&app, &fake.player)
+        };
+        let error = c.play(&liked(true)).expect_err("empty");
+        assert_eq!(error.code, "not_found");
+        assert!(app.commands().is_empty(), "{:?}", app.commands());
+        assert!(web.web.bodies("PUT").is_empty());
+    }
+
+    #[test]
+    fn a_show_starts_through_the_web_api_and_falls_back_to_applescript() {
+        let show = "spotify:show:6ll0MwobDt1JW9gYaOONEo";
+        let fake = app();
+        let desk = Desk::new(&fake);
+        let web = ListWeb::new(&fake, false, None);
+        let c = Controller {
+            web: Ok(&web),
+            focus: Some(&desk),
+            ..controller(&fake)
+        };
+        let target = PlayTarget::Uri {
+            uri: SpotifyUri::parse(show, None).expect("uri"),
+            context: None,
+            shuffle: false,
+        };
+        let outcome = c.play(&target).expect("plays");
+        assert_eq!(outcome.via, Via::WebApi);
+        assert_eq!(
+            outcome.playback.track.map(|t| t.uri).as_deref(),
+            Some(LATEST_EPISODE)
+        );
+        assert_eq!(
+            web.web.bodies("PUT /me/player/play"),
+            [json!({"context_uri": show})]
+        );
+        assert!(fake.commands().is_empty(), "{:?}", fake.commands());
+        // The Web API refuses: AppleScript starts it, and the focus goes back.
+        let fake = app();
+        let desk = Desk::new(&fake);
+        let web = ListWeb::new(&fake, false, None).on(
+            "PUT /me/player/play",
+            crate::webapi::tests::status(429, "", "limited"),
+        );
+        let c = Controller {
+            web: Ok(&web),
+            focus: Some(&desk),
+            ..controller(&fake)
+        };
+        let outcome = c.play(&target).expect("plays");
+        assert_eq!(outcome.via, Via::Applescript);
+        assert_eq!(
+            outcome.fallback.map(|f| f.reason.code).as_deref(),
+            Some("rate_limited")
+        );
+        assert_eq!(fake.commands(), [format!("play track \"{show}\"")]);
+        assert_eq!(outcome.refocused.map(|r| r.app).as_deref(), Some("iTerm2"));
     }
 
     #[test]
@@ -2662,6 +4713,33 @@ exit 0
             ]
         );
         assert!(fake.commands().is_empty(), "{:?}", fake.commands());
+    }
+
+    #[test]
+    fn applescript_liked_songs_wait_for_a_kept_shuffle_spotify_switches_to_late() {
+        // The list starts in the shuffle of the list before (off), and Spotify.app switches to
+        // Liked Songs' kept shuffle (on) a few reads later: it is turned off and the list
+        // started again, so it ends in order, as Spotify.app keeps it.
+        let (fake, app) = liked_setup(false);
+        app.app.lock().expect("lock").late_kept = Some(true);
+        let outcome = with_player(&app, &fake.player)
+            .play(&liked(false))
+            .expect("plays liked");
+        assert_eq!(outcome.via, Via::Applescript);
+        assert_eq!(outcome.playback.shuffling, Some(false));
+        {
+            let now = app.app.lock().expect("lock");
+            assert!(!now.shuffling, "Spotify.app kept shuffle on");
+            assert_eq!(now.uri.as_deref(), Some("spotify:track:first-liked"));
+        }
+        assert_eq!(
+            app.commands(),
+            vec![
+                "play track \"spotify:user:user1:collection\"".to_owned(),
+                "set shuffling to false".to_owned(),
+                "play track \"spotify:user:user1:collection\"".to_owned(),
+            ]
+        );
     }
 
     #[test]

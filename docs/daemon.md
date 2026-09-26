@@ -11,7 +11,7 @@ What it does:
 | Run AppleScript | in-process `NSAppleScript` on the main thread, each script compiled once (~50 ms per read, no process spawn) |
 | Fire triggers | the pure trigger engine; firings go to a durable outbox |
 | Deliver Tings | opens the creating Silicon's session under its lock, refreshes if needed, sends through the backend; retries with backoff for an hour |
-| Managed queue | hands over to the next queued item at the end of each song, resumes the interrupted context; `next`, `play <item>`, `previous` and hand-offs reach Spotify one at a time, never interleaved |
+| Managed queue | hands over to the next queued item at the end of each song, resumes the interrupted context; `next`, `play <item>`, `previous` and hand-offs reach Spotify one at a time, never interleaved. When a hand-off brings Spotify.app to the front, the focus goes back (`keep_spotify_in_background`) |
 | Warm spotify_player | keeps one headless instance on a pseudo-terminal so Web API calls take ~20 ms, with its view of playback refreshed every 20 s ([below](#the-warm-spotify-player)) |
 | Library reads | retries a library or playlist read once after a network blip, and makes reads right after a change wait until they can see it ([below](#library-and-playlist-reads)) |
 | Telemetry relay | relays CLI and daemon events to the backend every minute, draining the whole backlog (when enabled) |
@@ -80,7 +80,8 @@ playback device and only answers Web API commands.
   interval it runs with ("playback refresh every 20 s", `refresh_ms` in `--json`).
 - **Why not faster.** Spotify rate-limits a client ID over a rolling 30-second window and does
   not publish the limit. The poll shares that quota with spotify_player's commands, its re-reads
-  after them and the daemon's own lookups. With a development-mode client ID, a 3 s poll (10 GETs
+  after them, and the daemon's own Web API lookups, searches and starts (those pause together
+  after a 429). With a development-mode client ID, a 3 s poll (10 GETs
   per window) drew a 429 about every 30 s even while idle, and each `Retry-After` (6–15 s) froze
   the view and stalled commands. 20 s is 1–2 GETs per window (the 10 s floor at most 3), which
   leaves most of the quota to commands.
@@ -166,8 +167,15 @@ optional (·) for `unknown`, with the fix: start Spotify (`spotify launch`), the
 really re-checks.
 
 If you clicked Don't Allow: System Settings → Privacy & Security → Automation → spotify-daemon →
-enable Spotify. If no prompt ever appears, try resetting only the daemon's Automation answers,
-then retry:
+turn on Spotify (the `automation_permission_denied` hint says the same). The `spotify` command
+never sends Apple Events itself (see the end of this section); spotify-daemon does, and macOS
+files the answer under the app responsible for the daemon's process. That is spotify-daemon when
+launchd runs it (`spotify daemon install`, which the installer and `spotify setup` do). A daemon
+started from a terminal (`spotify daemon run`, or started on demand by a `spotify` command while
+no launchd agent is installed) belongs to that terminal app, so macOS asks for, and lists, the
+terminal (Terminal, iTerm, …) instead: turn on Spotify under its entry, or run
+`spotify daemon install` so launchd runs the daemon. If spotify-daemon is not listed or no prompt
+ever appears, try resetting only the daemon's Automation answers, then retry so macOS asks:
 
 ```sh
 tccutil reset AppleEvents com.unlikefraction.spotify-daemon
@@ -197,9 +205,11 @@ itself; it asks the daemon.
 
 The socket is owner-only inside an owner-only directory, and both sides check the peer runs as
 the same user. The daemon holds no credentials of its own; Silicon sessions stay in each home.
-It reads spotify_player's cached Spotify access tokens only for two Web API lookups spotify_player
-has no command for (`spotify docs auth`), and sends them only to `api.spotify.com`. It never
-sends lyrics, titles, search queries or notes to telemetry.
+It reads spotify_player's cached Spotify access tokens only for what spotify_player has no
+command for or cannot do: starting songs, episodes, shows and Liked Songs in the background, a
+search when spotify_player's fails, and a few lookups (`spotify docs auth`).
+It sends them only to `api.spotify.com` and never logs them. It never sends lyrics, titles,
+search queries or notes to telemetry.
 
 Telemetry (`spotify docs telemetry`) waits in `daemon.sqlite` (at most 2 000 events). Every minute
 the daemon relays all of it, in requests of at most 40 events and 64 KiB, and keeps the rest for

@@ -12,6 +12,7 @@ refused (exit 2) with the JSON form they meant as the hint, e.g.
 ```sh
 spotify config set '{"telemetry": false}'
 spotify config set '{"strategy": "applescript", "launch_spotify": false}'
+spotify config set '{"keep_spotify_in_background": false}'   # only if Spotify.app may stay in front
 spotify config set '{"notify_isi": "planner", "search_limit": 5}'
 spotify config set '{"strategy": null}'
 spotify config show          # effective values, defaults filled in, env overrides
@@ -28,9 +29,10 @@ Stemcell applies `silicon.app_configs.spotify` with exactly this command
 | `api_url` | https origin | `https://backend.spotify.unlikefraction.com` | Backend. `SPOTIFY_API_URL` overrides. |
 | `telemetry` | bool | `true` | Usage and diagnostics to Space Station (`spotify docs telemetry`). |
 | `org` | org handle | `SILICON_ORG`, then the session's | Organization for Ting delivery. |
-| `strategy` | `auto` \| `spotify_player` \| `applescript` | `auto` | Playback path (`spotify docs playback`). |
+| `strategy` | `auto` \| `spotify_player` \| `applescript` | `auto` | Playback path (`spotify docs playback`). `auto`: every start goes through the Web API first (songs, episodes, shows and Liked Songs directly, the rest through spotify_player), AppleScript is the fallback. `applescript` never uses the Web API, so every start goes through AppleScript (a radio cannot start). `spotify_player` never uses AppleScript. |
 | `launch_spotify` | bool | `true` | Launch Spotify.app hidden when a control command finds it closed. |
-| `verify_timeout_ms` | 200–15000 | `2500` | How long to wait for spotify_player's effect before falling back (`play`, `pause`, `toggle`, `volume` and `shuffle` wait at most 1.5 s); `like` waits up to this plus 1.1 s for spotify_player to catch up (`spotify docs playback`). |
+| `verify_timeout_ms` | 200–15000 | `2500` | How long to wait for spotify_player's effect, or for a Web API start (a song, episode, show or Liked Songs) to show in Spotify.app, before falling back to AppleScript; a start whose Web API answer was lost is looked for as long before anything starts it again (`play`, `pause`, `toggle`, `volume` and `shuffle` wait at most 1.5 s); `like` waits up to this plus 1.1 s for spotify_player to catch up (`spotify docs playback`). |
+| `keep_spotify_in_background` | bool | `true` | When an AppleScript start brings Spotify.app to the front (the fallback when a Web API start was not possible or did not take effect, an album or playlist spotify_player could not start, the restore after a failed start, the managed queue's hand-offs), give the focus back to the app that had it, and hide Spotify.app again if it was hidden. On by default, so keeping Spotify.app from jumping to the front needs nothing: check it with `spotify config get keep_spotify_in_background`, and turn it off (`false`) only if you want Spotify.app to stay in front. Needs no macOS permission (`spotify docs playback`). |
 | `spotify_player_binary` | absolute path | auto-detect | spotify_player executable. |
 | `spotify_player_config_dir` | absolute path | `~/.config/spotify-player` | spotify_player `-c`. |
 | `spotify_player_cache_dir` | absolute path | `~/.cache/spotify-player` | spotify_player `-C` (its Spotify tokens). |
@@ -62,3 +64,4 @@ Stemcell applies `silicon.app_configs.spotify` with exactly this command
 | `SPOTIFY_WARM_PLAYER=off` | Do not run the warm spotify_player instance (for the daemon; copies left by earlier daemons are still stopped). |
 | `SPOTIFY_DAEMON_AUTOSTART=0` | Never start the daemon on demand (commands that need it fail with `daemon_unavailable`). |
 | `SPOTIFY_DEBUG=1` | Print full error details in human mode. |
+| `SPOTIFY_HINTS` | The `Next:` suggestions after human output go to stderr, and only when stdout is a terminal: never when stdout is a pipe or a file, where they would show up before the output the pipe's reader prints (`--json` never prints them). `0`, `false`, `off` or `no` (any case) turns them off; `always` prints them even when stdout is not a terminal. |

@@ -614,6 +614,33 @@ pub async fn command(ctx: &Ctx, action: DaemonCommand) -> Result<()> {
     Ok(())
 }
 
+/// What `status_if_running` found.
+pub enum Found {
+    /// A daemon answered with its status.
+    Running(Value),
+    /// Something listens on the socket but gave no status (the error code: `timeout`,
+    /// `protocol_mismatch`, …): it is stuck or from another release.
+    NotAnswering(String),
+    /// Nothing listens.
+    NotRunning,
+}
+
+/// The running daemon's status over its local socket, without starting or replacing one, waiting
+/// at most `timeout`.
+pub async fn status_if_running(timeout: Duration) -> Found {
+    if !ipc::socket_path().is_ok_and(|p| p.exists()) {
+        return Found::NotRunning;
+    }
+    let request = request(None, "daemon.status", json!({}));
+    match tokio::time::timeout(timeout, ipc::call(&request, timeout)).await {
+        Ok(Ok(status)) => Found::Running(status),
+        // A stale socket file refuses the connection.
+        Ok(Err(error)) if error.code == "daemon_unavailable" => Found::NotRunning,
+        Ok(Err(error)) => Found::NotAnswering(error.code),
+        Err(_) => Found::NotAnswering("timeout".into()),
+    }
+}
+
 /// Calls the daemon only if it is already running (never starts one).
 pub async fn call_if_running(ctx: &Ctx, op: &str, args: Value) -> Option<Value> {
     if probe().await.is_err() {

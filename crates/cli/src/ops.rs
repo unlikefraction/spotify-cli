@@ -13,7 +13,7 @@ use crate::args::{
     QueueCommand, QueueKindArg, RepeatArg, ScopeArg, Switch, TrackKindArg, TriggerAdd,
     TriggerCommand,
 };
-use crate::render;
+use crate::{next, render};
 
 /// Most firings `trigger history` returns.
 const HISTORY_MAX: usize = 500;
@@ -83,7 +83,11 @@ fn playlist_items(items: &[String]) -> Result<Vec<SpotifyUri>> {
 
 /// Checks `--limit` against what the command can honor. Out-of-range values (negative ones too)
 /// are rejected rather than clamped, so the output always reflects the limit applied.
-fn check_limit(limit: Option<i64>, max: Option<usize>, hint: &str) -> Result<Option<usize>> {
+pub(crate) fn check_limit(
+    limit: Option<i64>,
+    max: Option<usize>,
+    hint: &str,
+) -> Result<Option<usize>> {
     let Some(value) = limit else {
         return Ok(None);
     };
@@ -153,9 +157,15 @@ async fn first_hit(ctx: &Ctx, query: &str, kind: Kind, kinds: &str) -> Result<(S
     Ok((parse_uri(uri, None)?, hit))
 }
 
+/// `play --liked`. Liked Songs has no shuffled start of its own: --shuffle asks for what
+/// --random does (a random song, a new shuffle order).
+fn liked_target(args: &PlayArgs) -> Value {
+    json!({"type": "liked", "limit": args.limit, "random": args.random || args.shuffle})
+}
+
 async fn play(ctx: &Ctx, args: PlayArgs) -> Result<()> {
     let target = if args.liked {
-        json!({"type": "liked", "limit": args.limit, "random": args.random})
+        liked_target(&args)
     } else if let Some(seed) = &args.radio {
         json!({"type": "radio", "uri": parse_uri(seed, args.kind.map(kind))?})
     } else if let Some(query) = &args.search {
@@ -179,6 +189,7 @@ async fn play(ctx: &Ctx, args: PlayArgs) -> Result<()> {
     };
     let value = ctx.daemon("player.play", json!({"target": target})).await?;
     ctx.emit(&value, render::outcome);
+    ctx.next(&next::after_play(&value));
     Ok(())
 }
 
@@ -226,6 +237,58 @@ fn known_item(uri: &SpotifyUri, hit: &Value) -> Value {
         "name": hit.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()),
         "by": by,
         "duration_ms": hit.get("duration_ms").and_then(Value::as_u64),
+    })
+}
+
+/// What `spotify lyrics` says when it is given words instead of a track: find the track first.
+#[must_use]
+pub(crate) fn lyrics_search_advice(words: &str) -> String {
+    format!(
+        "`spotify lyrics` takes a track, not search words: {}",
+        find_the_track(words)
+    )
+}
+
+/// How to get from a song's words to its lyrics: search for the track, then pass its URI.
+#[must_use]
+pub(crate) fn find_the_track(words: &str) -> String {
+    let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!(
+        "find it with `spotify search {} --type track`, then run `spotify lyrics <uri>` with the spotify:track: URI it shows.",
+        quote(&words)
+    )
+}
+
+/// A word for a shell command line: in single quotes when it needs them.
+fn quote(text: &str) -> String {
+    if !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/'))
+    {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
+
+/// The track `spotify lyrics` was given. Words that are no URI, link or id (a song's name) get
+/// the way to find the track, instead of the id format alone.
+fn lyrics_target(target: &str) -> Result<SpotifyUri> {
+    parse_uri(target, Some(Kind::Track)).map_err(|mut error| {
+        let trimmed = target.trim();
+        let reference = trimmed.starts_with("spotify:")
+            || trimmed.starts_with("http://")
+            || trimmed.starts_with("https://");
+        if error.code == "invalid_input" && !reference && !trimmed.is_empty() {
+            error.message = format!("`{trimmed}` is not a track URI, link or id.");
+            error.hint = format!("{} {}", lyrics_search_advice(trimmed), error.hint);
+            error = error.with_details(json!({
+                "value": trimmed,
+                "search": format!("spotify search {} --type track", quote(trimmed)),
+            }));
+        }
+        error
     })
 }
 
@@ -280,6 +343,7 @@ pub async fn run(ctx: &Ctx, command: Command) -> Result<()> {
         Command::Status { full } => {
             let value = ctx.daemon("player.status", json!({"full": full})).await?;
             ctx.emit(&value, render::status);
+            ctx.next(&next::after_status(&value));
         }
         Command::Play(args) => play(ctx, args).await?,
         Command::Resume => {
@@ -360,12 +424,11 @@ pub async fn run(ctx: &Ctx, command: Command) -> Result<()> {
                 }
             }
             ctx.emit(&value, render::track);
+            ctx.next(&next::after_track(&value));
         }
         Command::Lyrics { target } => {
-            let uri = target
-                .as_deref()
-                .map(|t| parse_uri(t, Some(Kind::Track)))
-                .transpose()?;
+            let uri = target.as_deref().map(lyrics_target).transpose()?;
+            let asked = uri.is_some();
             let value = ctx.daemon("lyrics", json!({"uri": uri})).await?;
             ctx.emit(&value, |v| {
                 format!(
@@ -374,6 +437,7 @@ pub async fn run(ctx: &Ctx, command: Command) -> Result<()> {
                     v["text"].as_str().unwrap_or("")
                 )
             });
+            ctx.next(&next::after_lyrics(&value, asked));
         }
         Command::Search {
             query,
@@ -419,8 +483,10 @@ pub async fn run(ctx: &Ctx, command: Command) -> Result<()> {
                 ctx.emit(&json!({"search": value, "played": played}), |v| {
                     render::outcome(&v["played"])
                 });
+                ctx.next(&next::after_play(&played));
             } else {
                 ctx.emit(&value, render::search);
+                ctx.next(&next::after_search(&value));
             }
         }
         Command::Library { section, limit } => {
@@ -438,6 +504,7 @@ pub async fn run(ctx: &Ctx, command: Command) -> Result<()> {
             )?;
             let value = read(ctx, "library.get", json!({"key": key, "limit": limit})).await?;
             ctx.emit(&value, render::items_list);
+            ctx.next(&next::after_library(&value, key));
         }
         Command::Queue { action } => queue(ctx, action.unwrap_or(QueueCommand::List)).await?,
         Command::Playlist { action } => playlist(ctx, action).await?,
@@ -446,6 +513,7 @@ pub async fn run(ctx: &Ctx, command: Command) -> Result<()> {
             DeviceCommand::List => {
                 let value = ctx.daemon("devices.list", json!({})).await?;
                 ctx.emit(&value, render::devices);
+                ctx.next(&next::after_devices(&value));
             }
             DeviceCommand::Connect { id, name } => {
                 let value = ctx
@@ -470,6 +538,7 @@ async fn queue(ctx: &Ctx, action: QueueCommand) -> Result<()> {
         QueueCommand::List => {
             let value = ctx.daemon("queue.list", json!({})).await?;
             ctx.emit(&value, render::queue);
+            ctx.next(&next::after_queue(&value));
         }
         QueueCommand::Add {
             items,
@@ -508,7 +577,8 @@ async fn queue(ctx: &Ctx, action: QueueCommand) -> Result<()> {
                 )
                 .await?;
             ctx.emit(&value, render::queue_added);
-            ctx.hint("They play when the current track ends (or run `spotify next`). See `spotify queue`.");
+            ctx.hint("They play when the current track ends (or run `spotify next`).");
+            ctx.next(&next::after_queue_add(&value));
         }
         QueueCommand::Remove { item } => {
             let value = ctx.daemon("queue.remove", json!({"item": item})).await?;
@@ -552,6 +622,7 @@ async fn playlist(ctx: &Ctx, action: PlaylistCommand) -> Result<()> {
             )?;
             let value = read(ctx, "playlist.list", json!({"limit": limit})).await?;
             ctx.emit(&value, |v| render::playlist("playlist.list", v));
+            ctx.next(&next::after_playlist_list(&value));
             return Ok(());
         }
         PlaylistCommand::Show { playlist } => {
@@ -588,6 +659,7 @@ async fn playlist(ctx: &Ctx, action: PlaylistCommand) -> Result<()> {
                 )
                 .await?;
             ctx.emit(&value, render::outcome);
+            ctx.next(&next::after_play(&value));
             return Ok(());
         }
         PlaylistCommand::Rename { playlist, name } => {
@@ -622,6 +694,11 @@ async fn playlist(ctx: &Ctx, action: PlaylistCommand) -> Result<()> {
         ctx.daemon(op, args).await?
     };
     ctx.emit(&value, |v| render::playlist(op, v));
+    match op {
+        "playlist.show" => ctx.next(&next::after_playlist_show(&value)),
+        "playlist.create" | "playlist.fork" => ctx.next(&next::after_playlist_created(&value)),
+        _ => {}
+    }
     if let Some(wanted) = fork_name
         && value.get("name").and_then(Value::as_str) != Some(wanted.as_str())
     {
@@ -653,6 +730,7 @@ async fn podcast(ctx: &Ctx, action: PodcastCommand) -> Result<()> {
                 )
                 .await?;
             ctx.emit(&value, render::search);
+            ctx.next(&next::after_search(&value));
         }
         PodcastCommand::Play { target } => {
             let uri = parse_uri(&target, Some(Kind::Episode))?;
@@ -669,6 +747,7 @@ async fn podcast(ctx: &Ctx, action: PodcastCommand) -> Result<()> {
                 )
                 .await?;
             ctx.emit(&value, render::outcome);
+            ctx.next(&next::after_play(&value));
         }
         PodcastCommand::Saved => {
             let value = ctx.daemon("podcast.saved", json!({})).await?;
@@ -714,6 +793,7 @@ async fn trigger(ctx: &Ctx, action: TriggerCommand) -> Result<()> {
                 .daemon("trigger.list", json!({"all": all, "everyone": everyone}))
                 .await?;
             ctx.emit(&value, render::triggers);
+            ctx.next(&next::after_trigger_list(&value));
             Ok(())
         }
         TriggerCommand::Show { id } => {
@@ -876,15 +956,12 @@ async fn trigger_add(ctx: &Ctx, add: TriggerAdd) -> Result<()> {
         )
         .await?;
     ctx.emit(&value, render::trigger_added);
-    let id = value
-        .pointer("/trigger/id")
-        .and_then(Value::as_str)
-        .unwrap_or("<id>");
     if add.local {
-        ctx.hint(&format!("Local only: `spotify trigger wait {id}` blocks until it fires; `spotify trigger history {id}` shows firings."));
+        ctx.hint("Local only: no Ting; `spotify trigger wait` blocks until it fires.");
     } else {
-        ctx.hint(&format!("You will get a `spotify.trigger.fired` Ting. Check delivery with `spotify trigger history {id}`; remove with `spotify trigger remove {id}`."));
+        ctx.hint("You will get a `spotify.trigger.fired` Ting when it fires.");
     }
+    ctx.next(&next::after_trigger_add(&value, add.local));
     Ok(())
 }
 
@@ -956,6 +1033,63 @@ mod tests {
             &Error::new("rate_limited", "429", "wait").retryable()
         ));
         assert!(!transient(&Error::not_found("gone", "search")));
+    }
+
+    #[test]
+    fn liked_songs_shuffled_start_at_random() {
+        use clap::Parser as _;
+        let play = |args: &[&str]| match crate::args::Cli::try_parse_from(args)
+            .expect("parses")
+            .command
+        {
+            Some(Command::Play(args)) => liked_target(&args),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            play(&["spotify", "play", "--liked", "--shuffle"])["random"],
+            true
+        );
+        assert_eq!(
+            play(&["spotify", "play", "--liked", "--random"])["random"],
+            true
+        );
+        assert_eq!(play(&["spotify", "play", "--liked"])["random"], false);
+    }
+
+    #[test]
+    fn lyrics_of_a_name_point_to_search() {
+        let error = lyrics_target("505").expect_err("not an id");
+        assert_eq!(error.code, "invalid_input");
+        assert_eq!(error.message, "`505` is not a track URI, link or id.");
+        assert!(
+            error.hint.starts_with(
+                "`spotify lyrics` takes a track, not search words: find it with `spotify search 505 --type track`, then run `spotify lyrics <uri>`"
+            ),
+            "{}",
+            error.hint
+        );
+        let error = lyrics_target("arctic monkeys 505").expect_err("words");
+        assert!(
+            error
+                .hint
+                .contains("spotify search 'arctic monkeys 505' --type track"),
+            "{}",
+            error.hint
+        );
+        assert_eq!(
+            error.details.map(|d| d["search"].clone()),
+            Some(json!("spotify search 'arctic monkeys 505' --type track"))
+        );
+        assert!(lyrics_search_advice("don't stop").contains(r"'don'\''t stop'"));
+        // A malformed URI keeps the error about its format.
+        let error = lyrics_target("spotify:track:short").expect_err("bad id");
+        assert!(!error.hint.contains("takes a track"), "{}", error.hint);
+        assert_eq!(
+            lyrics_target("0BxE4FqsDD1Ot4YuBXwAPp")
+                .map(|u| u.uri())
+                .ok(),
+            Some("spotify:track:0BxE4FqsDD1Ot4YuBXwAPp".to_owned())
+        );
     }
 
     #[test]

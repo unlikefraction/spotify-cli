@@ -3,18 +3,30 @@
 How `play`, `pause`, `seek` and the other controls reach Spotify.app, how every result is
 verified, and what happens when the first path fails.
 
-## The rule: spotify_player first, verified, AppleScript fallback
+## The rule: the Web API first, verified, AppleScript fallback
 
-spotify-cli drives Spotify through two tools:
+spotify-cli drives Spotify through three paths:
 
-- **spotify_player** — a Spotify Web API client. It can do everything the Web API can: start
-  albums/playlists/radios/Liked Songs, repeat-one, likes, search, lyrics, playlists, devices.
+- **The Spotify Web API, directly** — to start a song, an episode, a show or Liked Songs
+  ([Web API first](#web-api-first-songs-episodes-shows-and-liked-songs)), with spotify_player's
+  cached token. It tells Spotify.app on this Mac, or the speaker or phone Spotify.app controls,
+  what to play, so Spotify.app stays in the background.
+- **spotify_player** — a Spotify Web API client. It starts albums, playlists, artists and
+  radios, runs the other controls (resume, pause, next, previous, volume, shuffle, repeat, likes)
+  and serves search, lyrics, playlists and devices.
 - **AppleScript** — Spotify.app's own scripting interface on this Mac: play/pause, next/previous,
   play any URI (tracks, episodes, playlists, albums, shows, Liked Songs), seek to an absolute
-  position, volume, shuffle, context repeat, and complete player state in ~50 ms.
+  position, volume, shuffle, context repeat, and complete player state in ~50 ms. Reading state
+  leaves Spotify.app where it is; starting something with it brings Spotify.app to the front
+  ([Focus](#keeping-spotify-app-in-the-background)).
 
-For every playback command (`strategy: auto`, the default), except the ones listed under
-[AppleScript first](#applescript-first):
+So every start goes through the Spotify Web API first: songs, episodes, shows and Liked Songs
+directly, albums, playlists, artists and radios through spotify_player. Starts fall back to
+AppleScript, except a radio, which has no AppleScript way. Only exact seeks go to AppleScript
+first ([AppleScript first](#applescript-first)).
+
+For album, playlist, artist and radio starts and every other playback command but `seek`
+(`strategy: auto`, the default):
 
 1. Run the spotify_player command.
 2. **Verify** the effect in Spotify.app (AppleScript reads its state every 120 ms). spotify_player
@@ -34,12 +46,13 @@ If both fail you get one path's error (usually AppleScript's `verification_faile
 with the other attempt in `details` (`first_attempt`, or `second_attempt` when spotify_player
 was tried second and could not run at all).
 
-How long spotify_player gets before the fallback:
+How long the first path gets before the fallback:
 
 | Commands | Wait |
 | --- | --- |
 | `play` (resume), `pause`, `toggle`, `volume`, `shuffle` | at most 1.5 s (less when `verify_timeout_ms` is smaller): they set a state, so a late effect only repeats the fallback's |
 | `next`, `previous`, starts, `seek` | `verify_timeout_ms` (default 2500 ms), then one more look 0.4 s later, so a late skip or seek is never applied twice |
+| A Web API start (song, episode, show, Liked Songs) | the same; a rate limit, missing Premium, a device that takes no Web API commands or no device to start on falls back at once, and a start whose answer was lost is first looked for in Spotify.app ([Lost answers](#when-the-answer-is-lost)) |
 | AppleScript itself | up to 2.5 s |
 
 Other strategies (`spotify config set '{"strategy": "…"}'`):
@@ -47,43 +60,273 @@ Other strategies (`spotify config set '{"strategy": "…"}'`):
 | Strategy | Use when |
 | --- | --- |
 | `auto` | default |
-| `applescript` | no Premium, no spotify_player sign-in, or you want the fastest local control |
-| `spotify_player` | you control another Spotify Connect device and do not want AppleScript. It cannot start episodes or shows, or a track with `--context` (`unsupported`), and its seeks are approximate |
+| `applescript` | no Premium, no spotify_player sign-in, or you want only local control. The Web API is never used: every start goes through AppleScript (Spotify.app comes forward and the focus goes back), and a radio cannot start |
+| `spotify_player` | you do not want AppleScript at all. Songs, episodes, shows and Liked Songs start through the Web API; when that fails only a song without `--context` and Liked Songs have a second way (spotify_player's own start, which loads a bare list of ids), else the error is `unsupported` with the Web API's attempt in `details.first_attempt`. Its seeks are approximate |
+
+## Web API first: songs, episodes, shows and Liked Songs
+
+`spotify play <track>` and `spotify play <episode>` (also `play --search`, `podcast play` and
+`search --play` when they pick a song or episode, and a song with `--context`),
+`spotify play <show>` and `spotify play --liked` start through the Spotify Web API directly. Not
+through spotify_player, which starts a song or Liked Songs as a bare list of ids that leaves
+Spotify.app stopped with nothing loaded, and cannot start a show; and not through AppleScript,
+whose `play track` brings Spotify.app to the front and takes the focus from the app you work in.
+The Web API tells Spotify.app, as a Spotify Connect device, what to play, and it plays where it
+is.
+
+### A song or an episode
+
+1. **The item.** `GET /v1/tracks/{id}` (or `/v1/episodes/{id}`) with `market=from_token` names
+   the song's album or the episode's show, and, for a song that plays from another release in
+   your market ([relinked](#relinked-songs)), that release. A song or episode Spotify lists as
+   not playable in your market, with no release that plays there, fails at once
+   ([Not playable](#not-playable-in-your-market)): nothing is sent and playback is not touched.
+2. **The list.** `--context` when you give one, else the song's album or the episode's show. So
+   Spotify.app has a whole list loaded: after the song the album plays on (the show for an
+   episode), and `next` and `previous` move through it.
+3. **The device.** Listed at every start ([Where a start plays](#where-a-start-plays)): the
+   speaker or phone Spotify.app controls when one is active, else Spotify.app on this Mac.
+4. **The start.** `PUT /v1/me/player/play?device_id=…` with
+   `{"context_uri": <list>, "offset": {"uri": <item>}, "position_ms": 0}`: the item, from its
+   beginning, named as the list holds it. In its own album a relinked song is named by the id it
+   links from (the album holds it under that id), so one request starts it
+   ([Relinked songs](#relinked-songs)).
+5. **The check.** AppleScript reads Spotify.app every 120 ms (reads never bring it forward) until
+   it plays the item: the id asked for, the release it plays from, or the same song relinked.
+   Starting the song already loaded counts only once it went back to its start. It waits up to
+   `verify_timeout_ms` (default 2500 ms), then looks once more 0.4 s later. When another track of
+   the album starts instead, or Spotify refuses the item's uri in its album (400/404), the start
+   is sent once more naming the track by its position in the album (counted across discs): the
+   fallback when naming it by uri did not place it. A `--context` list is never retried by
+   position.
+
+```json
+{"action": "play", "via": "web_api", "playback": {…}}
+```
+
+Lookups are remembered for the life of the daemon (up to 500 items, not the ones that were not
+playable). The devices are not: they are listed at every start, because the active one changes
+whenever you pick a speaker in Spotify.app.
+
+### Not playable in your market
+
+When the lookup says Spotify cannot play the song (or episode) in your country or market
+(`is_playable: false`) and names no other release that plays there, the start fails at once with
+`not_playable` (exit 1, not retryable):
+
+```json
+{"code": "not_playable",
+ "message": "'Fall (Acoustic Version)' by Ana Rey, The Tides (spotify:track:…) is not playable in your country/market: Spotify has no release of it that plays here, so nothing was started.",
+ "hint": "Find another version with `spotify search 'Fall (Acoustic Version) Ana Rey' --type track`, then `spotify play <uri>`.",
+ "details": {"uri": "spotify:track:…", "name": "Fall (Acoustic Version)", "market": "from_token", "reason": "market"}}
+```
+
+`details.reason` is the lookup's `restrictions.reason` when it gives one. `market` is the case
+above. Two reasons are about the account, not the country, and the message says so instead:
+`explicit` ("… is explicit, and this Spotify account is set not to play explicit content"; the
+hint also points to Spotify's explicit-content setting and searches for a clean version) and
+`product` ("… is not available on this account's Spotify plan").
+
+No start is sent and nothing falls back: AppleScript's `play track` of such a song leaves
+Spotify.app with nothing loaded for a few seconds until what played before is put back. What
+played before keeps playing, untouched; the answer comes in about a second (one lookup of
+0.3–0.6 s, and Spotify.app reads). A song that is relinked to a release that plays in your
+market is playable and starts as usual. Under strategy `applescript` there is no lookup, so
+AppleScript tries it.
+
+### A show
+
+`spotify play spotify:show:<id>` sends `{"context_uri": "spotify:show:<id>"}` alone, so Spotify
+starts the show where it starts it, on the device chosen as for a song. It counts once
+Spotify.app plays something new (an episode, or an ad). spotify_player cannot start a show, so
+when this fails AppleScript plays it (`play track <show uri>`).
+
+### Liked Songs
+
+`spotify play --liked` plays the Liked Songs list itself (`spotify:user:<id>:collection`, with
+the Spotify user id spotify_player is signed in as, read from its `credentials.json`), so `next`
+and `previous` stay in it. The result says `via: web_api`, action `play_liked`, and Spotify.app
+stays in the background.
+
+1. `GET /v1/me/tracks?limit=1` gives how many songs Liked Songs holds and its first song (the one
+   liked last). An empty Liked Songs is `not_found` at once and nothing starts. An answer that
+   does not say how many is `web_api_failed` (retryable), and AppleScript starts the list.
+2. The start: at position 0, or, with `--random` (or `--shuffle`, which is the same with
+   `--liked`), at a random position below that count. It counts once Spotify.app plays
+   something new.
+3. Spotify keeps a shuffle setting per list and switches to Liked Songs' own when the list
+   starts, so shuffle is set after the start, never before (that would only change the list
+   playing before). That switch comes a moment after the first song shows: in one trace the
+   first song showed with the shuffle of the list before (off), and Spotify.app turned shuffle on
+   75 ms later. So the controller first lets shuffle settle: it reads Spotify.app every 120 ms
+   until neither shuffle nor the song changed for 0.45 s (at most 1.5 s), which adds about half
+   a second to the start.
+4. When the settled shuffle differs from what was asked (off without `--random`, on with it),
+   `PUT /v1/me/player/shuffle` sets it, and AppleScript's `set shuffling` does when that does
+   not show in Spotify.app within 2.5 s.
+5. Without `--random`, when the list plays another song than its first (it started shuffled),
+   it is started once more at position 0, so it plays in list order from the first song. When
+   the first song already plays (shuffle came on only after it showed), turning shuffle off is
+   enough.
+6. Whenever step 4 or 5 changed something, shuffle is let settle again and the result checked:
+   shuffle as asked and, without `--random`, the first song. When Spotify switched it back, steps
+   4 and 5 run once more. The result is what Spotify.app keeps, e.g. `shuffling: false` on the
+   first song for a plain `play --liked`.
+
+Once Liked Songs plays, a step that does not show is `verification_failed` (retryable) saying
+which one, and so is a shuffle that Spotify switched back twice ("Spotify.app's shuffle did not
+stay off"); Liked Songs keeps playing and is not started a second time.
+
+While Liked Songs plays, the Web API reports it as a playlist: `GET /v1/me/player` (and so
+`spotify status --full`'s `web`) says `"context_type": "playlist"` and
+`"context_uri": "spotify:playlist:37i9dQZF1F…"`, an id Spotify makes for your account
+(`GET /v1/playlists/<id>` names it "Liked Songs"), not `spotify:user:<id>:collection`, the uri
+that starts it. Both name the same list; to start Liked Songs use `spotify play --liked`.
+
+When the Web API start fails, AppleScript plays the list, the focus goes back to your app, and
+the same result is reached its way once the start shows:
+
+- Shuffle is let settle first, as above (Spotify.app switches to Liked Songs' kept shuffle a
+  moment after the start shows).
+- Without `--random` it plays in list order from its first song. A kept shuffle, also one set in
+  Spotify.app, is turned off (it stays off for Liked Songs) and the list is started again, so
+  the shuffled start plays for a moment first.
+- `--random` switches shuffle off and on, so Spotify draws a new order, then skips once, so every
+  start is a random song. Shuffle stays on for Liked Songs until a plain `play --liked` turns it
+  off.
+- Each step is checked in Spotify.app, and after them shuffle is let settle once more and
+  checked. When the start does not show within 2.5 s the error is `verification_failed`
+  (retryable) at once, and no shuffle step is sent. When a shuffle change, the restart in order
+  or the skip does not show, or shuffle did not stay as asked, the error is
+  `verification_failed` (retryable) saying which; Liked Songs keeps playing.
+
+spotify_player's `playback start liked` (up to `--limit` tracks, default 200, as a list of ids
+that also empties the desktop app) runs only when the Spotify user id is unknown or under
+strategy `spotify_player`.
+
+### Where a start plays
+
+Every Web API start lists `GET /v1/me/player/devices` first and picks:
+
+- **Another device is active** (a speaker, a phone or a TV that Spotify.app on this Mac is the
+  remote for; never spotify_player's): the start goes there, as Spotify.app's own play button
+  would, so playback stays on that device. Spotify.app shows what plays there, so the check reads
+  Spotify.app all the same. The outcome carries a `note`: "Started on <device>, the device
+  Spotify.app on this Mac is playing on, so playback stays there." A device listed without an id
+  gets no `device_id`: Spotify plays on the active one.
+- **That device takes no Web API commands** (the list marks it restricted): the reason is
+  `device_restricted`, and AppleScript starts the item through Spotify.app, which controls it.
+- **Spotify.app plays, but nothing listed is active**: it plays on a device Spotify leaves out of
+  that list (Spotify says some device models are never listed). The start names no device, so
+  Spotify plays it on the active one there too, instead of moving playback to this Mac.
+- **Nothing is active**: Spotify.app on this Mac, by device id: the one Computer device named
+  like this Mac (`scutil --get ComputerName`); only when that name is unknown, the only Computer
+  device. Never spotify_player's own device, and never another Mac or the Web Player that
+  happens to be the only computer listed. This works when no device is active; with no such
+  device the reason is `device_not_found`.
+
+When Spotify answers that the device is not found or that nothing is active (`no_active_device`:
+Spotify.app restarted, or the unlisted device went away), the devices are listed once more and
+the start goes to this Mac, unless another device is active by then.
+
+### When the answer is lost
+
+A start answered with a server error (5xx), or not answered in time (a timeout or a broken
+connection; a connection that never opened sent nothing), may still have gone through. So the
+controller first looks for the item in Spotify.app, as for any start (the verify timeout, then
+one more look). When it plays, the start counts: `via: web_api`, with a `note` such as "The
+Spotify Web API gave HTTP 502 to the start, but Spotify.app plays it: the start went through, so
+it was not started again." Only when it does not play does the fallback start it, once. This
+covers songs, episodes, the retry by position, shows and Liked Songs (whose shuffle steps then
+follow as usual).
+
+### Fallback
+
+When the start could not be sent or did not take effect, AppleScript plays it and verifies that.
+A song plays in the album the Web API's lookup named, named as that album holds it (`play track
+<uri> in context <album>`; a relinked song by the id it links from), so the album goes on after
+it, and Spotify.app showing either id counts. A song that is [not playable](#not-playable-in-your-market)
+never gets here. `--context` wins when given. The song plays alone when there was no
+lookup (the Web API unavailable) or when the album did not place it: Spotify refused it there by
+uri and by position, or another track of the album kept playing (`no_effect` with
+`details.landed_elsewhere: true`). An episode plays alone, a show and Liked Songs as themselves.
+
+The outcome says `fallback: {"from": "web_api", "reason": …}`, and if AppleScript fails too, its
+error carries the Web API's attempt in `details.first_attempt`. `fallback.reason.code`:
+
+| Code | When |
+| --- | --- |
+| `rate_limited` | Spotify answered 429, or the pause after an earlier 429 still runs: nothing is sent until its `Retry-After` has passed (1 s to 10 minutes, 30 s when it gives none). The daemon's own Web API lookups and searches share that one pause. Falls back at once |
+| `premium_required` | the account is not Premium: Spotify's Web API playback needs it. Falls back at once |
+| `device_restricted` | the active device takes no Web API commands (`details.device`: its name and type); AppleScript starts the item through Spotify.app, which controls that device |
+| `device_not_found` | nothing else is active and no device in the list is clearly Spotify.app on this Mac (just launched, not yet registered, or offline); `details.devices` lists each device's name and type |
+| `no_active_device` | Spotify answered that the device is not found or nothing is active, also after the devices were listed again |
+| `spotify_auth_required`, `spotify_player_missing` | the token is spotify_player's: it is not signed in, or not installed |
+| `web_api_failed` | any other HTTP status (`details`: `request`, `status`, `message`, `reason`, and `unanswered: true` for a 5xx that Spotify.app did not show), no album or show named for the item, a Liked Songs answer without its size, or spotify_player's cached token has expired (retryable) |
+| `not_found`, `transport` | Spotify does not know the item; the network (`details`: `connect`, `timeout`, and `unanswered: true` when the start may have left) |
+| `no_effect` | Spotify accepted the start but Spotify.app did not play the item in time (`details`: `context`, `device`, `offset` or `position`, `observed`, and for a song `landed_elsewhere`) |
+
+Under strategy `applescript` the Web API is never used; under strategy `spotify_player` there is
+no AppleScript fallback (see the strategies above).
+
+Notes:
+- **Premium.** Web API playback needs Premium. Without it every song, episode, show or Liked
+  Songs start spends one refused request (about 0.3 s) before AppleScript plays it; strategy
+  `applescript` skips that: `spotify config set '{"strategy": "applescript"}'`.
+- **Another device.** A start plays on the speaker or phone Spotify.app controls
+  ([above](#where-a-start-plays)), as AppleScript's `play track` does in the remote session. Move
+  playback with `spotify devices connect <id>`.
+- **Relinked songs** start in one request, named in their album by the id the album holds;
+  Spotify plays the release that plays in your market, Spotify.app shows the id you asked for,
+  and the start counts ([Relinked songs](#relinked-songs)).
+- **Not playable** songs and episodes fail at once with `not_playable`, before anything is sent
+  ([above](#not-playable-in-your-market)).
+
+## Keeping Spotify.app in the background
+
+AppleScript's starts bring Spotify.app to the front, which steals the focus from the app you work
+in. So whenever AppleScript starts something (the fallback of a song, episode, show or Liked
+Songs start, an album or playlist that spotify_player could not start, the restore after a
+failed start, and the daemon's managed-queue hand-offs and resumes), spotify-cli notes which app
+is in front, watches the front while the start runs and for 1 s after it, and as soon as
+Spotify.app takes it gives the focus back to that app (at most 3 times per start). If Spotify.app
+was hidden before, it is hidden again. In practice Spotify.app is in front for about half a
+second.
+
+- Giving the focus back: `lsappinfo setfront`, and when macOS ignores that (it usually does from a
+  background process), `open -a <that app>`. `open -a` is used only for a regular app (one with a
+  Dock icon) that still runs and is not Finder, so a launcher or the login window is never
+  reopened and a quit app is never relaunched. Once macOS has ignored `setfront`, later hand-backs
+  go straight to `open -a`.
+- Hiding Spotify.app again: `NSRunningApplication`'s `hide`, run by `osascript -l JavaScript`.
+- None of it needs a new macOS permission: these are LaunchServices and AppKit calls, not Apple
+  Events.
+
+The outcome says what happened in `refocused`, e.g. `{"app": "iTerm2", "via": "open"}` (`via`
+is `setfront` or `open`), plus `hid_spotify: true` when Spotify.app was hidden again and `error`
+(code `focus_not_returned`) when macOS ignored both ways and Spotify.app stays in front. On a failed
+command it is `details.refocused`. It is never a command error. The daemon logs its queue's
+hand-backs.
+
+Turn it off with `spotify config set '{"keep_spotify_in_background": false}'` (default true).
 
 ## AppleScript first
 
-Some actions go to AppleScript first under `auto`, because spotify_player's way of doing them is
-worse on the desktop app. They normally report `via: applescript` with no `fallback`.
+Only exact seeks go to AppleScript first under `auto`, because spotify_player's way of doing them
+is worse on the desktop app. They report `via: applescript` with no `fallback`.
 
 - **`seek`**: AppleScript sets the position itself, exactly. spotify_player can only seek by an
   offset, which it adds to a position it fetches from the Web API when the command runs (seconds
   later when the Web API is rate limiting), so it lands wherever that reading was. It is the
   fallback under `auto`, and the only path under strategy `spotify_player`: a relative,
   approximate seek, refused with `state_mismatch` when spotify_player is on another item.
-- **`play <track>`, `play <episode>`, `play <show>`** (and a track with `--context`): AppleScript
-  only. The Web API starts a single track as a list of ids, which leaves Spotify.app stopped with
-  nothing loaded, so spotify_player is never the fallback. It starts a track (without `--context`)
-  only under strategy `spotify_player`; it cannot start episodes or shows at all.
-- **`play --liked`**: AppleScript plays the Liked Songs list itself
-  (`spotify:user:<id>:collection`, with the Spotify user id spotify_player is signed in as, read
-  from its `credentials.json`), so `next` and `previous` stay in it. spotify_player's
-  `playback start liked` (up to `--limit` tracks, default 200, as a list of ids that also empties
-  the desktop app) runs only when that user id is unknown or under strategy `spotify_player`.
-  Spotify keeps a shuffle setting per list and switches to Liked Songs' own when the list starts;
-  shuffled, it starts at the song its kept order starts with, the same one every time. So once
-  AppleScript's start shows:
-  - Without `--random` it plays in list order from its first song. A kept shuffle, also one set
-    in Spotify.app, is turned off (it stays off for Liked Songs) and the list is started again,
-    so the shuffled start plays for a moment first; the result shows `shuffling: false`.
-  - `--random` switches shuffle off and on, so Spotify draws a new order, then skips once, so
-    every start is a random song. Shuffle stays on for Liked Songs until a plain `play --liked`
-    turns it off.
-  - Each step is checked in Spotify.app. When the start does not show within 2.5 s the error is
-    `verification_failed` (retryable) at once, and no shuffle step is sent. When a shuffle
-    change, the restart in order or the skip does not show, the error is `verification_failed`
-    (retryable) saying which step; Liked Songs keeps playing.
 
-Albums, playlists, artists, radios and resume follow the rule: spotify_player first.
+Every start goes to the Web API first: songs, episodes, shows and Liked Songs
+[directly](#web-api-first-songs-episodes-shows-and-liked-songs), albums, playlists, artists and
+radios through spotify_player (the rule). spotify_player starts a single song as a list of ids,
+which leaves Spotify.app stopped with nothing loaded, so it is never the fallback of a song
+start; it starts a song without `--context` only under strategy `spotify_player`, after the Web
+API. When any start falls back to AppleScript, the focus goes back to your app.
 
 ## Checking spotify_player's view first
 
@@ -139,12 +382,13 @@ wait for the timeout as before.
 | Command | First | Then | Verified by |
 | --- | --- | --- | --- |
 | `play` (resume) | `playback play` | `play` | state is playing |
-| `play <track>` / `<episode>` | AppleScript `play track <uri>` | — | that item playing (the item already loaded: restarted) |
-| `play <track> --context <list>` | AppleScript `play track <uri> in context <list>` | — | that track playing |
+| `play <track>` | Web API `PUT /me/player/play` in its album | `play track <uri> in context <album>`, named as the album holds it (the track alone when the album did not place it; none when it is `not_playable`) | that track playing, relinked included (the track already loaded: restarted) |
+| `play <episode>` | Web API `PUT /me/player/play` in its show | `play track <uri>` | that episode playing (already loaded: restarted) |
+| `play <track> --context <list>` | Web API `PUT /me/player/play` in `<list>` | `play track <uri> in context <list>` | that track playing, relinked included |
 | `play <album/playlist/artist>` | `playback start context` (`--shuffle`) | `play track <uri>` | a new item playing |
-| `play <show>` | AppleScript `play track <uri>` | — | a new item playing |
-| `play --liked` | AppleScript: the Liked Songs list, then its shuffle steps | — | a new item playing, then each step |
-| `play --radio` | `playback start radio` | none | a new item playing |
+| `play <show>` | Web API `PUT /me/player/play` with the show as the list | `play track <uri>` | a new item playing |
+| `play --liked` | Web API `PUT /me/player/play` in Liked Songs (its first song, or a random one), then its shuffle | AppleScript: the Liked Songs list, then its shuffle steps | a new item playing, then each step |
+| `play --radio` | `playback start radio` | none (AppleScript has no radio) | a new item playing |
 | `pause` | `playback pause` | `pause` | state is not playing |
 | `toggle` | `playback pause` or `playback play` | `pause` or `play` | state flipped |
 | `next` | `playback next` | `next track` | item changed (or restarted by repeat-one) |
@@ -215,8 +459,8 @@ playing. So `like` and `unlike`:
 When `play <something>` fails and leaves Spotify.app with nothing loaded although something was
 loaded before, the controller puts that back through AppleScript, under any strategy: the same
 track, in its playlist or album when spotify_player knew it, at the same position, paused if it
-was paused. The error's `details.restored` holds the playback afterwards, or
-`details.restore_failed` says why it could not.
+was paused (and the focus goes back to your app). The error's `details.restored` holds the
+playback afterwards, or `details.restore_failed` says why it could not.
 
 ## Status and the Web API
 
@@ -257,6 +501,20 @@ album name (a single and its album, a deluxe edition) is another item.
 
 - `status --full` treats it as the current item: `web.relinked: true`, `web.item_uri` is the
   substitute's id, and it is not `stale`.
+- A [Web API start](#web-api-first-songs-episodes-shows-and-liked-songs) looks the song up in
+  your market. The answer is the release that plays there (its `id`, with `linked_from` naming
+  the id you asked for) but the album of the release you asked for, which holds the song under
+  the id you asked for. So the start names that id in that album
+  (`"offset": {"uri": <the linked_from id>}`), and Spotify plays the substitute: one request.
+  Named by the substitute's id there, Spotify started the album's first track (seen 2026-09),
+  and only a second start by position reached the song; that retry stays as the fallback.
+  Spotify.app shows the id you asked for (and the album's other songs under their ids in that
+  album), and the start counts. When AppleScript has to start it instead, it plays it the same
+  way (`play track <the id you asked for> in context <album>`; by the substitute's id it too
+  starts the album's first track), with `--context` the id you gave, in that list, and
+  Spotify.app showing either id counts.
+- A song with no release that plays in your market is not relinked: it is
+  [`not_playable`](#not-playable-in-your-market).
 - The checks before spotify_player's commands count it as Spotify.app's song: its relative seek
   is not refused with `state_mismatch`, `next` and `previous` heed what the Web API allows for
   it, and a failed start can put it back in its playlist or album.
@@ -283,8 +541,22 @@ spotify_player commands take ~20 ms instead of ~1.5 s, and its view of playback 
 20 s (slow enough to leave Spotify's rate limit to commands). `spotify daemon status` shows it as
 `warm spotify_player: running (…)`; details in `spotify docs daemon`.
 
+A Web API start of a song or episode takes about 2–3 s end to end. In one traced start of 1.8 s,
+the item lookup took 0.35 s (with the TLS handshake), the device list 0.14 s and the play request
+0.34 s, and Spotify.app showed the song about 0.3 s later. The daemon keeps one HTTPS connection
+for these requests, and a later start of the same item skips the lookup; the device list is read
+at every start, so a start follows the speaker you just picked.
+
 ## Known limits
 
+- spotify_player's device is recognised by its default name, `spotify-player`. A spotify_player
+  you run yourself with streaming on and another `[device] name` in its `app.toml` looks like a
+  speaker Spotify.app controls, so a start while it is the active device plays there. The
+  daemon's own copy never streams.
+- AppleScript cannot read which list plays, so Liked Songs and show starts are checked by
+  "something new plays". A start whose answer was lost and that did nothing still counts when
+  the list playing before moves on to its next song within the wait (about 3 s), and for Liked
+  Songs its shuffle step then changes that list's shuffle. Rare; run the command again.
 - If repeat-one was turned on in Spotify.app while spotify_player believes `context`, a
   rate-limited `repeat off` can end in an AppleScript success while repeat-one stays on. Check
   `spotify status --full` and retry in a minute.

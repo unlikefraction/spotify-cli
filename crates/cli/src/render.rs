@@ -330,6 +330,26 @@ fn artist(v: &Value) -> String {
     out
 }
 
+/// A song's album URI: the `album_uri` the daemon gives, else the album object spotify_player
+/// reported (`album` of the current song, `raw.album` of a looked-up one).
+fn album_uri(song: &Value, album: Option<&Value>) -> Option<String> {
+    let valid_id = |id: &str| id.len() == 22 && id.chars().all(|c| c.is_ascii_alphanumeric());
+    let given = |uri: Option<&Value>| {
+        uri.and_then(Value::as_str)
+            .filter(|u| u.strip_prefix("spotify:album:").is_some_and(valid_id))
+            .map(str::to_owned)
+    };
+    given(song.get("album_uri"))
+        .or_else(|| given(album.and_then(|a| a.get("uri"))))
+        .or_else(|| {
+            album
+                .and_then(|a| a.get("id"))
+                .and_then(Value::as_str)
+                .filter(|id| valid_id(id))
+                .map(|id| format!("spotify:album:{id}"))
+        })
+}
+
 /// `spotify track`.
 #[must_use]
 pub fn track(v: &Value) -> String {
@@ -349,6 +369,12 @@ pub fn track(v: &Value) -> String {
         );
         if let Some(album) = item.get("album").and_then(Value::as_str) {
             let _ = write!(out, "\n  album: {}", one_line(album));
+            // Songs only: an episode's `album` is its show.
+            if s(item, "/kind") != "episode"
+                && let Some(uri) = album_uri(item, v.pointer("/raw/album"))
+            {
+                let _ = write!(out, " · {uri}");
+            }
         }
         if let Some(d) = item.get("duration").and_then(Value::as_str) {
             let _ = write!(out, "\n  length: {d}");
@@ -375,6 +401,11 @@ pub fn track(v: &Value) -> String {
     );
     if let Some(date) = v.pointer("/album/release_date").and_then(Value::as_str) {
         let _ = write!(out, " ({date})");
+    }
+    if s(t, "/kind") != "episode"
+        && let Some(uri) = album_uri(t, v.get("album"))
+    {
+        let _ = write!(out, " · {uri}");
     }
     let _ = write!(
         out,
@@ -426,22 +457,7 @@ pub fn search(v: &Value) -> String {
     if out.is_empty() {
         return format!("No results for `{}`.", s(v, "/query"));
     }
-    let has = |kinds: &[&str]| {
-        kinds.iter().any(|k| {
-            v.pointer(&format!("/results/{k}"))
-                .and_then(Value::as_array)
-                .is_some_and(|items| !items.is_empty())
-        })
-    };
-    let mut next = vec!["Play one: spotify play <uri>"];
-    // The queue holds single items only.
-    if has(&["tracks", "episodes"]) {
-        next.push("queue it: spotify queue add <uri>");
-    }
-    if has(&["albums", "artists", "playlists"]) {
-        next.push("look inside: spotify track <uri>");
-    }
-    out.push_str(&next.join(" · "));
+    // What to do with a hit follows on stderr (`Next:`, with the first hit's URI).
     out
 }
 
@@ -584,6 +600,33 @@ pub fn queue(v: &Value) -> String {
     // E.g. the item playing now, which Spotify repeats there, was left out.
     if let Some(note) = v.pointer("/spotify_upcoming/note").and_then(Value::as_str) {
         let _ = writeln!(out, "{note}");
+    }
+    // E.g. no_active_device: Spotify's list may be empty because no device plays.
+    let mut seen: Vec<String> = Vec::new();
+    for warning in ["/warnings", "/spotify_upcoming/warnings"]
+        .iter()
+        .filter_map(|at| v.pointer(at).and_then(Value::as_array))
+        .flatten()
+    {
+        let code = s(warning, "/code").to_owned();
+        // The same warning in both places once; two without a code are told apart by their text.
+        let key = if code.is_empty() {
+            s(warning, "/message").to_owned()
+        } else {
+            code.clone()
+        };
+        if seen.contains(&key) {
+            continue;
+        }
+        let _ = write!(out, "note: {}", s(warning, "/message"));
+        if !code.is_empty() {
+            let _ = write!(out, " ({code})");
+        }
+        if let Some(hint) = warning.get("hint").and_then(Value::as_str) {
+            let _ = write!(out, "\n  {hint}");
+        }
+        out.push('\n');
+        seen.push(key);
     }
     out
 }
@@ -1056,18 +1099,12 @@ mod tests {
     }
 
     #[test]
-    fn search_footer_offers_only_what_fits_the_results() {
-        let albums = json!({"results": {"albums": [{"name": "AM", "uri": "spotify:album:78bpIziExqiI9qztvNFlQu"}],
-            "artists": [{"name": "Arctic Monkeys", "uri": "spotify:artist:7Ln80lUS6He07XvHI8qqHH"}], "tracks": []}});
-        let text = search(&albums);
-        assert!(
-            text.ends_with("Play one: spotify play <uri> · look inside: spotify track <uri>"),
-            "{text}"
-        );
+    fn search_lists_hits_without_a_footer() {
         let tracks = json!({"results": {"tracks": [{"name": "505", "uri": "spotify:track:0BxE4FqsDD1Ot4YuBXwAPp"}]}});
-        assert!(
-            search(&tracks)
-                .ends_with("Play one: spotify play <uri> · queue it: spotify queue add <uri>")
+        // The `Next:` suggestions (next.rs) go to stderr with the hit's real URI.
+        assert_eq!(
+            search(&tracks),
+            "tracks:\n   1. 505\n      spotify:track:0BxE4FqsDD1Ot4YuBXwAPp\n"
         );
     }
 
@@ -1109,6 +1146,55 @@ mod tests {
             queue(&more).ends_with(&format!("   1. Next\n{note}\n")),
             "{}",
             queue(&more)
+        );
+    }
+
+    #[test]
+    fn a_song_shows_its_album_with_the_album_uri() {
+        // A looked-up song: the daemon's `item.album_uri`, else spotify_player's `raw.album`.
+        let looked_up = json!({"kind": "track", "item": {"kind": "track", "name": "505", "by": ["Arctic Monkeys"],
+            "album": "Favourite Worst Nightmare", "album_uri": "spotify:album:1XkGORuUX2QGOEIL4EbJKm",
+            "duration": "4:13", "uri": "spotify:track:0BxE4FqsDD1Ot4YuBXwAPp"}});
+        let text = track(&looked_up);
+        assert!(
+            text.contains(
+                "\n  album: Favourite Worst Nightmare · spotify:album:1XkGORuUX2QGOEIL4EbJKm\n"
+            ),
+            "{text}"
+        );
+        let mut raw = looked_up.clone();
+        raw["item"]
+            .as_object_mut()
+            .map(|item| item.remove("album_uri"));
+        raw["raw"] =
+            json!({"album": {"id": "1XkGORuUX2QGOEIL4EbJKm", "name": "Favourite Worst Nightmare"}});
+        assert_eq!(track(&raw), text);
+        // Nothing to go by: the name alone, never a made-up URI.
+        raw["raw"] = json!({"album": {"id": "not an id"}});
+        assert!(
+            track(&raw).contains("\n  album: Favourite Worst Nightmare\n"),
+            "{}",
+            track(&raw)
+        );
+        // The song playing now: its album object from spotify_player.
+        let current = json!({"track": {"kind": "track", "name": "505", "artist": "Arctic Monkeys", "album": "Favourite Worst Nightmare",
+            "duration": "4:13", "uri": "spotify:track:0BxE4FqsDD1Ot4YuBXwAPp"}, "playback": {"position": "1:00", "remaining_ms": 193_000},
+            "album": {"id": "1XkGORuUX2QGOEIL4EbJKm", "name": "Favourite Worst Nightmare", "release_date": "2007-04-23"}});
+        assert!(
+            track(&current).contains(
+                "\n  album: Favourite Worst Nightmare (2007-04-23) · spotify:album:1XkGORuUX2QGOEIL4EbJKm\n"
+            ),
+            "{}",
+            track(&current)
+        );
+        // An episode's show has no album URI.
+        let episode = json!({"track": {"kind": "episode", "name": "Sleep", "artist": "Huberman Lab", "album": "Huberman Lab",
+            "album_uri": "spotify:album:1XkGORuUX2QGOEIL4EbJKm", "duration": "1:59:00", "uri": "spotify:episode:4IzpgR6RCEkRqMHbJF38Wp"},
+            "playback": {"position": "1:00", "remaining_ms": 1_000}});
+        assert!(
+            !track(&episode).contains("spotify:album:"),
+            "{}",
+            track(&episode)
         );
     }
 
@@ -1234,6 +1320,27 @@ mod tests {
             "Queued 1 item. Managed queue now has 3.\n  + How to Speak Clearly — Huberman Lab"
         );
         assert_eq!(kind_and_id("not a uri"), "not a uri");
+    }
+
+    #[test]
+    fn queue_warnings_are_shown() {
+        let warning = json!({"code": "no_active_device",
+            "message": "No device is active, so Spotify lists nothing upcoming.",
+            "hint": "Start playback in Spotify.app, then run spotify queue again."});
+        let listed = json!({"managed": [], "spotify_upcoming": {"items": [], "warnings": [warning.clone()]},
+            "warnings": [warning]});
+        let text = queue(&listed);
+        assert!(
+            text.ends_with(
+                "note: No device is active, so Spotify lists nothing upcoming. (no_active_device)\n  Start playback in Spotify.app, then run spotify queue again.\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(text.matches("no_active_device").count(), 1, "{text}");
+        let text = queue(&json!({"managed": [], "warnings": [{"code": "x", "message": "M"}]}));
+        assert!(text.ends_with("note: M (x)\n"), "{text}");
+        let text = queue(&json!({"managed": [], "warnings": [{"message": "A"}, {"message": "B"}]}));
+        assert!(text.ends_with("note: A\nnote: B\n"), "{text}");
     }
 
     #[test]

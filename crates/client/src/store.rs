@@ -437,6 +437,10 @@ pub struct Config {
     /// How long to wait for spotify_player's effect before falling back (ms, default 2500).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_timeout_ms: Option<u64>,
+    /// Give the focus back to the app that had it when an AppleScript start brings Spotify.app to
+    /// the front (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_spotify_in_background: Option<bool>,
     /// Explicit spotify_player binary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spotify_player_binary: Option<String>,
@@ -498,7 +502,13 @@ pub const CONFIG_KEYS: &[(&str, &str, &str, &str)] = &[
         "verify_timeout_ms",
         "integer 200-15000",
         "2500",
-        "How long to wait for spotify_player's effect before falling back to AppleScript.",
+        "How long to wait for spotify_player's or the Web API's effect before falling back to AppleScript.",
+    ),
+    (
+        "keep_spotify_in_background",
+        "boolean",
+        "true",
+        "When AppleScript starts playback (the Web API could not) and Spotify.app comes to the front, give the focus back to the app that had it.",
     ),
     (
         "spotify_player_binary",
@@ -689,6 +699,7 @@ impl Config {
             "strategy": self.strategy.unwrap_or_default(),
             "launch_spotify": self.launch_spotify.unwrap_or(true),
             "verify_timeout_ms": self.verify_timeout_ms.unwrap_or(2500),
+            "keep_spotify_in_background": self.keep_spotify_in_background.unwrap_or(true),
             "spotify_player_binary": self.spotify_player_binary,
             "spotify_player_config_dir": self.spotify_player_config_dir,
             "spotify_player_cache_dir": self.spotify_player_cache_dir,
@@ -710,7 +721,9 @@ fn accepts(key: &str) -> (String, &'static str) {
             "an https:// origin (a string)",
             r#""https://backend.spotify.unlikefraction.com""#,
         ),
-        "telemetry" | "launch_spotify" | "auto_update" => ("true or false", "false"),
+        "telemetry" | "launch_spotify" | "auto_update" | "keep_spotify_in_background" => {
+            ("true or false", "false")
+        }
         "org" => ("an organization handle (a string)", r#""unlikefraction""#),
         "strategy" => (
             r#"one of "auto", "spotify_player", "applescript""#,
@@ -956,6 +969,29 @@ mod tests {
         let (reset, _) = config.apply_json(r#"{"telemetry": null}"#).expect("unset");
         assert_eq!(reset.telemetry, None);
         assert!(config.apply_json("[1]").is_err());
+    }
+
+    #[test]
+    fn spotify_stays_in_the_background_unless_turned_off() {
+        let config = Config::default();
+        assert_eq!(config.effective()["keep_spotify_in_background"], true);
+        let (off, changed) = config
+            .apply_json(r#"{"keep_spotify_in_background": false}"#)
+            .expect("applies");
+        assert_eq!(changed, vec!["keep_spotify_in_background"]);
+        assert_eq!(off.keep_spotify_in_background, Some(false));
+        assert_eq!(off.effective()["keep_spotify_in_background"], false);
+        let error = config
+            .apply_json(r#"{"keep_spotify_in_background": "yes"}"#)
+            .expect_err("type");
+        assert_eq!(
+            error.message,
+            r#"keep_spotify_in_background must be true or false, not "yes"."#
+        );
+        assert!(CONFIG_KEYS.iter().any(|(key, kind, default, _)| *key
+            == "keep_spotify_in_background"
+            && *kind == "boolean"
+            && *default == "true"));
     }
 
     #[test]

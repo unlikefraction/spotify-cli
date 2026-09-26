@@ -452,6 +452,10 @@ pub struct Item {
     /// Album (tracks) or show (episodes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub album: Option<String>,
+    /// The album's uri (tracks) or the show's (episodes), when known: `spotify track` it for its
+    /// tracks, or `spotify play` it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_uri: Option<String>,
     /// Length in milliseconds (tracks, episodes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
@@ -522,6 +526,7 @@ impl Item {
                 .map(str::to_owned),
             _ => None,
         };
+        let album_uri = container_uri(kind, value);
         let description = value
             .get("description")
             .or_else(|| value.get("desc"))
@@ -536,6 +541,7 @@ impl Item {
             name,
             by,
             album,
+            album_uri,
             duration: duration_ms.map(clock),
             duration_ms,
             release_date: value
@@ -552,6 +558,70 @@ impl Item {
         })
     }
 
+    /// Normalizes a Spotify Web API object of the given kind (a search hit from `GET
+    /// /v1/search`) into the same shape as [`Self::from_player_json`]: lengths come as
+    /// `duration_ms`, a playlist's owner as `{display_name, id}`, a show's `by` is its publisher.
+    /// `None` for a `null` entry (Spotify leaves those in some lists) or one without an id.
+    #[must_use]
+    pub fn from_web_json(kind: &str, value: &Value) -> Option<Self> {
+        let id = value
+            .get("id")?
+            .as_str()
+            .filter(|id| !id.is_empty())?
+            .to_owned();
+        let text = |pointer: &str| {
+            value
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        let by = match kind {
+            "playlist" => text("/owner/display_name")
+                .or_else(|| text("/owner/id"))
+                .into_iter()
+                .collect(),
+            "show" => text("/publisher").into_iter().collect(),
+            _ => value
+                .get("artists")
+                .and_then(Value::as_array)
+                .map(|artists| {
+                    artists
+                        .iter()
+                        .filter_map(|a| a.get("name").and_then(Value::as_str).map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        let album = match kind {
+            "track" => text("/album/name"),
+            "episode" => text("/show/name"),
+            _ => None,
+        };
+        let duration_ms = matches!(kind, "track" | "episode")
+            .then(|| value.get("duration_ms").and_then(Value::as_u64))
+            .flatten();
+        Some(Self {
+            kind: kind.to_owned(),
+            uri: format!("spotify:{kind}:{id}"),
+            id,
+            name: text("/name").unwrap_or_default(),
+            by,
+            album,
+            album_uri: container_uri(kind, value),
+            duration: duration_ms.map(clock),
+            duration_ms,
+            release_date: text("/release_date"),
+            album_type: (kind == "album")
+                .then(|| text("/album_type"))
+                .flatten()
+                .map(|t| t.to_ascii_lowercase()),
+            explicit: value.get("explicit").and_then(Value::as_bool),
+            description: text("/description").map(|d| truncate(&d, 280)),
+        })
+    }
+
     /// `name — by`.
     #[must_use]
     pub fn label(&self) -> String {
@@ -563,12 +633,43 @@ impl Item {
     }
 }
 
+/// The uri of a track's album or an episode's show in a spotify_player or Web API object: its
+/// `uri`, else built from its `id` (spotify_player gives bare ids). `None` for other kinds, or
+/// when neither is usable.
+fn container_uri(kind: &str, value: &Value) -> Option<String> {
+    let of = match kind {
+        "track" => "album",
+        "episode" => "show",
+        _ => return None,
+    };
+    let object = value.get(of).filter(|o| o.is_object())?;
+    let prefix = format!("spotify:{of}:");
+    let text = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(uri) = text("uri").filter(|uri| uri.starts_with(&prefix)) {
+        return Some(uri.to_owned());
+    }
+    let id = text("id")?;
+    let id = id.strip_prefix(&prefix).unwrap_or(id);
+    id.chars()
+        .all(|c| c.is_ascii_alphanumeric())
+        .then(|| format!("{prefix}{id}"))
+}
+
 /// Details of one album, artist or track from `spotify_player get item --id <id> <kind>`, as
 /// `spotify track <uri>` prints them.
 ///
 /// spotify_player wraps albums as `{"album", "tracks"}` and artists as `{"artist", "top_tracks",
 /// "albums", "related_artists"}`; a track is the bare object. The result always has `kind` and
-/// `item` (the normalized [`Item`], `null` only when the output has no id), plus per kind:
+/// `item` (the normalized [`Item`], `null` only when the output has no id; a track's `item` has
+/// `album` (its name) and `album_uri`), plus per kind:
+/// - track: `album` as `{name, uri}`, so its album can be opened (`spotify track <uri>`) or
+///   played;
 /// - album: `release_date`, `track_count`, `duration_ms`, `duration`, `tracks`;
 /// - artist: `top_tracks`, `albums`, `related_artists`, and `genres`, `followers`, `popularity`
 ///   when spotify_player reports them.
@@ -594,6 +695,14 @@ pub fn item_view(kind: &str, value: &Value) -> Value {
     let item = Item::from_player_json(kind, object);
     let mut view = serde_json::json!({"kind": kind, "item": item});
     match kind {
+        "track" => {
+            if let Some(item) = item
+                .as_ref()
+                .filter(|i| i.album.is_some() || i.album_uri.is_some())
+            {
+                view["album"] = serde_json::json!({"name": item.album, "uri": item.album_uri});
+            }
+        }
         "album" => {
             let tracks = list("tracks", "track");
             let total_ms: u64 = tracks.iter().filter_map(|t| t.duration_ms).sum();
@@ -670,6 +779,51 @@ pub fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn web_api_search_hits_take_the_player_shape() {
+        let track = json!({"id": "3SVAN3BRByDmHOhKyIDxfC", "name": "Reckoner", "type": "track",
+            "uri": "spotify:track:3SVAN3BRByDmHOhKyIDxfC", "duration_ms": 290_213, "explicit": false,
+            "artists": [{"name": "Radiohead"}], "album": {"name": "In Rainbows", "album_type": "album"}});
+        let item = Item::from_web_json("track", &track).expect("track");
+        assert_eq!(item.uri, "spotify:track:3SVAN3BRByDmHOhKyIDxfC");
+        assert_eq!(item.by, ["Radiohead"]);
+        assert_eq!(item.album.as_deref(), Some("In Rainbows"));
+        assert_eq!(item.duration_ms, Some(290_213));
+        assert_eq!(item.duration.as_deref(), Some("4:50"));
+        assert_eq!(item.explicit, Some(false));
+        // The same song through spotify_player serializes the same way.
+        let player = json!({"id": "3SVAN3BRByDmHOhKyIDxfC", "name": "Reckoner", "explicit": false,
+            "artists": [{"name": "Radiohead"}], "album": {"name": "In Rainbows"},
+            "duration": {"secs": 290, "nanos": 213_000_000}});
+        assert_eq!(Item::from_player_json("track", &player), Some(item));
+        let playlist = json!({"id": "37i9dQZF1DZ06evO1RD8NV", "name": "This Is Radiohead",
+            "description": "  The essential tracks.  ", "collaborative": null, "public": null,
+            "owner": {"display_name": "Spotify", "id": "spotify"}});
+        let item = Item::from_web_json("playlist", &playlist).expect("playlist");
+        assert_eq!(item.by, ["Spotify"]);
+        assert_eq!(item.description.as_deref(), Some("The essential tracks."));
+        assert_eq!(item.duration_ms, None);
+        let album = json!({"id": "5vkqYmiPBYLaalcmjujWxK", "name": "In Rainbows", "album_type": "ALBUM",
+            "release_date": "2007-12-28", "artists": [{"name": "Radiohead"}]});
+        let item = Item::from_web_json("album", &album).expect("album");
+        assert_eq!(item.album_type.as_deref(), Some("album"));
+        assert_eq!(item.release_date.as_deref(), Some("2007-12-28"));
+        let show = json!({"id": "5qSUyCrk9KR69lEiXbjwXM", "name": "The Tim Ferriss Show",
+            "publisher": "Tim Ferriss: Bestselling Author"});
+        assert_eq!(
+            Item::from_web_json("show", &show).expect("show").by,
+            ["Tim Ferriss: Bestselling Author"]
+        );
+        // Search episodes carry no show.
+        let episode = json!({"id": "4IzpgR6RCEkRqMHbJF38Wp", "name": "Ep", "duration_ms": 60_000,
+            "release_date": "2026-09-01"});
+        let item = Item::from_web_json("episode", &episode).expect("episode");
+        assert_eq!((item.album, item.duration_ms), (None, Some(60_000)));
+        // Spotify's null holes and entries without an id are skipped.
+        assert_eq!(Item::from_web_json("playlist", &Value::Null), None);
+        assert_eq!(Item::from_web_json("track", &json!({"name": "x"})), None);
+    }
 
     #[test]
     fn web_playback_names_the_item_and_play_state() {
@@ -888,6 +1042,76 @@ mod tests {
         );
         assert_eq!(view["item"]["album"], "AM");
         assert!(view["item"].get("album_type").is_none());
+        // Its album can be opened: its uri next to its name.
+        assert_eq!(
+            view["item"]["album_uri"],
+            "spotify:album:78bpIziExqiI9qztvNFlQu"
+        );
+        assert_eq!(
+            view["album"],
+            json!({"name": "AM", "uri": "spotify:album:78bpIziExqiI9qztvNFlQu"})
+        );
+        // Albums and artists carry no album object of their own.
+        assert!(item_view("album", &album).get("album").is_none());
+        assert!(item_view("artist", &artist).get("album").is_none());
+    }
+
+    #[test]
+    fn a_tracks_album_uri_comes_from_either_shape() {
+        // The Web API names the album's uri; spotify_player only its bare id.
+        let web = json!({"id": "5FVd6KXrgO9B3JPmC8OPst", "name": "Do I Wanna Know?", "duration_ms": 272_000,
+            "artists": [{"name": "Arctic Monkeys"}],
+            "album": {"id": "78bpIziExqiI9qztvNFlQu", "uri": "spotify:album:78bpIziExqiI9qztvNFlQu", "name": "AM"}});
+        let item = Item::from_web_json("track", &web).expect("track");
+        assert_eq!(
+            item.album_uri.as_deref(),
+            Some("spotify:album:78bpIziExqiI9qztvNFlQu")
+        );
+        let player = json!({"id": "5FVd6KXrgO9B3JPmC8OPst", "name": "Do I Wanna Know?",
+            "artists": [{"id": "7Ln80lUS6He07XvHI8qqHH", "name": "Arctic Monkeys"}],
+            "album": {"id": "78bpIziExqiI9qztvNFlQu", "name": "AM", "typ": "album"},
+            "duration": {"secs": 233, "nanos": 630_000_000}});
+        let item = Item::from_player_json("track", &player).expect("track");
+        assert_eq!(item.album.as_deref(), Some("AM"));
+        assert_eq!(
+            item.album_uri.as_deref(),
+            Some("spotify:album:78bpIziExqiI9qztvNFlQu")
+        );
+        let value = serde_json::to_value(&item).expect("json");
+        assert_eq!(value["album"], "AM", "still a string");
+        assert_eq!(value["album_uri"], "spotify:album:78bpIziExqiI9qztvNFlQu");
+        // An episode's is its show's.
+        let episode = json!({"id": "4IzpgR6RCEkRqMHbJF38Wp", "name": "Ep", "duration_ms": 60_000,
+            "show": {"id": "79CkJF3UJTHFV8Dse3Oy0P", "name": "Huberman Lab"}});
+        let item = Item::from_web_json("episode", &episode).expect("episode");
+        assert_eq!(
+            item.album_uri.as_deref(),
+            Some("spotify:show:79CkJF3UJTHFV8Dse3Oy0P")
+        );
+        // Nothing usable, or another kind: none, and absent from the JSON.
+        let bare =
+            json!({"id": "x", "name": "Song", "album": {"name": "Album", "id": "not an id!"}});
+        let item = Item::from_player_json("track", &bare).expect("track");
+        assert_eq!(item.album_uri, None);
+        assert!(
+            serde_json::to_value(&item)
+                .expect("json")
+                .get("album_uri")
+                .is_none()
+        );
+        let album = json!({"id": "78bpIziExqiI9qztvNFlQu", "name": "AM"});
+        assert_eq!(
+            Item::from_player_json("album", &album)
+                .expect("album")
+                .album_uri,
+            None
+        );
+        // Items saved before the field existed still read.
+        let old: Item =
+            serde_json::from_value(json!({"kind": "track", "id": "a", "uri": "spotify:track:a",
+            "name": "A", "album": "B"}))
+            .expect("old item");
+        assert_eq!((old.album.as_deref(), old.album_uri), (Some("B"), None));
     }
 
     #[test]

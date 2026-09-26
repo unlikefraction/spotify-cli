@@ -7,13 +7,20 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use silicon_spotify_client::applescript::{self, Runner};
-use silicon_spotify_client::control::{Controller, PlayTarget, RepeatMode, Strategy, VolumeTarget};
+use silicon_spotify_client::control::{
+    Controller, Fallback, PlayTarget, RepeatMode, Strategy, Via, VolumeTarget,
+};
+use silicon_spotify_client::focus::{Focus, LaunchServices};
 use silicon_spotify_client::ipc::Request;
 use silicon_spotify_client::model::{Item, Playback, PlayerState, Track, WebPlayback, now_rfc3339};
 use silicon_spotify_client::player::{Output, SpotifyPlayer};
 use silicon_spotify_client::timing::SeekTarget;
 use silicon_spotify_client::trigger::Tracker;
 use silicon_spotify_client::uri::{Kind, SpotifyUri};
+use silicon_spotify_client::webapi::{
+    HttpWebApi, WebApi, cached_access_tokens, pause_after_rate_limit,
+    pause_left as web_api_pause_left,
+};
 use silicon_spotify_client::{Error, Result};
 use tokio::sync::{Notify, broadcast};
 
@@ -33,6 +40,9 @@ pub struct Settings {
     /// spotify_player verification timeout.
     #[serde(default)]
     pub verify_timeout_ms: Option<u64>,
+    /// Give the focus back when an AppleScript start brings Spotify.app forward (default true).
+    #[serde(default)]
+    pub keep_spotify_in_background: Option<bool>,
     /// spotify_player binary.
     #[serde(default)]
     pub spotify_player_binary: Option<String>,
@@ -77,6 +87,16 @@ impl Settings {
         let player = self.player()?;
         player.require_auth()?;
         Ok(player)
+    }
+
+    /// What gives the focus back when an AppleScript start brings Spotify.app to the front
+    /// (`None` when `keep_spotify_in_background` is off).
+    #[must_use]
+    pub fn focus(&self) -> Option<&'static dyn Focus> {
+        static DESKTOP: LaunchServices = LaunchServices;
+        self.keep_spotify_in_background
+            .unwrap_or(true)
+            .then_some(&DESKTOP as &dyn Focus)
     }
 }
 
@@ -170,9 +190,15 @@ impl Daemon {
         f: impl FnOnce(&Controller<'_>) -> Result<T>,
     ) -> Result<T> {
         let player = settings.authed_player();
+        let web = player.as_ref().map(HttpWebApi::new).map_err(Clone::clone);
         let controller = Controller {
             script: self.script.as_ref(),
             player: player.as_ref().map_err(Clone::clone),
+            web: web
+                .as_ref()
+                .map(|web| web as &dyn WebApi)
+                .map_err(Clone::clone),
+            focus: settings.focus(),
             strategy: settings.strategy.unwrap_or_default(),
             verify_timeout: Duration::from_millis(settings.verify_timeout_ms.unwrap_or(2500)),
             launch_spotify: settings.launch_spotify.unwrap_or(true),
@@ -800,7 +826,8 @@ fn item_info(daemon: &Daemon, settings: &Settings, uri: &SpotifyUri) -> Result<V
 }
 
 /// `spotify track` for the item playing now: Spotify.app's view, plus the song's artists, album
-/// and explicit flag from the Web API when it is a song (a failed lookup is a warning).
+/// (with its `uri`, also as `album_uri`) and explicit flag from spotify_player when it is a song
+/// (a failed lookup is a warning).
 fn current_info(settings: &Settings, playback: &Playback, track: Track) -> Value {
     let mut web = Value::Null;
     let mut warnings = Vec::new();
@@ -813,11 +840,24 @@ fn current_info(settings: &Settings, playback: &Playback, track: Track) -> Value
             Err(error) => warnings.push(error),
         }
     }
+    current_view(playback, track, &web, warnings)
+}
+
+/// [`current_info`]'s reply from Spotify.app's view and spotify_player's `get item` answer for
+/// the song (`web`, `null` when there is none).
+fn current_view(playback: &Playback, track: Track, web: &Value, warnings: Vec<Error>) -> Value {
     let artists = web.get("artists").and_then(Value::as_array).map(|a| {
         a.iter()
             .map(|x| json!({"id": x.get("id"), "name": x.get("name")}))
             .collect::<Vec<_>>()
     });
+    // The album's uri, so it can be opened: in the album object and on its own, as
+    // `spotify track <uri>`'s `item.album_uri`.
+    let album_uri = Item::from_player_json("track", web).and_then(|item| item.album_uri);
+    let mut album = web.get("album").cloned().unwrap_or(Value::Null);
+    if let (Some(object), Some(uri)) = (album.as_object_mut(), &album_uri) {
+        object.insert("uri".into(), json!(uri));
+    }
     json!({
         "track": track,
         "playback": {
@@ -825,7 +865,8 @@ fn current_info(settings: &Settings, playback: &Playback, track: Track) -> Value
             "remaining_ms": playback.remaining_ms, "progress": playback.progress,
         },
         "artists": artists,
-        "album": web.get("album"),
+        "album": album,
+        "album_uri": album_uri,
         "explicit": web.get("explicit"),
         "warnings": warnings,
     })
@@ -913,6 +954,8 @@ fn lyrics(daemon: &Daemon, settings: &Settings, uri: Option<&SpotifyUri>) -> Res
     }))
 }
 
+/// `search`: `spotify_player search`, and when that fails the Web API's own search
+/// (`GET /v1/search` with the same token and rate-limit pause; see [`search_results`]).
 fn search(settings: &Settings, query: &str, kinds: &[Kind], limit: usize) -> Result<Value> {
     let max = silicon_spotify_client::player::SEARCH_MAX_PER_KIND as usize;
     if !(1..=max).contains(&limit) {
@@ -927,33 +970,116 @@ fn search(settings: &Settings, query: &str, kinds: &[Kind], limit: usize) -> Res
             "Example: spotify search 'arctic monkeys 505' --type track",
         ));
     }
-    let value = settings.authed_player()?.json(&["search", query])?;
-    let mut out = serde_json::Map::new();
-    let wanted = |kind: Kind| kinds.is_empty() || kinds.contains(&kind);
-    for (key, kind) in [
-        ("tracks", Kind::Track),
-        ("albums", Kind::Album),
-        ("artists", Kind::Artist),
-        ("playlists", Kind::Playlist),
-        ("shows", Kind::Show),
-        ("episodes", Kind::Episode),
-    ] {
-        if !wanted(kind) {
-            continue;
+    let player = settings.authed_player()?;
+    let answer = player.json(&["search", query]);
+    let web = HttpWebApi::new(&player);
+    search_results(answer, &web, query, kinds, limit)
+}
+
+/// The kinds a search reports, in order, under their result keys.
+const SEARCH_KINDS: [(&str, Kind); 6] = [
+    ("tracks", Kind::Track),
+    ("albums", Kind::Album),
+    ("artists", Kind::Artist),
+    ("playlists", Kind::Playlist),
+    ("shows", Kind::Show),
+    ("episodes", Kind::Episode),
+];
+
+/// The search reply from spotify_player's `answer`, or, when that failed, from the Web API's own
+/// search, with `via` naming which one answered and `fallback` why spotify_player did not.
+/// spotify_player fails on some answers it cannot parse itself (`invalid type: null, expected a
+/// boolean` for a playlist with a null field). Its refusals that the Web API would repeat (a rate
+/// limit, no sign-in, a bad request) are not searched again.
+///
+/// # Errors
+/// spotify_player's error when there is no fallback; the Web API's, with spotify_player's as
+/// `first_attempt`, when both failed.
+fn search_results(
+    answer: Result<Value>,
+    web: &dyn WebApi,
+    query: &str,
+    kinds: &[Kind],
+    limit: usize,
+) -> Result<Value> {
+    let wanted: Vec<(&str, Kind)> = SEARCH_KINDS
+        .into_iter()
+        .filter(|(_, kind)| kinds.is_empty() || kinds.contains(kind))
+        .collect();
+    let error = match answer {
+        Ok(value) => {
+            let results = search_items(&value, &wanted, limit, |kind, hit| {
+                Item::from_player_json(kind, hit)
+            })?;
+            return Ok(
+                json!({"query": query, "results": results, "limit": limit, "via": Via::SpotifyPlayer}),
+            );
         }
-        let items: Vec<Item> = value
-            .get(key)
+        Err(error) => error,
+    };
+    if matches!(
+        error.code.as_str(),
+        "rate_limited" | "spotify_auth_required" | "spotify_player_missing" | "invalid_input"
+    ) {
+        return Err(error);
+    }
+    let types: Vec<&str> = wanted.iter().map(|(_, kind)| kind.as_str()).collect();
+    let value =
+        silicon_spotify_client::webapi::search(web, query, &types, limit).map_err(|web_error| {
+            let mut web_error = web_error;
+            let mut details = match web_error.details.take() {
+                Some(Value::Object(map)) => map,
+                _ => serde_json::Map::new(),
+            };
+            details.insert(
+                "first_attempt".into(),
+                serde_json::to_value(Fallback {
+                    from: Via::SpotifyPlayer,
+                    reason: error.clone(),
+                })
+                .unwrap_or(Value::Null),
+            );
+            web_error.details = Some(Value::Object(details));
+            web_error
+        })?;
+    // The Web API answers each type as a paging object.
+    let results = search_items(&value, &wanted, limit, |kind, hit| {
+        Item::from_web_json(kind, hit)
+    })?;
+    Ok(json!({
+        "query": query,
+        "results": results,
+        "limit": limit,
+        "via": Via::WebApi,
+        "fallback": Fallback {from: Via::SpotifyPlayer, reason: error},
+    }))
+}
+
+/// Up to `limit` hits of each `wanted` kind from a search answer (spotify_player's lists, or the
+/// Web API's paging objects under `items`), normalized by `item`.
+fn search_items(
+    value: &Value,
+    wanted: &[(&str, Kind)],
+    limit: usize,
+    item: impl Fn(&str, &Value) -> Option<Item>,
+) -> Result<serde_json::Map<String, Value>> {
+    let mut out = serde_json::Map::new();
+    for (key, kind) in wanted {
+        let list = value
+            .get(*key)
+            .map(|list| list.get("items").unwrap_or(list));
+        let items: Vec<Item> = list
             .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| Item::from_player_json(kind.as_str(), v))
+            .map(|hits| {
+                hits.iter()
+                    .filter_map(|hit| item(kind.as_str(), hit))
                     .take(limit)
                     .collect()
             })
             .unwrap_or_default();
-        out.insert(key.into(), serde_json::to_value(items)?);
+        out.insert((*key).into(), serde_json::to_value(items)?);
     }
-    Ok(json!({"query": query, "results": out, "limit": limit}))
+    Ok(out)
 }
 
 /// A read (`get key …`, `get item …`) that spotify_player may page through many Web API requests
@@ -1439,12 +1565,21 @@ async fn queue_list(daemon: &Arc<Daemon>, settings: Settings) -> Result<Value> {
         )
     };
     let d = Arc::clone(daemon);
-    let upcoming = blocking(move || -> Result<Value> {
+    let (upcoming, warnings) = blocking(move || -> Result<(Value, Vec<Error>)> {
         let queue = settings.authed_player().and_then(|player| {
             let value = player.json(&["get", "key", "queue"])?;
             Ok((player, value))
         });
         match queue {
+            // Nothing plays on any device: Spotify's upcoming list is empty for that reason.
+            Ok((_, value)) if nothing_active(&value) => Ok((
+                json!({"items": []}),
+                inactive_warnings(d.read().ok().as_ref()),
+            )),
+            Err(error) if error.code == "no_active_device" => Ok((
+                json!({"items": []}),
+                inactive_warnings(d.read().ok().as_ref()),
+            )),
             Ok((player, value)) => {
                 let (items, repeats) = spotify_upcoming(&value);
                 let more = !items.is_empty();
@@ -1466,9 +1601,9 @@ async fn queue_list(daemon: &Arc<Daemon>, settings: Settings) -> Result<Value> {
                         more
                     ));
                 }
-                Ok(upcoming)
+                Ok((upcoming, Vec::new()))
             }
-            Err(error) => Ok(json!({"items": [], "error": error})),
+            Err(error) => Ok((json!({"items": [], "error": error}), Vec::new())),
         }
     })
     .await?;
@@ -1477,8 +1612,42 @@ async fn queue_list(daemon: &Arc<Daemon>, settings: Settings) -> Result<Value> {
         "managed_now": managed_now,
         "resume_after": resume,
         "spotify_upcoming": upcoming,
+        "warnings": warnings,
         "note": "`managed` items are spotify-cli's own queue: they play next, in order, and can be added, removed, moved and cleared. `spotify_upcoming` is Spotify's native queue/context (read-only: Spotify offers no API to remove or reorder it).",
     }))
+}
+
+/// Whether a `get key queue` answer says nothing plays on any device: no current item and
+/// nothing upcoming (`null` when Spotify answered without a body).
+fn nothing_active(value: &Value) -> bool {
+    value.is_null()
+        || (value.get("currently_playing").is_none_or(Value::is_null)
+            && value
+                .get("queue")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty))
+}
+
+/// The warnings on `spotify queue` when the Web API reports nothing playing: `no_active_device`,
+/// unless Spotify.app (`app`) plays after all (an ad or a private session, which the Web API does
+/// not report); then the list is just empty.
+fn inactive_warnings(app: Option<&Playback>) -> Vec<Error> {
+    if app.is_some_and(|app| app.state == PlayerState::Playing) {
+        Vec::new()
+    } else {
+        vec![no_active_device()]
+    }
+}
+
+/// The warning on `spotify queue` when Spotify has no active device, which leaves its upcoming
+/// list empty.
+fn no_active_device() -> Error {
+    Error::new(
+        "no_active_device",
+        "Spotify has no active device, so its upcoming list is empty; play something in Spotify.app once",
+        "Play or resume anything (`spotify play`), then run `spotify queue` again. The managed queue is not affected.",
+    )
+    .retryable()
 }
 
 /// The note on the copies of the item playing now that [`spotify_upcoming`] left out. Spotify
@@ -1826,38 +1995,20 @@ impl<T> Fetched<T> {
     }
 }
 
-/// Until when (unix ms) [`web_api_get`] stays away from the Web API after a rate limit.
-static WEB_API_PAUSED_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// How long [`web_api_get`] still stays away after a rate limit (zero when it does not).
-fn web_api_pause_left() -> Duration {
-    let until = WEB_API_PAUSED_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed);
-    Duration::from_millis(until.saturating_sub(silicon_spotify_client::model::now_ms()))
-}
-
-/// How long to stay away after a 429: its `Retry-After` in seconds, 30 s without a usable one,
-/// at most 10 minutes (these lookups are niceties; a bogus header must not disable them for long).
-fn rate_limit_pause(retry_after: Option<&str>) -> Duration {
-    let secs = retry_after
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(30);
-    Duration::from_secs(secs.clamp(1, 600))
-}
-
 /// `GET` a Spotify Web API `url` with the access tokens spotify_player keeps in its cache folder
 /// (the warm copy keeps them fresh; see [`cached_access_tokens`]), trying the next token when one
 /// is refused (401/403). [`Fetched::Limited`] on a rate limit (429), [`Fetched::Failed`] on any
 /// other status, a network error or after `timeout` per request; nothing is logged or shown.
 /// After a rate limit it sends nothing until the `Retry-After` has passed (answering `Limited`
 /// meanwhile), so these lookups do not prolong it for spotify_player, which shares the token's
-/// client.
+/// client. The pause is the one the controller's Web API starts observe too
+/// ([`silicon_spotify_client::webapi::pause_left`]).
 async fn web_api_get(
     tokens: &[String],
     url: &str,
     query: &[(&str, &str)],
     timeout: Duration,
 ) -> Fetched<Value> {
-    use std::sync::atomic::Ordering;
     if !web_api_pause_left().is_zero() {
         return Fetched::Limited;
     }
@@ -1889,15 +2040,12 @@ async fn web_api_get(
             // That token is stale or for a client without the scope: try the next.
             401 | 403 => {}
             429 => {
-                let pause = rate_limit_pause(
+                pause_after_rate_limit(
                     response
                         .headers()
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|value| value.to_str().ok()),
                 );
-                let until = silicon_spotify_client::model::now_ms()
-                    .saturating_add(u64::try_from(pause.as_millis()).unwrap_or(u64::MAX));
-                WEB_API_PAUSED_UNTIL_MS.fetch_max(until, Ordering::Relaxed);
                 return Fetched::Limited;
             }
             _ => return Fetched::Failed,
@@ -1918,37 +2066,6 @@ fn episode_from_web(value: &Value) -> TrackFacts {
         ),
         value.get("duration_ms").and_then(Value::as_u64),
     )
-}
-
-/// The unexpired Web API access tokens in spotify_player's cache folder, newest first.
-fn cached_access_tokens(player: &SpotifyPlayer) -> Vec<String> {
-    let Some(entries) = player
-        .cache_folder()
-        .and_then(|dir| std::fs::read_dir(dir).ok())
-    else {
-        return Vec::new();
-    };
-    let now = time::OffsetDateTime::now_utc();
-    let mut found: Vec<(std::time::SystemTime, String)> = entries
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.file_name().to_string_lossy().ends_with("_token.json"))
-        .filter_map(|entry| {
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            let value: Value = serde_json::from_slice(&std::fs::read(entry.path()).ok()?).ok()?;
-            let expired = value
-                .get("expires_at")
-                .and_then(Value::as_str)
-                .and_then(|at| {
-                    time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
-                        .ok()
-                })
-                .is_some_and(|at| at <= now);
-            let token = value.get("access_token")?.as_str()?.to_owned();
-            (!expired).then_some((modified, token))
-        })
-        .collect();
-    found.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    found.into_iter().map(|(_, token)| token).collect()
 }
 
 async fn queue_add(daemon: &Arc<Daemon>, request: &Request, settings: Settings) -> Result<Value> {
@@ -2225,6 +2342,38 @@ mod tests {
     }
 
     #[test]
+    fn track_details_name_the_albums_uri() {
+        // `spotify_player get item --id <id> track` (0.25.1): the album by its bare id.
+        let mut song = track_json("5FVd6KXrgO9B3JPmC8OPst", "Do I Wanna Know?", 272);
+        song["album"] = json!({"added_at": 0, "id": "78bpIziExqiI9qztvNFlQu", "name": "AM",
+            "release_date": "2013-09-09", "typ": "album", "artists": [{"id": "7Ln80lUS6He07XvHI8qqHH", "name": "Arctic Monkeys"}]});
+        let album = "spotify:album:78bpIziExqiI9qztvNFlQu";
+        // `spotify track <uri>`: the album's name stays a string, its uri is next to it.
+        let out = item_envelope("track", song.clone());
+        assert_eq!(out["item"]["album"], json!("AM"));
+        assert_eq!(out["item"]["album_uri"], json!(album));
+        assert_eq!(out["album"], json!({"name": "AM", "uri": album}));
+        // `spotify track` for the song playing now: the album object gains its uri.
+        let mut track = Track {
+            uri: "spotify:track:5FVd6KXrgO9B3JPmC8OPst".into(),
+            name: "Do I Wanna Know?".into(),
+            album: "AM".into(),
+            duration_ms: 272_000,
+            ..Track::default()
+        };
+        track.finish();
+        let playback = Playback::empty(PlayerState::Playing);
+        let now = current_view(&playback, track.clone(), &song, Vec::new());
+        assert_eq!(now["album_uri"], json!(album));
+        assert_eq!(now["album"]["uri"], json!(album));
+        assert_eq!(now["album"]["name"], json!("AM"));
+        assert_eq!(now["album"]["release_date"], json!("2013-09-09"));
+        // Without spotify_player's answer: no album, no uri.
+        let alone = current_view(&playback, track, &Value::Null, Vec::new());
+        assert!(alone["album"].is_null() && alone["album_uri"].is_null());
+    }
+
+    #[test]
     fn reads_wait_out_spotify_players_shared_responses_after_a_write() {
         let now = Instant::now();
         assert_eq!(settle_delay(None, now), None);
@@ -2487,7 +2636,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rate_limited_lookup_is_not_a_try_and_nothing_is_sent_meanwhile() {
-        use std::sync::atomic::Ordering;
+        use silicon_spotify_client::webapi::replace_pause;
         let daemon = daemon_playing(&format!("spotify:track:{ID}"));
         daemon.live().queue.items = vec![queued(
             "q_1",
@@ -2496,11 +2645,7 @@ mod tests {
         )];
         // While an earlier 429's Retry-After runs, lookups answer `Limited` without a request
         // (the token here is fake: a request would fail, not be limited).
-        let before = WEB_API_PAUSED_UNTIL_MS.load(Ordering::Relaxed);
-        WEB_API_PAUSED_UNTIL_MS.store(
-            silicon_spotify_client::model::now_ms() + 60_000,
-            Ordering::Relaxed,
-        );
+        let before = replace_pause(silicon_spotify_client::model::now_ms() + 60_000);
         assert!(web_api_pause_left() > Duration::from_secs(50));
         let tokens = ["not-a-token".to_owned()];
         assert_eq!(
@@ -2509,7 +2654,7 @@ mod tests {
         );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         assert!(backfill_round(&daemon, &tokens, deadline).await);
-        WEB_API_PAUSED_UNTIL_MS.store(before, Ordering::Relaxed);
+        replace_pause(before);
         // The item stays wanted, with no try used up.
         let live = daemon.live();
         assert_eq!(live.fact_tries.get("q_1"), None);
@@ -2596,13 +2741,11 @@ mod tests {
     }
 
     fn outcome_on(daemon: &Daemon) -> Result<silicon_spotify_client::control::Outcome> {
-        Ok(silicon_spotify_client::control::Outcome {
-            action: "play".into(),
-            via: silicon_spotify_client::control::Via::Applescript,
-            fallback: None,
-            result: None,
-            playback: daemon.read()?,
-        })
+        Ok(silicon_spotify_client::control::Outcome::new(
+            "play",
+            silicon_spotify_client::control::Via::Applescript,
+            daemon.read()?,
+        ))
     }
 
     #[test]
@@ -2678,20 +2821,6 @@ mod tests {
     }
 
     #[test]
-    fn rate_limits_pause_web_api_lookups_for_their_retry_after() {
-        assert_eq!(rate_limit_pause(Some("7")), Duration::from_secs(7));
-        assert_eq!(rate_limit_pause(Some(" 12 ")), Duration::from_secs(12));
-        // No usable header: a default pause; a bogus one is capped.
-        assert_eq!(rate_limit_pause(None), Duration::from_secs(30));
-        assert_eq!(
-            rate_limit_pause(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
-            Duration::from_secs(30)
-        );
-        assert_eq!(rate_limit_pause(Some("86400")), Duration::from_secs(600));
-        assert_eq!(rate_limit_pause(Some("0")), Duration::from_secs(1));
-    }
-
-    #[test]
     fn only_transient_read_failures_are_retried() {
         let transport = silicon_spotify_client::player::classify(
             "error sending request for url (https://api.spotify.com/v1/me/tracks?offset=450)",
@@ -2737,6 +2866,184 @@ mod tests {
         // A blank show is missing, so it stays wanted rather than recorded as known.
         let blank = json!({"name": "Ep", "duration_ms": 1, "show": {"name": " "}});
         assert_eq!(episode_from_web(&blank), (Some("Ep".into()), None, Some(1)));
+    }
+
+    /// `GET /v1/search?q=radiohead+reckoner&type=track,playlist&limit=2` as Spotify answers it
+    /// (trimmed): paging objects, `duration_ms`, owners as objects, a `null` playlist hole and a
+    /// playlist whose `public` is `null` (what spotify_player 0.25's parser refuses).
+    const WEB_SEARCH: &str = r#"{
+      "tracks": {"href": "https://api.spotify.com/v1/search?offset=0&limit=2&query=radiohead%20reckoner&type=track",
+        "limit": 2, "next": null, "offset": 0, "previous": null, "total": 2,
+        "items": [
+          {"id": "3SVAN3BRByDmHOhKyIDxfC", "name": "Reckoner", "type": "track", "uri": "spotify:track:3SVAN3BRByDmHOhKyIDxfC",
+           "duration_ms": 290213, "explicit": false, "is_playable": true, "popularity": 71,
+           "artists": [{"id": "4Z8W4fKeB5YxbusRsdQVPb", "name": "Radiohead", "type": "artist"}],
+           "album": {"id": "5vkqYmiPBYLaalcmjujWxK", "name": "In Rainbows", "album_type": "album"}},
+          {"id": "0jyikFM0Umv0KlnrOEKtTG", "name": "Reckoner - Live", "type": "track", "uri": "spotify:track:0jyikFM0Umv0KlnrOEKtTG",
+           "duration_ms": 301000, "explicit": false,
+           "artists": [{"id": "4Z8W4fKeB5YxbusRsdQVPb", "name": "Radiohead", "type": "artist"}],
+           "album": {"id": "1S3uMGBdmPnQuqkvF1sZ8N", "name": "In Rainbows (Live)", "album_type": "album"}}
+        ]},
+      "playlists": {"limit": 2, "next": null, "offset": 0, "total": 3,
+        "items": [
+          null,
+          {"id": "37i9dQZF1DZ06evO1RD8NV", "name": "This Is Radiohead", "type": "playlist",
+           "description": "The essential tracks, all in one playlist.", "collaborative": false, "public": null,
+           "owner": {"id": "spotify", "display_name": "Spotify", "type": "user"},
+           "tracks": {"total": 50}}
+        ]}
+    }"#;
+
+    /// Answers `GET /search` with `answer` and records the requests.
+    struct SearchWeb {
+        answer: Mutex<Option<silicon_spotify_client::webapi::Reply>>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl SearchWeb {
+        fn new(status: u16, body: Value) -> Self {
+            Self {
+                answer: Mutex::new(Some(silicon_spotify_client::webapi::Reply {
+                    status,
+                    body,
+                    retry_after: None,
+                })),
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl WebApi for SearchWeb {
+        fn send(
+            &self,
+            method: silicon_spotify_client::webapi::Method,
+            path: &str,
+            query: &[(&str, &str)],
+            _body: Option<&Value>,
+        ) -> Result<silicon_spotify_client::webapi::Reply> {
+            let query: Vec<String> = query.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            self.asked.lock().expect("lock").push(format!(
+                "{} {path}?{}",
+                method.as_str(),
+                query.join("&")
+            ));
+            self.answer
+                .lock()
+                .expect("lock")
+                .clone()
+                .ok_or_else(|| Error::internal("no answer"))
+        }
+
+        fn pause_left(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        fn rate_limited(&self, _retry_after: Option<&str>) {}
+    }
+
+    /// spotify_player's failure on 'radiohead reckoner' (0.25): its own parser refused the answer.
+    fn parse_failure() -> Error {
+        silicon_spotify_client::player::classify(
+            "Error: invalid type: null, expected a boolean at line 1 column 5230",
+            "",
+            &["search", "radiohead reckoner"],
+        )
+    }
+
+    #[test]
+    fn a_search_spotify_player_cannot_parse_is_answered_by_the_web_api() {
+        let web = SearchWeb::new(200, serde_json::from_str(WEB_SEARCH).expect("fixture"));
+        let kinds = [Kind::Track, Kind::Playlist];
+        let reply = search_results(Err(parse_failure()), &web, "radiohead reckoner", &kinds, 2)
+            .expect("answered");
+        assert_eq!(reply["via"], "web_api");
+        assert_eq!(reply["fallback"]["from"], "spotify_player");
+        assert_eq!(reply["fallback"]["reason"]["code"], "spotify_player_failed");
+        let tracks = reply["results"]["tracks"].as_array().expect("tracks");
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0]["uri"], "spotify:track:3SVAN3BRByDmHOhKyIDxfC");
+        assert_eq!(tracks[0]["by"], json!(["Radiohead"]));
+        assert_eq!(tracks[0]["album"], "In Rainbows");
+        assert_eq!(tracks[0]["duration"], "4:50");
+        // The null hole is skipped; the playlist's owner is its display name.
+        let playlists = reply["results"]["playlists"].as_array().expect("playlists");
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0]["by"], json!(["Spotify"]));
+        // Only the kinds asked for.
+        assert_eq!(
+            reply["results"]
+                .as_object()
+                .expect("results")
+                .keys()
+                .collect::<Vec<_>>(),
+            ["playlists", "tracks"]
+        );
+        assert_eq!(
+            *web.asked.lock().expect("lock"),
+            ["GET /search?q=radiohead reckoner&type=track,playlist&limit=2"]
+        );
+    }
+
+    #[test]
+    fn a_search_spotify_player_answered_says_so_and_asks_nothing_else() {
+        let web = SearchWeb::new(500, Value::Null);
+        let answer = json!({"tracks": [track_json(ID, "Reckoner", 290)], "albums": [], "artists": [],
+            "playlists": [], "shows": [], "episodes": []});
+        let reply = search_results(Ok(answer), &web, "reckoner", &[], 10).expect("answered");
+        assert_eq!(reply["via"], "spotify_player");
+        assert!(reply.get("fallback").is_none());
+        assert_eq!(reply["results"]["tracks"][0]["name"], "Reckoner");
+        assert_eq!(reply["results"].as_object().expect("results").len(), 6);
+        assert!(web.asked.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn search_failures_the_web_api_would_repeat_are_not_searched_again() {
+        let web = SearchWeb::new(200, json!({}));
+        let limited = silicon_spotify_client::player::classify(
+            "http error: status code 429 Too Many Requests",
+            "",
+            &["search", "x"],
+        );
+        let error = search_results(Err(limited), &web, "x", &[], 5).expect_err("limited");
+        assert_eq!(error.code, "rate_limited");
+        assert!(web.asked.lock().expect("lock").is_empty());
+        // Both failed: the Web API's error, with spotify_player's as the first attempt.
+        let web = SearchWeb::new(
+            502,
+            json!({"error": {"status": 502, "message": "Bad gateway"}}),
+        );
+        let error =
+            search_results(Err(parse_failure()), &web, "x", &[Kind::Track], 5).expect_err("both");
+        assert_eq!(error.code, "web_api_failed");
+        let first = &error.details.expect("details")["first_attempt"];
+        assert_eq!(first["from"], "spotify_player");
+        assert_eq!(first["reason"]["code"], "spotify_player_failed");
+    }
+
+    #[test]
+    fn an_empty_upcoming_list_with_nothing_playing_means_no_active_device() {
+        assert!(nothing_active(
+            &json!({"currently_playing": null, "queue": []})
+        ));
+        assert!(nothing_active(&Value::Null));
+        assert!(nothing_active(&json!({})));
+        // Something plays: an empty list is just empty.
+        assert!(!nothing_active(
+            &json!({"currently_playing": track_json(ID, "Now", 100), "queue": []})
+        ));
+        let warning = no_active_device();
+        assert_eq!(warning.code, "no_active_device");
+        // Spotify.app plays all the same (an ad, a private session): no such warning.
+        let playing = Playback::empty(PlayerState::Playing);
+        assert!(inactive_warnings(Some(&playing)).is_empty());
+        let paused = Playback::empty(PlayerState::Paused);
+        assert_eq!(inactive_warnings(Some(&paused))[0].code, "no_active_device");
+        assert_eq!(inactive_warnings(None)[0].code, "no_active_device");
+        assert_eq!(
+            warning.message,
+            "Spotify has no active device, so its upcoming list is empty; play something in Spotify.app once"
+        );
     }
 
     #[test]

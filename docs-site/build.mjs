@@ -170,6 +170,21 @@ const llms = [
   "",
   `Install: \`${install}\``,
   "",
+  "Find anything, offline:",
+  "",
+  "- `spotify` with no arguments: what is set up, what is missing (each with its fix), what is playing, and what to try (`--json`: version, ready, now_playing, checks, try, help).",
+  "- `spotify how \"<question>\"`: plain-words search over every command's help, the guides, the settings and the error codes; prints commands with ready-to-run examples made for the question (a song name becomes a search, a setting a `config set`), the guide section to read and matching error codes (`--json`: question, name, terms, commands, guides, errors, more).",
+  "- `spotify commands --json`: the whole CLI as one JSON manifest. Per command: path, summary, goal, capabilities, keywords, arguments (flag, type, allowed_values, default, min, max, conflicts_with, requires), arg_groups, examples, output fields, errors with exit codes, requirements (macos, daemon, spotify_app, spotify_player_signed_in, iam_login, premium, controls_playback, network), mutates, changes, read_only_when and has_read_only_form. Top level: goals, errors (code, exit, meaning, fix), exit_codes, argument_types, changes (library is Liked Songs, changed by like and unlike; playlists is playlists), output_contract. Commands that can run without changing anything: `spotify commands --json | jq -r '.commands[] | select(.mutates == false or .read_only_when != null).command'` (the same as `select(.has_read_only_form)`); what changes Liked Songs: `select(.changes | index(\"library\"))`. `spotify commands` marks changing commands with `✎ changes <what>`.",
+  "- `spotify --help` groups commands by goal; every `spotify <command> --help` lists its own options, then the global ones, and ends with runnable examples; `spotify docs <topic> --section '<heading>'` prints one guide section and `spotify docs [<topic>] --search '<text>'` searches; `spotify completions --help` has the install lines for zsh, bash, fish and PowerShell.",
+  "- Human output ends with a `Next:` line on stderr suggesting the likely next commands with real URIs, only when stdout is a terminal (never ahead of piped output; `SPOTIFY_HINTS=0` turns it off, `SPOTIFY_HINTS=always` forces it; never in `--json`).",
+  "",
+  "Common tasks:",
+  "",
+  "- Lyrics of any song, nothing has to play: `spotify lyrics <uri|link|id>` (`spotify lyrics` alone: the song playing now). It takes a track, not search words: find one by name with `spotify search '<words>' --type track`, then run `spotify lyrics <uri>`. `--json`: track, title, lines, text, synced.",
+  "- Play anything: `spotify play spotify:track:<id>` (or `--search '<words>'`, `--context <playlist>`, `--liked`, an album, playlist, artist or show). Every start goes through the Spotify Web API first, so Spotify.app stays in the background (`via: \"web_api\"`): songs, episodes, shows and Liked Songs directly (a song inside its album, so the album plays on), albums, playlists, artists and radios through spotify_player. It plays where Spotify.app plays: on this Mac, or on the speaker or phone it controls (`note`). AppleScript is the fallback, except for a radio (`fallback.from: \"web_api\"`, `fallback.reason.code`), and the focus goes back to the previous app (`refocused`; config `keep_spotify_in_background`).",
+  "- Get notified at a checkpoint: `spotify trigger add --remaining 30s --note '<what to do>'` (also `--elapsed 50%`, `--end`, `--change`; needs `spotify login '<SLT>'` with an SLT from `iam`, Silicon IAM's own CLI, separate from spotify-cli: `cargo install silicon-iam-cli`; or `--local` with `spotify trigger wait <id>`).",
+  "- Output: `--json` prints exactly one JSON value on stdout; errors are one `{\"error\": {code, message, hint, retryable, details}}` object on stderr. Exit codes: 0 ok, 1 failed, 2 usage, 3 not signed in, 4 refused, 5 unavailable.",
+  "",
   "## Docs",
 ];
 
@@ -198,33 +213,43 @@ const landing = `<main class="landing">
 <section class="hero">
   <p class="eyebrow"><span class="dot"></span> For Carbons and Silicons on macOS</p>
   <h1>Spotify from the command line, with a <span class="serif">cue</span> for every moment.</h1>
-  <p class="lede">Play, search, queue and manage playlists and podcasts from a terminal or a Silicon. Set checkpoints like <em>30 seconds left</em>, <em>halfway</em> or <em>song over</em>, and get a Ting when they arrive.</p>
+  <p class="lede">Play, search, read the lyrics of any song, queue and manage playlists and podcasts from a terminal or a Silicon, while Spotify stays in the background. Set checkpoints like <em>30 seconds left</em>, <em>halfway</em> or <em>song over</em>, and get a Ting when they arrive.</p>
   <div class="install"><code id="install-cmd">${esc(install)}</code><button class="copy" data-copy="install-cmd" type="button">Copy</button></div>
   <p class="note">Installs <code>spotify</code>, <code>spotify-daemon</code> and <code>spotify_player</code>, and starts what needs to run. It never logs you in. Then: <code>spotify doctor</code>.</p>
 </section>
 <section class="cards">
-  <article><h2>Every control</h2><p>Play anything by link, URI or search. Pause, skip, seek, volume, shuffle, repeat, likes, lyrics, devices, playlists, podcasts, and a real queue you can reorder and trim.</p><pre><code>spotify play --search 'arctic monkeys 505'
+  <article><h2>Every control</h2><p>Play anything by link, URI or search. Pause, skip, seek, volume, shuffle, repeat, likes, devices, playlists, podcasts, and a real queue you can reorder and trim.</p><pre><code>spotify play --search 'arctic monkeys 505'
 spotify seek 50%
 spotify queue add spotify:track:… --next
 spotify playlist create 'Deep focus'</code></pre></article>
-  <article><h2>Verified, not assumed</h2><p>Each command goes through spotify_player first, is checked against Spotify.app itself, and falls back to AppleScript when it did not take effect. The result says which path worked and why.</p><pre><code>{"action": "play", "via": "applescript",
- "fallback": {"from": "spotify_player",
-  "reason": {"code": "no_effect", …}}}</code></pre></article>
+  <article><h2>Lyrics of any song</h2><p>The song playing now, or any track by URI, link or id. Nothing has to play, and Spotify does not need to be open. Only know its name? Search for the track, then pass its URI.</p><pre><code>spotify lyrics
+spotify lyrics \\
+  spotify:track:0BxE4FqsDD1Ot4YuBXwAPp
+spotify search 'bohemian rhapsody' \\
+  --type track</code></pre></article>
+  <article><h2>Find anything</h2><p>Ask in plain words, offline. <code>spotify</code> alone shows what is set up and what to try, <code>--help</code> groups every command by goal with an example, and each result suggests what comes next. Tab completion for zsh, bash, fish and PowerShell, with install lines that work as they are.</p><pre><code>spotify how "play my liked songs shuffled"
+spotify --help
+spotify completions --help</code></pre></article>
+  <article><h2>Out of your way, and verified</h2><p>Every start goes through the Spotify Web API first, so Spotify.app stays in the background, a song's album plays on after it, and a speaker you picked keeps playing. Every effect is checked against Spotify.app; if AppleScript has to step in, your app gets the focus back. The result says which path worked and why.</p><pre><code>{"action": "play", "via": "web_api",
+ "playback": {"state": "playing", …}}</code></pre></article>
   <article><h2>Triggers through Ting</h2><p>Checkpoints by time left, time played, percentage, song end or song change. Firings are durable, retried, never duplicated, and carry your note and ISI.</p><pre><code>spotify trigger add --remaining 30s \\
   --note 'wrap up the call'
 spotify trigger add --end --scope every</code></pre></article>
+  <article><h2>Describes itself</h2><p>One JSON manifest holds every command: arguments with types, allowed values and defaults, examples, output fields, error codes with exit codes, what each needs (daemon, Spotify.app, login, Premium) and whether it changes anything.</p><pre><code>spotify commands --json | jq \\
+  '.commands[] | select(.path == "lyrics")'</code></pre></article>
 </section>
 <section class="silicons">
   <h2>For Silicons</h2>
   <ol>
     <li><code>spotify iam --json</code> → <code>{"app_id": "spotify", …}</code></li>
-    <li><code>cargo install silicon-iam-cli</code> — the official <code>iam</code> CLI, if you do not have it</li>
+    <li><code>cargo install silicon-iam-cli</code> — <code>iam</code>, Silicon IAM's own CLI (separate from spotify-cli), if you do not have it</li>
+    <li>In a fresh <code>SILICON_HOME</code>, once: <code>iam silicon-login --sid si:&lt;handle&gt;</code> — the Silicon's own IAM sign-in (it asks for its STK)</li>
     <li><code>iam silicon-login --app-id spotify --grant-org "$SILICON_ORG" --approve-scopes</code> — prints a short-lived token (SLT)</li>
     <li><code>spotify login '&lt;SLT&gt;'</code> — exchanges it and registers you with Ting</li>
     <li><code>spotify trigger add --elapsed 50%</code> — you receive <code>spotify.trigger.fired</code></li>
   </ol>
   <p>New to IAM, Silicons, SLTs or Ting? <a href="/docs/usage/#concepts">Concepts</a> explains each in a sentence or two.</p>
-  <p>Every command documents itself (<code>spotify &lt;command&gt; --help</code>), the whole tree is machine-readable (<code>spotify commands --json</code>), guides are bundled offline (<code>spotify docs</code>), and every error says what failed, why, and the exact fix.</p>
+  <p>Every command documents itself with runnable examples (<code>spotify &lt;command&gt; --help</code>). <code>spotify how "&lt;task&gt;" --json</code> finds the command for a task, <code>spotify commands --json</code> describes every command, argument, output field, error and requirement (<a href="/docs/usage/#the-command-manifest">the manifest</a>), guides are bundled offline (<code>spotify docs &lt;topic&gt; --section '&lt;heading&gt;'</code>), and every error says what failed, why, and the exact fix.</p>
 </section>
 <section class="grid">
 ${topics.map(([n, t]) => `<a href="/docs/${n}/"><strong>${esc(t)}</strong><span>spotify docs ${n}</span></a>`).join("\n")}

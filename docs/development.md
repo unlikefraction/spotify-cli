@@ -7,9 +7,10 @@ patch it, open a pull request, then `spotify report '<what>' --pr <url>`.
 
 ```text
 crates/client   silicon-spotify-client   stateless library: models, URI/time parsing, AppleScript,
-                                         spotify_player wrapper, verified control, trigger engine,
-                                         backend API client; feature `runtime` adds the per-home
-                                         store and daemon IPC used by the CLI and daemon
+                                         spotify_player wrapper, Web API starts, focus hand-back,
+                                         verified control, trigger engine, backend API client;
+                                         feature `runtime` adds the per-home store and daemon IPC
+                                         used by the CLI and daemon
 crates/cli      silicon-spotify-cli      the `spotify` command
 crates/daemon   silicon-spotify-daemon   `spotify-daemon` (macOS: objc2 NSAppleScript + notifications)
 src/            silicon-spotify          backend (`spotify-api`): IAM exchange, Ting, reports, telemetry
@@ -21,45 +22,78 @@ deploy/         backend deployment (systemd, Caddy, CloudFormation), Honeycomb a
 ## Use the library
 
 ```toml
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.5" }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.6" }
 # no HTTP at all:
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.5", default-features = false }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.6", default-features = false }
 ```
 
 ```rust
 use std::time::Duration;
-use silicon_spotify_client::{applescript::Osascript, control::*, player::SpotifyPlayer, timing::SeekTarget};
+use silicon_spotify_client::{applescript::Osascript, control::*, focus::{Focus, LaunchServices}, player::SpotifyPlayer, timing::SeekTarget, webapi::{HttpWebApi, WebApi}};
 
 let script = Osascript::default();                    // or your own `applescript::Runner`
 let player = SpotifyPlayer::locate(None);
+let web = player.as_ref().map(HttpWebApi::new).map_err(Clone::clone);   // feature `api`
 let spotify = Controller {
     script: &script,
     player: player.as_ref().map_err(Clone::clone),
+    web: web.as_ref().map(|w| w as &dyn WebApi).map_err(Clone::clone),
+    focus: Some(&LaunchServices as &dyn Focus),       // None: leave the focus where it lands
     strategy: Strategy::Auto,
     verify_timeout: Duration::from_millis(2500),
     launch_spotify: false,
 };
 let now = spotify.status()?;                          // Playback
-let outcome = spotify.seek(SeekTarget::parse("50%")?)?;   // Outcome { via, fallback, result, playback }
+let outcome = spotify.seek(SeekTarget::parse("50%")?)?;   // Outcome { via, fallback, result, playback, refocused, note }
 ```
 
 `Outcome::result` says what an action did when it can do more than one thing (`previous`:
-`restarted` or `previous_item`). The rules the controller follows (AppleScript first for seeks and
-for starting a track, episode, show or Liked Songs, spotify_player's view checked before commands
-that depend on it, refusals read from its log, restoring what a failed start emptied) are in
-`spotify docs playback`.
+`restarted` or `previous_item`); `Outcome::refocused` says where the focus went back after an
+AppleScript start brought Spotify.app forward; `Outcome::note` says when a start went to the
+speaker or phone Spotify.app controls, or counted although the Web API's answer was lost (a 5xx
+or no answer, and Spotify.app plays it). The rules the controller follows (every start through
+the Web API first: songs, episodes, shows and Liked Songs directly, albums, playlists, artists
+and radios through spotify_player; AppleScript first only for exact seeks; spotify_player's view
+checked before commands that depend on it; refusals read from its log; restoring what a failed
+start emptied) are in `spotify docs playback`.
+
+`web` and `focus` are new in 0.1.6 (a `Controller` built for 0.1.5 needs them added).
+`web: Err(error)` makes AppleScript start songs, episodes, shows and Liked Songs, as before, and
+the controller then reports `fallback: {from: "web_api", reason: error}`; `focus: None` leaves
+the focus where it lands. `webapi::WebApi` needs one method (`send`), so tests and other HTTP
+stacks can supply their own. The `webapi` module has the steps without the verification:
+`start` (a track or episode: item lookup, device, `PUT /me/player/play`, position retry),
+`start_list` (Liked Songs or a show), `choose_device` and `target` (where a start goes:
+the active speaker or phone Spotify.app controls, else Spotify.app on this Mac), `set_shuffle`,
+`liked_songs`, `search`, `unanswered` (a start whose effect is unknown) and `cached_facts` (what a
+lookup found, without asking again). The library remembers, for the life of the process, the
+album or show of each item it looked up (up to 500), and keeps one process-wide pause after a
+Web API 429 (`webapi::pause_left`). Devices are listed at every start.
 
 Try control code live, without the daemon:
 
 ```sh
 cargo run -p silicon-spotify-client --example control -- status
 cargo run -p silicon-spotify-client --example control -- seek 1:30 --strategy spotify_player
+cargo run -p silicon-spotify-client --example control -- play spotify:track:0BxE4FqsDD1Ot4YuBXwAPp --trace
+cargo run -p silicon-spotify-client --example control -- play spotify:track:0BxE4FqsDD1Ot4YuBXwAPp --no-web
+cargo run -p silicon-spotify-client --example control -- devices
 ```
 
 It takes `status`, `full`, `play [uri [context]]`, `liked [random]`, `pause`, `toggle`, `next`,
 `previous`, `seek <time>`, `volume <0-100>`, `shuffle <on|off>`, `repeat <off|context|track>`,
-`like` and `unlike`, prints the outcome or error as JSON, and the time it took on stderr. It
-controls the real Spotify.app.
+`like`, `unlike`, `front` (the frontmost app), `handoff <uri> [context]` (a bare AppleScript start
+with the focus hand-back, as the daemon's managed queue makes one), `lookup <uri>` (the album or
+show a Web API start would use, the release a relinked song plays from, its position),
+`webstate` (a summary of the Web API's `GET /me/player`), `devices` (the Spotify Connect devices
+and where a start would go now), `websearch <query>` (the Web API's search, as the daemon falls
+back to it) and `raw <GET|PUT> <path> [key=value…] [json body]` (one Web API request, to see how
+Spotify answers). Flags: `--strategy auto|spotify_player|applescript`, `--no-web` (the Web API's
+playback commands, its PUTs, fail with `web_api_disabled` while lookups still answer, to try the
+AppleScript fallback: a track then plays in its album), `--no-refocus` (no focus hand-back) and
+`--trace` (method, path, status and time of each Web API request on stderr; never tokens). It
+prints the outcome or error as JSON and the time it took on stderr, and it controls the real
+Spotify.app.
 
 The trigger engine is pure: feed `trigger::Tracker::observe` readings, pass the events to
 `trigger::evaluate`, deliver the returned `Firing`s however you like (`Firing::data()` is the Ting
@@ -100,7 +134,19 @@ The socket accepts only the same OS user. Some fields a client may rely on:
 - `track.info` adds `liked: true|false` for songs when the Liked Songs check answers in 2.5 s.
 - `spotify.launch` answers `{"launched", "already_running", "playback"}`.
 - `player.next` may carry `skipped` (a managed item whose hand-off was still in flight).
-- `queue.list`'s `spotify_upcoming` may carry `current_repeats_left_out` and `note`.
+- `queue.list`'s `spotify_upcoming` may carry `current_repeats_left_out` and `note`. Its
+  top-level `warnings` (on every reply, empty unless something is worth knowing) holds
+  `no_active_device` when Spotify reports nothing playing on any device and Spotify.app does not
+  play either, so the upcoming list is empty for that reason.
+- `search` replies carry `via` (`spotify_player`, or `web_api` when spotify_player's search failed
+  and the Web API's answered) and then `fallback: {from: "spotify_player", reason}`. When both
+  fail, the error is the Web API's with spotify_player's in `details.first_attempt`.
+- `player.play`'s outcome may say `via: "web_api"` (a song, episode, show or Liked Songs started
+  through the Web API) or `fallback.from: "web_api"`, carries `note` when the start went to the
+  speaker or phone Spotify.app controls or counted although the Web API's answer was lost, and
+  carries `refocused` (`{app, via, hid_spotify, error}`, the last two only when set) when an
+  AppleScript start brought Spotify.app forward. The settings the CLI merges into `args` include
+  `keep_spotify_in_background` (default true); older daemons ignore it.
 - `player.status` with `{"full": true}` may set `web.relinked: true` (the Web API plays
   Spotify.app's song under another id); `player.like` then refuses with a non-retryable
   `track_mismatch` whose `details` carry `relinked: true` and `matched_by`.
@@ -133,7 +179,8 @@ SPOTIFY_NOTARY_PROFILE=spotify-cli \
 
 ## Conventions
 
-- Library: stateless; never caches credentials, never retries or updates behind the caller.
+- Library: stateless apart from the process-lifetime memory above (looked-up items, the Web
+  API's rate-limit pause); never caches credentials, never updates behind the caller.
 - Errors: `{code, message, hint, retryable, details}` everywhere; add new codes to `docs/errors.md`.
 - Every playback command verifies its effect and reports `via`/`fallback`.
 - Never send lyrics, titles, queries, notes or tokens to telemetry or logs.

@@ -291,10 +291,11 @@ fn send_hand_off(daemon: &Arc<Daemon>, claim: &Pending, why: &str) {
         daemon.save_queue(&live);
     }
     let uri = claim.uri.as_str();
-    let result = daemon
-        .script
-        .run(&applescript::play_uri(uri, None))
-        .and_then(|o| applescript::expect_ok(&o));
+    let result = start_script(
+        daemon,
+        &daemon.settings(),
+        &applescript::play_uri(uri, None),
+    );
     match result {
         Ok(()) => log!("queue: handing over to {uri} ({why})"),
         Err(error) => {
@@ -447,11 +448,7 @@ pub fn advance_queue(daemon: &Arc<Daemon>, settings: &Settings) -> Result<Advanc
     let Some(item) = item else {
         return Ok(Advance::Nothing { skipped });
     };
-    if let Err(error) = daemon
-        .script
-        .run(&applescript::play_uri(&item.uri, None))
-        .and_then(|o| applescript::expect_ok(&o))
-    {
+    if let Err(error) = start_script(daemon, settings, &applescript::play_uri(&item.uri, None)) {
         let mut live = daemon.live();
         live.queue.hand_off_failed();
         daemon.save_queue(&live);
@@ -462,6 +459,28 @@ pub fn advance_queue(daemon: &Arc<Daemon>, settings: &Settings) -> Result<Advanc
     Ok(Advance::Played(
         json!({"action": "next", "via": "applescript", "source": "managed_queue", "playing": item, "queue_remaining": remaining, "skipped": skipped}),
     ))
+}
+
+/// Runs an AppleScript start. Spotify.app comes to the front when it handles one; the focus
+/// goes back to the app that had it unless `keep_spotify_in_background` is off.
+fn start_script(daemon: &Daemon, settings: &Settings, script: &str) -> Result<()> {
+    let (result, refocused) =
+        silicon_spotify_client::focus::keep_in_background(settings.focus(), || {
+            daemon
+                .script
+                .run(script)
+                .and_then(|o| applescript::expect_ok(&o))
+        });
+    if let Some(refocus) = refocused {
+        match refocus.error {
+            None => log!(
+                "queue: Spotify.app came forward; the focus went back to {}",
+                refocus.app
+            ),
+            Some(error) => log!("queue: Spotify.app came forward and kept the focus: {error}"),
+        }
+    }
+    result
 }
 
 /// Waits (up to `within`) until Spotify.app shows `uri` as the current item.
@@ -500,11 +519,7 @@ fn resume_context(daemon: &Arc<Daemon>, resume: &Resume, decided_ms: u64) {
         (None, Some(context)) => applescript::play_uri(context, None),
         (None, None) => return,
     };
-    match daemon
-        .script
-        .run(&script)
-        .and_then(|o| applescript::expect_ok(&o))
-    {
+    match start_script(daemon, &daemon.settings(), &script) {
         Ok(()) => log!(
             "queue: drained; resumed {:?} in {:?}",
             resume.next_uri,

@@ -18,6 +18,13 @@ use crate::args::{
     AuthCommand, ConfigCommand, LoginArgs, LoginCommand, TestingCommand, TingCommand,
 };
 
+/// How to get the `iam` command that mints SLTs: Silicon IAM's own CLI, not part of this one.
+const IAM_CLI_INSTALL: &str = "cargo install silicon-iam-cli";
+const IAM_CLI_NOTE: &str =
+    "`iam` (it mints the SLT) is Silicon IAM's own CLI, separate from spotify-cli";
+/// Which `iam` session mints the SLT (`spotify docs auth`).
+const IAM_SESSION_NOTE: &str = "`iam` mints for the Silicon whose SILICON_HOME it runs with (its session: $SILICON_HOME/.silicon-iam); in a fresh SILICON_HOME it has none and refuses to mint, so sign that Silicon in to IAM once first with its own credential: iam silicon-login --sid si:<handle> (it asks for the Silicon's STK)";
+
 /// `spotify iam --json`: static, offline discovery.
 pub fn iam(ctx: &Ctx) -> Result<()> {
     let value = json!({
@@ -29,7 +36,8 @@ pub fn iam(ctx: &Ctx) -> Result<()> {
         "iam_url": IAM_URL,
         "auth_url": IAM_AUTH_URL,
         "login_method": "short_lived_token",
-        "login": format!("Mint an SLT with `iam silicon-login --app-id {APP_ID} --grant-org <org> --approve-scopes` (Silicon) or `iam login --app-id {APP_ID} --grant-org <org>` (Carbon), then run `spotify login '<SLT>'`."),
+        "login": format!("Mint an SLT with `iam silicon-login --app-id {APP_ID} --grant-org \"$SILICON_ORG\" --approve-scopes` (Silicon; in a fresh SILICON_HOME, first `iam silicon-login --sid si:<handle>` with the Silicon's own credential) or `iam login --app-id {APP_ID} --grant-org <org>` (Carbon), then run `spotify login '<SLT>'`."),
+        "iam_session": IAM_SESSION_NOTE,
         "credential_issuer": false,
         "scopes": ["self.identity.read", "self.profile.read", "obo:ting:subscriptions.register", "obo:ting:tings.send"],
         "ting_types": TING_TYPES.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
@@ -39,11 +47,16 @@ pub fn iam(ctx: &Ctx) -> Result<()> {
         "rust_package": RUST_PACKAGE,
         "cli_package": CLI_PACKAGE,
         "install": INSTALL_COMMAND,
+        "iam_cli": {
+            "name": "iam",
+            "description": IAM_CLI_NOTE,
+            "install": IAM_CLI_INSTALL,
+        },
         "testing": ctx.testing.is_some(),
     });
     ctx.emit(&value, |v| {
         format!(
-            "{APP_NAME} {VERSION}\n  app_id: {APP_ID} (org {OWNER_ORG})\n  backend: {}\n  login: {}\n  docs: {DOCS_URL}\n  source: {REPOSITORY}\n  rust: {RUST_PACKAGE}",
+            "{APP_NAME} {VERSION}\n  app_id: {APP_ID} (org {OWNER_ORG})\n  backend: {}\n  login: {}\n  iam CLI: {IAM_CLI_NOTE}; get it with `{IAM_CLI_INSTALL}`\n  iam session: {IAM_SESSION_NOTE}\n  docs: {DOCS_URL}\n  source: {REPOSITORY}\n  rust: {RUST_PACKAGE}",
             v["api_url"].as_str().unwrap_or(""),
             v["login"].as_str().unwrap_or("")
         )
@@ -57,7 +70,7 @@ fn read_token(path: &Path) -> Result<String> {
         if std::io::stdin().is_terminal() {
             return Err(Error::invalid(
                 "--token-file - reads the SLT from stdin, but stdin is a terminal.",
-                "Pipe it: iam -o json silicon-login --app-id spotify --grant-org <org> --approve-scopes | jq -r .slt | spotify login --token-file -",
+                "Pipe it: iam -o json silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes | jq -r .slt | spotify login --token-file -",
             ));
         }
         std::io::stdin()
@@ -112,7 +125,7 @@ pub async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
         (None, None) => {
             return Err(Error::invalid(
                 "`spotify login` needs an IAM short-lived token (SLT). The CLI never asks for passwords or codes.",
-                "Silicon: iam silicon-login --app-id spotify --grant-org <org> --approve-scopes, then spotify login '<SLT>'. Carbon: iam login --app-id spotify --grant-org <org>.",
+                "Silicon: iam silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes (in a fresh SILICON_HOME, first iam silicon-login --sid si:<handle> with the Silicon's own credential), then spotify login '<SLT>'. Carbon: iam login --app-id spotify --grant-org <org>.",
             ));
         }
     };
@@ -122,13 +135,27 @@ pub async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
             "Pass the token exactly as iam printed it (usually oac_…).",
         ));
     }
+    // A short plain word is a typo, not a token (SLTs look like `oac_…`): never send it to the
+    // backend as an SLT. Testing planes accept a test public id such as `si:test-silicon`.
+    if slt.len() < 16 && !slt.contains('_') && !slt.starts_with("si:") && !slt.starts_with("c:") {
+        let hint = if crate::edit_distance(&slt.to_ascii_lowercase(), "status") <= 2 {
+            "Did you mean `spotify login status`?".to_owned()
+        } else {
+            "Pass the token exactly as iam printed it (usually oac_…): spotify login '<SLT>'."
+                .to_owned()
+        };
+        return Err(Error::invalid(
+            format!("`{slt}` does not look like an SLT."),
+            hint,
+        ));
+    }
     let api = ctx.api()?;
     let session: Session = api.login(&slt, &store::login_key(&slt)).await.map_err(|error| {
         if error.code == "not_authenticated" {
             Error::new(
                 "slt_rejected",
                 "IAM rejected the short-lived token: it expired (they last ~2 minutes), was already used, or was minted for another app.",
-                "Mint a fresh one for app `spotify` and retry immediately: iam silicon-login --app-id spotify --grant-org <org> --approve-scopes",
+                "Mint a fresh one for app `spotify` and retry immediately: iam silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes",
             )
             .with_details(json!({"iam": error}))
         } else {
@@ -145,9 +172,7 @@ pub async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
         };
         format!("Logged in as {} (org {}).\n  {ting}", v["actor"]["public_id"].as_str().unwrap_or("?"), v["org_id"].as_str().unwrap_or("?"))
     });
-    ctx.hint(
-        "Next: spotify trigger add --remaining 30s --note 'what to do'   (spotify trigger --help)",
-    );
+    ctx.next(&crate::next::after_login());
     Ok(())
 }
 
@@ -224,6 +249,7 @@ async fn status(ctx: &Ctx) -> Result<()> {
             }
         )
     });
+    ctx.next(&crate::next::after_login());
     Ok(())
 }
 
@@ -337,6 +363,7 @@ pub async fn config(ctx: &Ctx, action: ConfigCommand) -> Result<()> {
             };
             ctx.home.save_config(&config)?;
             let value = json!({"updated": store::describe_changes(&changed, &config), "path": ctx.home.config_path()});
+            let next = vec!["spotify config show".to_owned()];
             if changed.iter().any(|k| k == "telemetry") && config.telemetry == Some(false) {
                 // Clear a running daemon's backlog; never start one just for this.
                 let _ = crate::daemon::call_if_running(ctx, "telemetry.clear", json!({})).await;
@@ -348,6 +375,7 @@ pub async fn config(ctx: &Ctx, action: ConfigCommand) -> Result<()> {
                     v["path"].as_str().unwrap_or("")
                 )
             });
+            ctx.next(&next);
         }
         ConfigCommand::Show => {
             let config = ctx.home.config()?;
@@ -742,6 +770,12 @@ pub async fn doctor(ctx: &Ctx) -> Result<()> {
         });
         out
     });
+    if value["ok"] == Value::Bool(true) {
+        ctx.next(&[
+            "spotify status".to_owned(),
+            "spotify how \"<what you want to do>\"".to_owned(),
+        ]);
+    }
     if value["ok"] == Value::Bool(false) {
         return Err(Error::new("doctor_failed", "One or more required checks failed.", "Run the listed fixes, or `spotify setup`.").with_details(json!({"failed": value["checks"].as_array().map(|c| c.iter().filter(|x| x["ok"] == Value::Bool(false) && x.get("optional") != Some(&Value::Bool(true))).map(|x| x["check"].clone()).collect::<Vec<_>>())})));
     }

@@ -10,10 +10,16 @@
 //! - [`model`] holds the playback, track and library shapes every surface prints.
 //! - [`applescript`] builds and parses the AppleScript that talks to Spotify.app.
 //! - [`player`] wraps the `spotify_player` CLI and classifies its failures.
-//! - [`control`] combines both: it tries `spotify_player` first (AppleScript first for seeking and
-//!   for starting a track or Liked Songs), checks spotify_player's view of the player against
-//!   Spotify.app before commands that depend on it, verifies the effect against Spotify.app, and
-//!   falls back to AppleScript. It never stores anything.
+//! - [`webapi`] starts tracks, episodes, Liked Songs and shows through the Spotify Web API (with
+//!   spotify_player's token) on the device Spotify.app on this Mac controls, which keeps
+//!   Spotify.app in the background, and searches when spotify_player cannot.
+//! - [`focus`] gives the focus back when an AppleScript start brings Spotify.app to the front.
+//! - [`control`] combines them: it tries `spotify_player` first (the Web API first to start a
+//!   track, episode, Liked Songs or a show, AppleScript first for seeking), checks
+//!   spotify_player's view of the player against Spotify.app before commands that depend on it,
+//!   verifies the effect against Spotify.app, and falls back to AppleScript. It stores nothing
+//!   beyond remembering, for the life of the process, each started item's album (the device is
+//!   chosen again at every start).
 //! - [`trigger`] is the pure trigger engine: given playback observations it decides what fires.
 //! - [`api`] (feature `api`) is the HTTP client for the spotify-cli backend.
 //! - [`store`] and [`ipc`] (feature `runtime`) are the stateful helpers shared by the `spotify`
@@ -26,12 +32,14 @@
 pub mod applescript;
 pub mod control;
 pub mod error;
+pub mod focus;
 pub mod model;
 pub mod player;
 pub mod telemetry;
 pub mod timing;
 pub mod trigger;
 pub mod uri;
+pub mod webapi;
 
 #[cfg(feature = "api")]
 pub mod api;

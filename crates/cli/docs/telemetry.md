@@ -25,8 +25,9 @@ Self-contained events: event name, step (command or op), outcome (`ok`/`error`),
 duration, which path worked (`via`) and why a fallback happened, versions, OS and architecture,
 a per-command trace id, and `ISI` when set.
 
-**Never recorded:** track, album or artist names, lyrics, search queries, trigger notes, playlist
-names, URIs you play, tokens, SLTs, file contents.
+**Never recorded:** track, album or artist names, lyrics, search queries, `spotify how` questions,
+trigger notes, playlist names, URIs you play, tokens, SLTs, file contents. The offline commands
+(`spotify` alone, `how`, `docs`, `commands`, `completions`, `iam`) record nothing at all.
 
 The website records only a `page_view` event per page and an `install_command_copied` event when
 you copy the install command. Each carries the page path, the referrer's host (not its full

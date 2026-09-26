@@ -6,6 +6,7 @@ can remove or reorder it, and spotify_player's CLI cannot even append. So spotif
 
 ```sh
 spotify queue                                   # managed items, then Spotify's upcoming
+spotify queue show                              # the same (also queue list, queue ls)
 spotify queue add spotify:track:<id> spotify:episode:<id>
 spotify queue add --search 'song name'          # first hit (--type episode for podcasts)
 spotify queue add <uri> --next                  # put at the front
@@ -15,11 +16,18 @@ spotify queue clear
 spotify next                                    # plays the managed head now
 ```
 
+`spotify queue` with no subcommand lists the queue, as do `queue list` and its aliases
+`queue show` and `queue ls`; `queue remove` is also `queue rm`, and `queue move` is `queue mv`.
+Skipping is not a queue subcommand: `queue next` exits 2 with a hint that lists the
+subcommands and adds "To skip to the next track: spotify next."
+
 ## How it plays
 
 - When the current song is within 0.9 s of its end, the daemon starts the managed head through
   AppleScript. If Spotify moves on first (the queue was added too late, crossfade, a skip or stop
-  in the Spotify app), the daemon switches to the managed head immediately.
+  in the Spotify app), the daemon switches to the managed head immediately. When the start brings
+  Spotify.app to the front, the focus goes back to the app that had it, as for every AppleScript
+  start (`keep_spotify_in_background`, `spotify docs playback`); the daemon log says so.
 - An item leaves the queue only once Spotify actually shows it playing. Until then the hand-off
   is pending and nothing else is decided; if it does not show up within 5 s it is retried, and
   after three failed hand-offs the item is dropped (logged in `spotify daemon logs`).
@@ -73,6 +81,13 @@ spotify next                                    # plays the managed head now
   without a context)" or "(nothing else is up next in its album)", only when spotify_player's view
   of that same item shows it and Spotify.app's repeat flag does not contradict it. That view can be
   up to about 20 s behind, so otherwise the note names no cause.
+- When Spotify reports nothing playing on any device (no current item and nothing upcoming, or
+  spotify_player's `no_active_device`) while Spotify.app does not play either, Spotify's upcoming
+  list is empty for that reason. The reply's top-level `warnings` then holds `no_active_device`
+  ("Spotify has no active device, so its upcoming list is empty; play something in Spotify.app
+  once", retryable). `warnings` is on every reply and empty otherwise; when Spotify.app plays
+  (an ad, a private session) the list is just empty. The human output prints each warning as
+  `note: <message> (<code>)`, with its hint on the next line. The managed queue is not affected.
 
 Names, artists (the show, for episodes) and lengths are recorded when an item is queued: from the
 search hit `queue add --search` picked (sent to the daemon as `known`), from spotify_player for a

@@ -304,6 +304,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "037e2a1a92236d0aff7e845093f64661d6df4c02c9fcc61a60e9e1d736fa392f"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1783,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "silicon-spotify"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1817,10 +1826,11 @@ dependencies = [
 
 [[package]]
 name = "silicon-spotify-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "clap",
+ "clap_complete",
  "libc",
  "semver",
  "serde",
@@ -1834,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "silicon-spotify-client"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "blake3",
  "libc",
@@ -1852,7 +1862,7 @@ dependencies = [
 
 [[package]]
 name = "silicon-spotify-daemon"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "block2",
