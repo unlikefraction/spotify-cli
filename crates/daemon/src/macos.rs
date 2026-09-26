@@ -49,14 +49,22 @@ impl Runner for MainThreadScript {
         let slot = &mut result;
         let source = source.to_owned();
         DispatchQueue::main().exec_sync(move || {
-            *slot = Some(run_on_main(&source));
+            // Callers that queued behind a script which then timed out fail fast too, and
+            // outcomes are recorded in the order the main thread ran them.
+            *slot = Some(backing_off().map_or_else(
+                || {
+                    let result = run_on_main(&source);
+                    record(&result);
+                    result
+                },
+                Err,
+            ));
         });
         let result = result.unwrap_or_else(|| {
             Err(Error::internal(
                 "the main thread did not run the AppleScript",
             ))
         });
-        record(&result);
         result.map_err(explain_timeout)
     }
 }
@@ -70,7 +78,8 @@ pub enum Automation {
     Denied,
     /// Spotify did not answer: usually macOS's consent dialog is open, or Spotify is busy.
     NotAnswering,
-    /// No Apple Event reached Spotify yet (not running, or nothing asked).
+    /// No answer is known: no Apple Event reached Spotify yet (not running, or nothing asked),
+    /// or the Spotify that stopped answering has quit.
     Unknown,
 }
 
@@ -125,6 +134,17 @@ pub fn automation_state() -> Automation {
 
 fn record(result: &Result<String>) {
     let state = match result {
+        // The script found Spotify closed and sent it nothing, which says nothing about the
+        // permission. Silence from a Spotify that has since quit no longer means anything either.
+        Ok(output) if output == "not_running" => {
+            let _ = STATE.compare_exchange(
+                Automation::NotAnswering.to_u8(),
+                Automation::Unknown.to_u8(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            return;
+        }
         Ok(_) => Automation::Granted,
         Err(e) if e.code == "automation_permission_denied" => Automation::Denied,
         Err(e) if e.code == "timeout" => {
@@ -136,14 +156,26 @@ fn record(result: &Result<String>) {
     STATE.store(state.to_u8(), Ordering::Relaxed);
 }
 
-/// Spotify timed out moments ago: fail fast rather than block the main thread again.
-fn backing_off() -> Option<Error> {
+/// How much longer scripts fail fast after Spotify's last timeout (`None` when they do not).
+#[must_use]
+pub fn backoff_remaining() -> Option<Duration> {
     if automation_state() != Automation::NotAnswering {
         return None;
     }
-    let last = LAST_TIMEOUT_MS.load(Ordering::Relaxed);
-    let recent = last != 0 && u128::from(now_ms().saturating_sub(last)) < BACKOFF.as_millis();
-    recent.then(|| explain_timeout(classify("", Some(-1712))))
+    backoff_left(LAST_TIMEOUT_MS.load(Ordering::Relaxed), now_ms())
+}
+
+fn backoff_left(last_timeout_ms: u64, now_ms: u64) -> Option<Duration> {
+    if last_timeout_ms == 0 {
+        return None;
+    }
+    let since = Duration::from_millis(now_ms.saturating_sub(last_timeout_ms));
+    BACKOFF.checked_sub(since).filter(|left| !left.is_zero())
+}
+
+/// Spotify timed out moments ago: fail fast rather than block the main thread again.
+fn backing_off() -> Option<Error> {
+    backoff_remaining().map(|_| explain_timeout(classify("", Some(-1712))))
 }
 
 /// A timeout from Spotify usually means macOS is waiting for someone to answer its Automation
@@ -270,8 +302,36 @@ mod tests {
         record(&Err(classify("", Some(-1712))));
         assert_eq!(automation_state(), Automation::NotAnswering);
         assert_eq!(backing_off().map(|e| e.code), Some("timeout".to_owned()));
+        assert!(backoff_remaining().is_some_and(|left| left <= BACKOFF));
         record(&Err(classify("", Some(-1743))));
         assert_eq!(automation_state(), Automation::Denied);
         assert!(backing_off().is_none());
+        // Spotify closed: no Apple Event was sent, so a known answer stands...
+        record(&Ok("not_running".into()));
+        assert_eq!(automation_state(), Automation::Denied);
+        record(&Ok(String::new()));
+        record(&Ok("not_running".into()));
+        assert_eq!(automation_state(), Automation::Granted);
+        // ...and silence from the Spotify that quit is forgotten, lifting the backoff.
+        record(&Err(classify("", Some(-1712))));
+        record(&Ok("not_running".into()));
+        assert_eq!(automation_state(), Automation::Unknown);
+        assert!(backing_off().is_none());
+        // Errors that say nothing about the permission leave it alone.
+        record(&Err(classify("", Some(-600))));
+        assert_eq!(automation_state(), Automation::Unknown);
+    }
+
+    #[test]
+    fn the_backoff_lifts() {
+        assert_eq!(backoff_left(0, 5_000), None);
+        assert_eq!(backoff_left(5_000, 5_000), Some(BACKOFF));
+        assert_eq!(
+            backoff_left(5_000, 6_000),
+            Some(BACKOFF - Duration::from_secs(1))
+        );
+        let backoff_ms = u64::try_from(BACKOFF.as_millis()).expect("ms");
+        assert_eq!(backoff_left(5_000, 5_000 + backoff_ms), None);
+        assert_eq!(backoff_left(5_000, 60_000), None);
     }
 }

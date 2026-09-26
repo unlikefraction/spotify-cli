@@ -2,13 +2,16 @@
 //!
 //! Readings happen when Spotify posts a playback notification, when a CLI command changed
 //! something, and on a timer whose interval adapts: every 2 s while playing with work to do,
-//! 5 s while playing otherwise, 10 s paused, 15 s when Spotify is closed, and precisely at the
-//! next trigger checkpoint or queue hand-off. Every reading (also the one `trigger add` takes) goes
-//! through [`observe_now`], which serializes read-and-process so readings are never applied out
-//! of order.
+//! 5 s while playing otherwise, 10 s paused, 15 s when Spotify is closed (3 s in the daemon's
+//! first two minutes while no Apple Event has reached it yet), and precisely at the next trigger checkpoint or queue hand-off.
+//! Every reading (also the one `trigger add` takes) goes through [`observe_now`], which
+//! serializes read-and-process so readings are never applied out of order.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// How long after start a closed Spotify is polled every 3 s (see [`process`]).
+const FIRST_CONTACT_WINDOW: Duration = Duration::from_secs(120);
 
 use serde_json::{Value, json};
 use silicon_spotify_client::applescript;
@@ -169,6 +172,15 @@ fn process(daemon: &Arc<Daemon>, playback: &Playback, at: u64) -> Result<Duratio
         PlayerState::Playing if busy => 2_000,
         PlayerState::Playing => 5_000,
         PlayerState::Paused | PlayerState::Stopped => 10_000,
+        // Right after the daemon starts (install, login) and until an Apple Event has reached
+        // Spotify, look again soon: the first one after Spotify starts raises macOS's
+        // Automation question, which someone may be waiting on.
+        PlayerState::NotRunning
+            if crate::macos::automation_state() == crate::macos::Automation::Unknown
+                && daemon.started.elapsed() < FIRST_CONTACT_WINDOW =>
+        {
+            3_000
+        }
         PlayerState::NotRunning => 15_000,
     };
     if live.tracker.pending_stop {

@@ -7,7 +7,7 @@ can remove or reorder it, and spotify_player's CLI cannot even append. So spotif
 ```sh
 spotify queue                                   # managed items, then Spotify's upcoming
 spotify queue add spotify:track:<id> spotify:episode:<id>
-spotify queue add --search 'song name'          # first hit
+spotify queue add --search 'song name'          # first hit (--type episode for podcasts)
 spotify queue add <uri> --next                  # put at the front
 spotify queue move 3 1                          # position 3 → 1
 spotify queue remove 2                          # by position, id (q_…) or uri

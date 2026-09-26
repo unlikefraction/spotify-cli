@@ -446,7 +446,8 @@ pub struct Config {
     /// spotify_player cache folder (`-C`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spotify_player_cache_dir: Option<String>,
-    /// Default number of search results per kind (1–50, default 10).
+    /// Default number of search results per kind (1–10, default 10; spotify_player returns at
+    /// most 10 per kind).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_limit: Option<u32>,
     /// ISI written into Ting metadata when the `ISI` env var is absent.
@@ -519,9 +520,9 @@ pub const CONFIG_KEYS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "search_limit",
-        "integer 1-50",
+        "integer 1-10",
         "10",
-        "Default results per kind for `spotify search`.",
+        "Default results per kind for `spotify search` (spotify_player returns at most 10 per kind).",
     ),
     (
         "notify_isi",
@@ -544,11 +545,12 @@ pub const CONFIG_KEYS: &[(&str, &str, &str, &str)] = &[
 ];
 
 impl Config {
-    /// Applies a JSON object: known keys are set, `null` unsets. Rejects duplicates, unknown keys
-    /// and wrong types before changing anything.
+    /// Applies a JSON object: known keys are set, `null` unsets. Rejects duplicates, unknown keys,
+    /// wrong types and out-of-range values of the given keys before changing anything. Keys not
+    /// in `text` are left as they are, even if a saved value is out of range.
     ///
     /// # Errors
-    /// `invalid_input` naming the offending key and the valid keys.
+    /// `invalid_input` naming the offending key and what it accepts.
     pub fn apply_json(&self, text: &str) -> Result<(Self, Vec<String>)> {
         let entries = strict_object(text)?;
         let mut merged = serde_json::to_value(self)?;
@@ -573,6 +575,10 @@ impl Config {
             if value.is_null() {
                 object.remove(&key);
             } else {
+                // Type-check each key alone so the error names it and what it accepts.
+                if serde_json::from_value::<Self>(json!({ key.as_str(): value.clone() })).is_err() {
+                    return Err(wrong_value(&key, &value));
+                }
                 object.insert(key.clone(), value);
             }
             changed.push(key);
@@ -583,64 +589,81 @@ impl Config {
                 "Check `spotify config keys` for each key's type, e.g. {\"telemetry\": false, \"strategy\": \"applescript\"}.",
             )
         })?;
-        config.validate()?;
+        for key in &changed {
+            config.validate_key(key)?;
+        }
         Ok((config, changed))
     }
 
-    /// Range and format checks.
+    /// Range and format checks of every key.
     ///
     /// # Errors
     /// `invalid_input`.
     pub fn validate(&self) -> Result<()> {
-        if let Some(url) = &self.api_url {
-            crate::api::validate_base(url)?;
-        }
-        if let Some(ms) = self.verify_timeout_ms
-            && !(200..=15_000).contains(&ms)
-        {
-            return Err(Error::invalid(
-                "verify_timeout_ms must be between 200 and 15000.",
-                "For example {\"verify_timeout_ms\": 2500}.",
-            ));
-        }
-        if let Some(limit) = self.search_limit
-            && !(1..=50).contains(&limit)
-        {
-            return Err(Error::invalid(
-                "search_limit must be between 1 and 50.",
-                "For example {\"search_limit\": 10}.",
-            ));
-        }
-        if let Some(org) = &self.org
-            && !valid_handle(org, 3, 50)
-        {
-            return Err(Error::invalid(
-                format!("`{org}` is not an organization handle."),
-                "Use the bare org handle, e.g. unlikefraction.",
-            ));
-        }
-        if let Some(output) = &self.output
-            && output != "human"
-            && output != "json"
-        {
-            return Err(Error::invalid(
-                "output must be human or json.",
-                "For example {\"output\": \"json\"}.",
-            ));
-        }
-        for (key, path) in [
-            ("spotify_player_binary", &self.spotify_player_binary),
-            ("spotify_player_config_dir", &self.spotify_player_config_dir),
-            ("spotify_player_cache_dir", &self.spotify_player_cache_dir),
-        ] {
-            if let Some(path) = path
-                && !Path::new(path).is_absolute()
-            {
-                return Err(Error::invalid(
-                    format!("{key} must be an absolute path."),
-                    "Pass the full path, e.g. /opt/homebrew/bin/spotify_player.",
-                ));
+        CONFIG_KEYS
+            .iter()
+            .try_for_each(|(key, ..)| self.validate_key(key))
+    }
+
+    /// Range and format checks of one key (unset keys pass).
+    ///
+    /// # Errors
+    /// `invalid_input` naming the key and what it accepts.
+    pub fn validate_key(&self, key: &str) -> Result<()> {
+        match key {
+            "api_url" => {
+                if let Some(url) = &self.api_url {
+                    crate::api::validate_base(url)?;
+                }
             }
+            "verify_timeout_ms" => {
+                if let Some(ms) = self.verify_timeout_ms
+                    && !(200..=15_000).contains(&ms)
+                {
+                    return Err(wrong_value(key, &json!(ms)));
+                }
+            }
+            "search_limit" => {
+                if let Some(limit) = self.search_limit
+                    && !(1..=crate::player::SEARCH_MAX_PER_KIND).contains(&limit)
+                {
+                    return Err(wrong_value(key, &json!(limit)));
+                }
+            }
+            "org" => {
+                if let Some(org) = &self.org
+                    && !valid_handle(org, 3, 50)
+                {
+                    return Err(Error::invalid(
+                        format!("`{org}` is not an organization handle."),
+                        "Use the bare org handle, e.g. unlikefraction.",
+                    ));
+                }
+            }
+            "output" => {
+                if let Some(output) = &self.output
+                    && output != "human"
+                    && output != "json"
+                {
+                    return Err(wrong_value(key, &json!(output)));
+                }
+            }
+            "spotify_player_binary" | "spotify_player_config_dir" | "spotify_player_cache_dir" => {
+                let path = match key {
+                    "spotify_player_binary" => &self.spotify_player_binary,
+                    "spotify_player_config_dir" => &self.spotify_player_config_dir,
+                    _ => &self.spotify_player_cache_dir,
+                };
+                if let Some(path) = path
+                    && !Path::new(path).is_absolute()
+                {
+                    return Err(Error::invalid(
+                        format!("{key} must be an absolute path."),
+                        "Pass the full path, e.g. /opt/homebrew/bin/spotify_player.",
+                    ));
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -669,7 +692,8 @@ impl Config {
             "spotify_player_binary": self.spotify_player_binary,
             "spotify_player_config_dir": self.spotify_player_config_dir,
             "spotify_player_cache_dir": self.spotify_player_cache_dir,
-            "search_limit": self.search_limit.unwrap_or(10),
+            // A larger value saved by an earlier release is applied as the maximum.
+            "search_limit": self.search_limit.unwrap_or(10).min(crate::player::SEARCH_MAX_PER_KIND),
             "notify_isi": self.notify_isi,
             "auto_update": self.auto_update.unwrap_or(true),
             "output": self.output.clone().unwrap_or_else(|| "human".into()),
@@ -678,6 +702,60 @@ impl Config {
 }
 
 pub use crate::valid_handle;
+
+/// What a key accepts, in plain words, and an example value.
+fn accepts(key: &str) -> (String, &'static str) {
+    let (words, example) = match key {
+        "api_url" => (
+            "an https:// origin (a string)",
+            r#""https://backend.spotify.unlikefraction.com""#,
+        ),
+        "telemetry" | "launch_spotify" | "auto_update" => ("true or false", "false"),
+        "org" => ("an organization handle (a string)", r#""unlikefraction""#),
+        "strategy" => (
+            r#"one of "auto", "spotify_player", "applescript""#,
+            r#""applescript""#,
+        ),
+        "verify_timeout_ms" => ("an integer from 200 to 15000", "2500"),
+        "search_limit" => {
+            return (
+                format!(
+                    "an integer from 1 to {}",
+                    crate::player::SEARCH_MAX_PER_KIND
+                ),
+                "10",
+            );
+        }
+        "spotify_player_binary" => (
+            "an absolute path (a string)",
+            r#""/opt/homebrew/bin/spotify_player""#,
+        ),
+        "spotify_player_config_dir" | "spotify_player_cache_dir" => (
+            "an absolute path (a string)",
+            r#""/Users/me/.config/spotify-player""#,
+        ),
+        "notify_isi" => ("a string", r#""planner""#),
+        "output" => (r#""human" or "json""#, r#""json""#),
+        _ => ("the type `spotify config keys` lists", "null"),
+    };
+    (words.to_owned(), example)
+}
+
+/// `invalid_input` for a value of the wrong type or out of range, e.g. "verify_timeout_ms must be
+/// an integer from 200 to 15000, not \"fast\"."
+fn wrong_value(key: &str, value: &Value) -> Error {
+    let (words, example) = accepts(key);
+    Error::invalid(
+        format!(
+            "{key} must be {words}, not {}.",
+            crate::model::truncate(&value.to_string(), 80)
+        ),
+        format!(
+            "For example spotify config set '{{\"{key}\": {example}}}' (null resets it). `spotify config keys` lists every key."
+        ),
+    )
+    .with_details(json!({"key": key, "accepts": words}))
+}
 
 /// Parses a JSON object, rejecting duplicate keys and trailing data.
 ///
@@ -827,9 +905,64 @@ mod tests {
         );
         assert!(config.apply_json(r#"{"telemetry": "yes"}"#).is_err());
         assert!(config.apply_json(r#"{"verify_timeout_ms": 5}"#).is_err());
+        assert!(config.apply_json(r#"{"search_limit": 11}"#).is_err());
+        assert!(config.apply_json(r#"{"search_limit": 10}"#).is_ok());
         let (reset, _) = config.apply_json(r#"{"telemetry": null}"#).expect("unset");
         assert_eq!(reset.telemetry, None);
         assert!(config.apply_json("[1]").is_err());
+    }
+
+    #[test]
+    fn config_errors_name_the_key_and_what_it_accepts() {
+        let config = Config::default();
+        let error = config
+            .apply_json(r#"{"verify_timeout_ms": "fast"}"#)
+            .expect_err("type");
+        assert_eq!(error.code, "invalid_input");
+        assert_eq!(
+            error.message,
+            r#"verify_timeout_ms must be an integer from 200 to 15000, not "fast"."#
+        );
+        assert!(
+            error.hint.contains(r#"{"verify_timeout_ms": 2500}"#),
+            "{}",
+            error.hint
+        );
+        let error = config
+            .apply_json(r#"{"verify_timeout_ms": 5}"#)
+            .expect_err("range");
+        assert_eq!(
+            error.message,
+            "verify_timeout_ms must be an integer from 200 to 15000, not 5."
+        );
+        let error = config
+            .apply_json(r#"{"strategy": "magic"}"#)
+            .expect_err("enum");
+        assert!(
+            error
+                .message
+                .contains(r#"strategy must be one of "auto", "spotify_player", "applescript""#),
+            "{}",
+            error.message
+        );
+        let error = config
+            .apply_json(r#"{"search_limit": 50}"#)
+            .expect_err("range");
+        assert!(error.message.contains("from 1 to 10"), "{}", error.message);
+        let error = config
+            .apply_json(r#"{"telemetry": "yes"}"#)
+            .expect_err("bool");
+        assert!(error.message.contains("true or false"), "{}", error.message);
+        // A saved value from an older release that is now out of range does not block other keys.
+        let legacy = Config {
+            search_limit: Some(20),
+            ..Config::default()
+        };
+        let (updated, _) = legacy
+            .apply_json(r#"{"telemetry": false}"#)
+            .expect("other keys still apply");
+        assert_eq!(updated.search_limit, Some(20));
+        assert!(legacy.validate().is_err());
     }
 
     #[test]

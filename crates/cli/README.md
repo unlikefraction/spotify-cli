@@ -1,7 +1,8 @@
 # spotify-cli
 
 Spotify from the command line, for Carbons and Silicons on macOS, with playback triggers
-delivered through Ting.
+delivered through Ting. New to Carbons, Silicons, IAM, SLTs or Ting? See
+[Concepts](https://spotify.unlikefraction.com/docs/usage/#concepts).
 
 ```sh
 curl -fsSL https://spotify.unlikefraction.com/install.sh | sh
@@ -10,13 +11,17 @@ spotify play --search 'arctic monkeys 505'
 spotify trigger add --remaining 30s --note 'wrap up'
 ```
 
+Installer options, where state lives and how to uninstall:
+[Install options](https://spotify.unlikefraction.com/docs/usage/#install-options).
+
 - **Every control:** play (URIs, links, search, Liked Songs, radio), pause, next/previous, seek,
   volume, shuffle, repeat, like, track details, lyrics, search, library, devices, playlists
   (create/delete/add/remove/import/fork/sync), podcasts, and a managed queue you can reorder.
 - **Verified, not assumed:** spotify_player first, checked against Spotify.app, AppleScript
   fallback; every result says which path worked and why.
-- **Triggers:** `--remaining 30s|25%`, `--elapsed 50%|1:30`, `--end`, `--change`, for the current
-  song, every song or one track; durable, retried, idempotent Ting delivery with your note and ISI.
+- **Triggers:** `--remaining 30s` or `25%`, `--elapsed 50%` or `1:30`, `--end`, `--change`, for
+  the current song, every song or one track; durable, retried, idempotent Ting delivery with your
+  note and ISI.
 - **Agent-grade CLI:** `--json` everywhere, one error shape with exact fixes, a documented command
   tree (`spotify commands --json`), offline guides (`spotify docs`), `spotify report --pr`.
 

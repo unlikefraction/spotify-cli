@@ -28,7 +28,11 @@ Scope (`--scope`, default `current`):
 | `track --track <uri>` | every play of one track | on every play, until removed or `--times N` |
 
 Other options: `--times N` / `--once`, `--note TEXT` (up to 1000 characters, echoed in the
-notification), `--label NAME`, `--no-expiry-notice`, `--local`.
+notification), `--label NAME` (up to 80 characters), `--no-expiry-notice`, `--local`.
+
+The request is checked before anything reads Spotify, whatever is playing: `--times 0`, a longer
+note or label, a percentage outside 0–100%, or a `--track` that is not a track or episode fails
+with `invalid_input` (exit 2).
 
 ```sh
 spotify trigger add --remaining 30s --note 'start wrapping up the meeting'
@@ -38,7 +42,8 @@ spotify trigger add --end --scope track --track spotify:track:0BxE4FqsDD1Ot4YuBX
 
 The response contains the trigger id (`trg_…`). Inspect with `spotify trigger show <id>`, list with
 `spotify trigger list` (add `--all` for finished ones), remove with `spotify trigger remove <id>`
-or `spotify trigger clear`.
+or `spotify trigger clear`. `spotify trigger history` shows recent firings (`--limit` 1–500,
+default 20).
 
 ## Exact rules
 
@@ -124,6 +129,7 @@ the trigger finishes without firing (expired silently, removed).
 
 | Code | Meaning | Fix |
 | --- | --- | --- |
+| `invalid_input` | a bad time, percentage, `--times`, note, label or `--track` | the hint shows what is accepted |
 | `threshold_passed` | the checkpoint is already behind the current song | later checkpoint, `--end`, `--scope every` |
 | `nothing_playing` | `current` scope needs a song | start one, or use `--scope every` |
 | `not_authenticated` | no login in this home | `spotify login '<SLT>'`, or `--local` |

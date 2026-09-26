@@ -1,12 +1,17 @@
-//! Backend HTTP contract tests (real router, fake IAM and Ting).
+//! Backend HTTP contract tests (real router, fake IAM and Ting; the real IAM adapter against a
+//! stand-in IAM server for how IAM refusals map).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::response::IntoResponse as _;
 use http_body_util::BodyExt as _;
+use secrecy::SecretString;
 use serde_json::{Value, json};
 use silicon_spotify::dev::{FakeIam, FakeTing};
+use silicon_spotify::identity::{Iam, Identity as _};
 use tower::ServiceExt as _;
 
 struct App {
@@ -44,15 +49,17 @@ async fn call(
         }
         None => Body::empty(),
     };
-    let response = app
-        .router
-        .clone()
-        .oneshot(request.body(body).expect("request"))
-        .await
-        .expect("response");
+    let (status, _, value) = send(app, request.body(body).expect("request")).await;
+    (status, value)
+}
+
+/// Sends a prepared request; every response must carry a request id and a JSON (or empty) body.
+async fn send(app: &App, request: Request<Body>) -> (StatusCode, HeaderMap, Value) {
+    let response = app.router.clone().oneshot(request).await.expect("response");
     let status = response.status();
+    let headers = response.headers().clone();
     assert!(
-        response.headers().contains_key("x-request-id"),
+        headers.contains_key("x-request-id"),
         "every response carries a request id"
     );
     let bytes = response
@@ -66,7 +73,23 @@ async fn call(
     } else {
         serde_json::from_slice(&bytes).expect("json body")
     };
-    (status, value)
+    if status.is_client_error() || status.is_server_error() {
+        assert!(
+            !value["error"]["code"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty(),
+            "{status}: errors are the JSON envelope: {value}"
+        );
+        assert!(
+            !value["error"]["hint"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty(),
+            "{status}: every error has a hint: {value}"
+        );
+    }
+    (status, headers, value)
 }
 
 const KEY: &str = "spotify-test-key-0000000001";
@@ -138,8 +161,19 @@ async fn login_registers_the_ting_recipient() {
         Some(json!({"slt": "garbage"})),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(value["error"]["code"], "unauthenticated");
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "401 keeps older CLIs working"
+    );
+    assert_eq!(value["error"]["code"], "slt_rejected");
+    assert!(
+        value["error"]["hint"]
+            .as_str()
+            .expect("hint")
+            .contains("iam silicon-login --app-id spotify"),
+        "{value}"
+    );
     let (status, _) = call(
         &app,
         "POST",
@@ -205,6 +239,18 @@ async fn refresh_rotates_and_logout_revokes() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Revoking a token nobody recognises is a success (RFC 7009), whatever its shape.
+    for token in ["ort_garbage_qa", "oat_garbage_qa", "garbage", ""] {
+        let (status, value) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/logout",
+            &[("idempotency-key", KEY)],
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{token}: {value}");
+    }
 }
 
 #[tokio::test]
@@ -238,6 +284,24 @@ async fn me_checks_bearer_and_org() {
             .expect("m")
             .contains("X-Org-ID")
     );
+    // A bearer that cannot be an access token is refused before the organization is asked for.
+    for bad in [
+        "Bearer garbage",
+        "Bearer oat_",
+        "Bearer oat_a b",
+        "Basic abc",
+    ] {
+        let (status, value) = call(
+            &app,
+            "GET",
+            "/api/v1/auth/me",
+            &[("authorization", bad)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{bad}: {value}");
+        assert_eq!(value["error"]["code"], "unauthenticated");
+    }
     let (status, _) = call(
         &app,
         "GET",
@@ -420,4 +484,287 @@ async fn telemetry_gateway_validates_tables() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn telemetry_batches_over_64_kib_are_refused_not_dropped() {
+    let app = app();
+    let big = "x".repeat(70 * 1024);
+    let body = json!({"table": "spotifyclidaemon", "events": [{"id": "1", "note": big}]});
+    let (status, value) = call(&app, "POST", "/api/v1/telemetry", &[], Some(body.clone())).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{value}");
+    assert_eq!(value["error"]["code"], "payload_too_large");
+    assert!(
+        value["error"]["hint"]
+            .as_str()
+            .expect("hint")
+            .contains("smaller batches")
+    );
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/v1/telemetry",
+        &[("x-spotify-telemetry", "off")],
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "opted-out callers are still skipped"
+    );
+    // The website can read the refusal: it carries the same CORS headers as a 204.
+    let web = json!({"table": "spotifyfrontendevents", "events": [{"id": "1", "note": "x".repeat(70 * 1024)}]});
+    let (status, headers, _) = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/telemetry")
+            .header("content-type", "application/json")
+            .header("origin", "http://localhost:4321")
+            .body(Body::from(web.to_string()))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .expect("cors on refusals"),
+        "http://localhost:4321"
+    );
+    // Other refusals name a next step too (`send` asserts every error has a hint).
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/v1/telemetry",
+        &[],
+        Some(json!({"table": "spotifyclidaemon", "events": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/v1/auth/logout",
+        &[("idempotency-key", "short")],
+        Some(json!({"token": "ort_x"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn framework_errors_use_the_json_envelope() {
+    let app = app();
+    // 405 keeps `Allow` and says which method to use.
+    let (status, headers, value) = send(
+        &app,
+        Request::builder()
+            .method("GET")
+            .uri("/api/v1/auth/login")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(value["error"]["code"], "method_not_allowed");
+    assert!(
+        value["error"]["hint"]
+            .as_str()
+            .expect("hint")
+            .contains("POST")
+    );
+    assert_eq!(headers.get("allow").expect("allow"), "POST");
+    assert_eq!(
+        headers.get("content-type").expect("content type"),
+        "application/json"
+    );
+    // 413 from the 512 KiB body limit, declared up front or discovered while reading.
+    let big = vec![b'a'; 2 * 1024 * 1024];
+    for declared in [true, false] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/reports")
+            .header("content-type", "application/json")
+            .header("idempotency-key", KEY);
+        if declared {
+            request = request.header("content-length", big.len());
+        }
+        let (status, _, value) = send(
+            &app,
+            request.body(Body::from(big.clone())).expect("request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "declared={declared}");
+        assert_eq!(value["error"]["code"], "payload_too_large");
+        assert_eq!(value["error"]["retryable"], false);
+    }
+    let (status, value) = call(&app, "DELETE", "/api/v1/nope", &[], None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["error"]["code"], "not_found");
+}
+
+/// The real IAM adapter against a stand-in IAM that answers every call with one fixed response.
+struct StandIn {
+    iam: Iam,
+    calls: Arc<AtomicUsize>,
+}
+
+async fn stand_in(status: u16, code: &str) -> StandIn {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let code = code.to_owned();
+    let router = axum::Router::new().fallback(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        let code = code.clone();
+        async move {
+            let status = StatusCode::from_u16(status).expect("status");
+            if status.is_success() {
+                return status.into_response();
+            }
+            (
+                status,
+                axum::Json(json!({"error": {"code": code, "message": "refused by the stand-in"}})),
+            )
+                .into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    let mut settings = silicon_spotify::dev::settings();
+    settings.iam_url = url::Url::parse(&format!("http://{address}")).expect("url");
+    StandIn {
+        iam: Iam::new(&settings).expect("adapter"),
+        calls,
+    }
+}
+
+const REFRESH: &str = "ort_0123456789abcdef0123456789abcdef";
+
+#[tokio::test]
+async fn logout_treats_unrecognised_tokens_as_revoked() {
+    let token = SecretString::from(REFRESH);
+    for (status, code) in [
+        (200, ""),
+        (400, "invalid_request"),
+        (400, "invalid_grant"),
+        (401, "token_revoked"),
+        (410, "token_expired"),
+        (422, "validation_failed"),
+    ] {
+        let iam = stand_in(status, code).await;
+        let result = iam.iam.logout(&token, KEY).await;
+        assert!(result.is_ok(), "{status} {code}: {result:?}");
+        assert_eq!(iam.calls.load(Ordering::SeqCst), 1);
+    }
+    // Problems that are not about the token stay errors.
+    for (status, code, expected, http) in [
+        (401, "invalid_client", "dependency_unavailable", 503),
+        (400, "invalid_client", "dependency_unavailable", 503),
+        (409, "idempotency_conflict", "conflict", 409),
+        (503, "service_unavailable", "dependency_unavailable", 503),
+    ] {
+        let iam = stand_in(status, code).await;
+        let error = iam
+            .iam
+            .logout(&token, KEY)
+            .await
+            .expect_err("still an error");
+        assert_eq!(error.code, expected, "{status} {code}");
+        assert_eq!(error.status.as_u16(), http, "{status} {code}");
+    }
+    // A token IAM never issues is not sent to IAM at all.
+    let iam = stand_in(500, "boom").await;
+    for token in ["garbage", "ort_", "ort_has space", ""] {
+        let result = iam.iam.logout(&SecretString::from(token), KEY).await;
+        assert!(result.is_ok(), "{token}: {result:?}");
+    }
+    assert_eq!(iam.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn refused_exchanges_name_the_token() {
+    // Login: any refusal of the SLT itself names the SLT. Refresh: only an explicit refusal of the
+    // refresh token is a 401 (clients delete the session on 401); a malformed-request 400 or 422
+    // is not, so a request-shape problem on IAM's side never wipes saved sessions.
+    for (status, code, refresh) in [
+        (400, "invalid_grant", "unauthenticated"),
+        (400, "invalid_request", "invalid_input"),
+        (401, "unauthenticated", "unauthenticated"),
+        (401, "refresh_token_reuse", "unauthenticated"),
+        (410, "slt_expired", "unauthenticated"),
+        (422, "validation_failed", "invalid_input"),
+    ] {
+        let iam = stand_in(status, code).await;
+        let error = iam
+            .iam
+            .login(&SecretString::from("oac_0123456789abcdef"), KEY)
+            .await
+            .expect_err("refused");
+        assert_eq!(error.code, "slt_rejected", "{status} {code}");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        let error = iam
+            .iam
+            .refresh(&SecretString::from(REFRESH), KEY)
+            .await
+            .expect_err("refused");
+        assert_eq!(error.code, refresh, "{status} {code}");
+        assert_eq!(
+            error.status == StatusCode::UNAUTHORIZED,
+            refresh == "unauthenticated",
+            "{status} {code}"
+        );
+    }
+    // An idempotency conflict is a conflict whatever status carries it, never a token refusal.
+    for status in [409, 422] {
+        let iam = stand_in(status, "idempotency_conflict").await;
+        let login = iam
+            .iam
+            .login(&SecretString::from("oac_0123456789abcdef"), KEY)
+            .await
+            .expect_err("conflict");
+        let refresh = iam
+            .iam
+            .refresh(&SecretString::from(REFRESH), KEY)
+            .await
+            .expect_err("conflict");
+        let logout = iam
+            .iam
+            .logout(&SecretString::from(REFRESH), KEY)
+            .await
+            .expect_err("conflict");
+        for error in [login, refresh, logout] {
+            assert_eq!(error.code, "conflict", "{status}");
+            assert_eq!(error.status, StatusCode::CONFLICT);
+        }
+    }
+    let iam = stand_in(401, "invalid_client").await;
+    let error = iam
+        .iam
+        .login(&SecretString::from("oac_0123456789abcdef"), KEY)
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        error.code, "dependency_unavailable",
+        "a rejected app secret is the backend's problem, not the SLT's"
+    );
+    let iam = stand_in(429, "rate_limited").await;
+    let error = iam
+        .iam
+        .login(&SecretString::from("oac_0123456789abcdef"), KEY)
+        .await
+        .expect_err("refused");
+    assert_eq!(error.code, "rate_limited");
+    let iam = stand_in(418, "teapot").await;
+    let error = iam
+        .iam
+        .refresh(&SecretString::from(REFRESH), KEY)
+        .await
+        .expect_err("refused");
+    assert_eq!(error.code, "dependency_unavailable");
 }

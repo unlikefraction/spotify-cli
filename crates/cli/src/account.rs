@@ -591,11 +591,18 @@ pub async fn doctor(ctx: &Ctx) -> Result<()> {
             .is_file()
     });
     checks.push(json!({"check": "daemon_starts_at_login", "ok": agent, "detail": agent, "fix": if agent { Value::Null } else { json!("spotify daemon install") }, "optional": true}));
-    // Backend reachability and login.
+    // Backend reachability, whether it still supports this CLI (`min_cli`), and login. Both
+    // requests run together; offline, the version check is simply left out.
     let api = ctx.api()?;
-    match api.iam().await {
-        Ok(value) => checks.push(json!({"check": "backend_reachable", "ok": value.get("app_id").and_then(Value::as_str) == Some(APP_ID), "detail": {"api_url": ctx.api_url, "iam": value}, "fix": Value::Null})),
-        Err(error) => checks.push(json!({"check": "backend_reachable", "ok": false, "detail": {"api_url": ctx.api_url, "error": error}, "fix": "Check the network and `spotify config get api_url`."})),
+    match tokio::join!(api.iam(), api.version()) {
+        (Ok(value), version) => {
+            let version = version.unwrap_or_else(|error| json!({"error": error}));
+            checks.push(json!({"check": "backend_reachable", "ok": value.get("app_id").and_then(Value::as_str) == Some(APP_ID), "detail": {"api_url": ctx.api_url, "iam": value, "version": version}, "fix": Value::Null}));
+            if let Some(check) = cli_version_check(&version, VERSION) {
+                checks.push(check);
+            }
+        }
+        (Err(error), _) => checks.push(json!({"check": "backend_reachable", "ok": false, "detail": {"api_url": ctx.api_url, "error": error}, "fix": "Check the network and `spotify config get api_url`."})),
     }
     let logged_in = ctx.home.sessions()?.slots.get(&ctx.slot()).cloned();
     let ting_ok = logged_in
@@ -639,6 +646,21 @@ pub async fn doctor(ctx: &Ctx) -> Result<()> {
         return Err(Error::new("doctor_failed", "One or more required checks failed.", "Run the listed fixes, or `spotify setup`.").with_details(json!({"failed": value["checks"].as_array().map(|c| c.iter().filter(|x| x["ok"] == Value::Bool(false) && x.get("optional") != Some(&Value::Bool(true))).map(|x| x["check"].clone()).collect::<Vec<_>>())})));
     }
     Ok(())
+}
+
+/// `cli_version_supported` from the backend's `GET /api/v1/version`: fails when this CLI is older
+/// than its `min_cli`. `None` when the answer has no usable `min_cli`.
+fn cli_version_check(version: &Value, cli: &str) -> Option<Value> {
+    let min_cli = version.get("min_cli").and_then(Value::as_str)?;
+    let minimum = semver::Version::parse(min_cli).ok()?;
+    let current = semver::Version::parse(cli).ok()?;
+    let ok = current >= minimum;
+    Some(json!({
+        "check": "cli_version_supported",
+        "ok": ok,
+        "detail": {"cli": cli, "min_cli": min_cli, "backend": version.get("version")},
+        "fix": if ok { Value::Null } else { json!(format!("spotify update (the backend supports CLI {min_cli} and newer; this is {cli})")) },
+    }))
 }
 
 fn brew(args: &[&str]) -> Result<()> {
@@ -836,4 +858,29 @@ pub async fn update(ctx: &Ctx, check: bool) -> Result<()> {
         _ => format!("Up to date ({VERSION})."),
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doctor_flags_a_cli_older_than_min_cli() {
+        let version = json!({"version": "0.2.0", "api_versions": ["v1"], "min_cli": "0.1.0"});
+        let check = cli_version_check(&version, "0.1.1").expect("check");
+        assert_eq!(check["check"], "cli_version_supported");
+        assert_eq!(check["ok"], true);
+        assert!(check["fix"].is_null());
+        let check = cli_version_check(&json!({"min_cli": "0.3.0"}), "0.2.9").expect("check");
+        assert_eq!(check["ok"], false);
+        assert!(
+            check["fix"]
+                .as_str()
+                .expect("fix")
+                .starts_with("spotify update")
+        );
+        // An older backend without min_cli (or an unreachable one) adds no check.
+        assert!(cli_version_check(&json!({"error": {"code": "not_found"}}), "0.1.1").is_none());
+        assert!(cli_version_check(&json!({"min_cli": "soon"}), "0.1.1").is_none());
+    }
 }

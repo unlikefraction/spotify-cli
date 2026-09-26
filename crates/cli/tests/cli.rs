@@ -28,6 +28,8 @@ impl Env {
             .env("SPOTIFY_DAEMON_AUTOSTART", "0")
             .env_remove("SPOTIFY_TEST_APP_SECRET")
             .env_remove("SILICON_ORG")
+            // clap wraps help at COLUMNS when set; without it (and no terminal), at 100.
+            .env_remove("COLUMNS")
             .output()
             .expect("run spotify")
     }
@@ -258,4 +260,206 @@ fn reports_validate_before_sending() {
             .expect("gh")
             .starts_with("gh issue create")
     );
+}
+
+/// Runs a command that must fail with `invalid_input` (exit 2) before reaching the daemon; with
+/// autostart off, reaching it would be `daemon_unavailable` (exit 5) instead.
+fn invalid(env: &Env, args: &[&str]) -> Value {
+    let out = env.run(args);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+    let error = stderr_error(&out);
+    assert_eq!(error["code"], "invalid_input", "{args:?}: {error}");
+    error
+}
+
+#[test]
+fn malformed_ids_are_rejected_up_front() {
+    let env = Env::new();
+    for args in [
+        vec!["track", "garbage", "--json"],
+        vec!["lyrics", "garbage", "--json"],
+        vec!["playlist", "show", "garbage", "--json"],
+        vec![
+            "playlist",
+            "add",
+            "0000000000000000000000",
+            "notatrack",
+            "--json",
+        ],
+        vec!["queue", "add", "spotify:track:abc", "--json"],
+        vec!["play", "spotify:album:tooshort", "--json"],
+    ] {
+        let error = invalid(&env, &args);
+        assert!(
+            error["hint"]
+                .as_str()
+                .expect("hint")
+                .contains("spotify:<kind>:<id>"),
+            "{args:?} lists the accepted forms: {error}"
+        );
+    }
+    // Well-formed references of the wrong kind are caught too.
+    invalid(
+        &env,
+        &[
+            "playlist",
+            "show",
+            "spotify:album:78bpIziExqiI9qztvNFlQu",
+            "--json",
+        ],
+    );
+    invalid(
+        &env,
+        &[
+            "playlist",
+            "add",
+            "37i9dQZF1DXcBWIGoYBM5M",
+            "spotify:artist:7Ln80lUS6He07XvHI8qqHH",
+            "--json",
+        ],
+    );
+    // Episodes can be in playlists, but spotify_player cannot add them: `unsupported`, as the
+    // daemon answers, still before any edit.
+    let out = env.run(&[
+        "playlist",
+        "add",
+        "37i9dQZF1DXcBWIGoYBM5M",
+        "spotify:track:0BxE4FqsDD1Ot4YuBXwAPp",
+        "spotify:episode:4rOoJ6Egrf8K2IrywzwOMk",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stderr_error(&out)["code"], "unsupported");
+}
+
+#[test]
+fn limits_outside_what_can_be_honored_are_rejected() {
+    let env = Env::new();
+    for limit in ["0", "11", "50"] {
+        let error = invalid(&env, &["search", "queen", "--limit", limit, "--json"]);
+        assert!(
+            error["hint"].as_str().expect("hint").contains("1 to 10"),
+            "{error}"
+        );
+    }
+    invalid(
+        &env,
+        &["podcast", "search", "news", "--limit", "20", "--json"],
+    );
+    invalid(&env, &["library", "liked", "--limit", "0", "--json"]);
+    invalid(&env, &["playlist", "list", "--limit", "0", "--json"]);
+    invalid(&env, &["trigger", "history", "--limit", "501", "--json"]);
+    // search_limit takes the same range.
+    let error = invalid(
+        &env,
+        &["config", "set", r#"{"search_limit": 20}"#, "--json"],
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("from 1 to 10"),
+        "{error}"
+    );
+}
+
+#[test]
+fn trigger_requests_are_checked_before_reading_spotify() {
+    let env = Env::new();
+    invalid(
+        &env,
+        &[
+            "trigger", "add", "--end", "--scope", "every", "--times", "0", "--json",
+        ],
+    );
+    let note = "n".repeat(1001);
+    invalid(
+        &env,
+        &[
+            "trigger", "add", "--end", "--local", "--note", &note, "--json",
+        ],
+    );
+}
+
+#[test]
+fn config_type_errors_name_the_key() {
+    let env = Env::new();
+    let error = invalid(
+        &env,
+        &[
+            "config",
+            "set",
+            r#"{"verify_timeout_ms": "fast"}"#,
+            "--json",
+        ],
+    );
+    assert_eq!(
+        error["message"],
+        r#"verify_timeout_ms must be an integer from 200 to 15000, not "fast"."#
+    );
+    let error = invalid(
+        &env,
+        &["config", "set", r#"{"strategy": "magic"}"#, "--json"],
+    );
+    assert!(
+        error["message"].as_str().expect("message").contains("auto"),
+        "lists the allowed values: {error}"
+    );
+}
+
+#[test]
+fn usage_errors_keep_the_details_in_json() {
+    let env = Env::new();
+    let out = env.run(&["config", "set", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let error = stderr_error(&out);
+    assert_eq!(error["code"], "usage");
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .ends_with("<JSON>"),
+        "{error}"
+    );
+    let out = env.run(&["search", "x", "--type", "bogus", "--json"]);
+    let error = stderr_error(&out);
+    assert!(
+        error["hint"]
+            .as_str()
+            .expect("hint")
+            .starts_with("Possible values: track, album"),
+        "{error}"
+    );
+    // queue add --type offers only what the queue accepts.
+    let out = env.run(&["queue", "add", "--search", "x", "--type", "album", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        stderr_error(&out)["details"]["possible_values"],
+        serde_json::json!(["track", "episode"])
+    );
+}
+
+#[test]
+fn help_examples_stay_copyable() {
+    let env = Env::new();
+    let out = env.run(&["login", "--help"]);
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("--approve-scopes \\\n    | jq -r .slt | spotify login --token-file -"),
+        "{help}"
+    );
+    let out = env.run(&["report", "--help"]);
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("--pr https://github.com/unlikefraction/spotify-cli/pull/42\n"),
+        "{help}"
+    );
+    let out = env.run(&["playlist", "fork", "--help"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("--name <NAME>"));
 }

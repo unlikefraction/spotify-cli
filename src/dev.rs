@@ -95,7 +95,7 @@ impl Identity for FakeIam {
         } else if value.starts_with("oac_") {
             "si:dev".to_owned()
         } else {
-            return Err(AppError::unauthenticated());
+            return Err(AppError::slt_rejected());
         };
         let scopes = self
             .scopes
@@ -281,7 +281,7 @@ impl TestingPlanes for NoTesting {
     async fn resolve(&self, _secret: &str) -> AppResult<Arc<dyn Identity>> {
         Err(AppError::invalid(
             "The dev backend has no testing planes.",
-            "",
+            "Leave out X-Testing-Environment-Key (`spotify testing exit`) when using the dev backend.",
         ))
     }
 }

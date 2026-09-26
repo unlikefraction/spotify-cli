@@ -116,7 +116,7 @@ pub fn classify(message: &str, number: Option<i64>) -> Error {
         Some(-1743) => Error::new(
             "automation_permission_denied",
             "macOS blocked this process from controlling Spotify (Automation permission is off or was never granted).",
-            "Open System Settings → Privacy & Security → Automation, find spotify-daemon (or your terminal) and enable Spotify. If no prompt ever appeared, run `tccutil reset AppleEvents` and retry so macOS asks again. `spotify doctor` re-checks.",
+            "Open System Settings → Privacy & Security → Automation, find spotify-daemon (or your terminal) and enable Spotify. If it is not listed, run `tccutil reset AppleEvents com.unlikefraction.spotify-daemon` (if macOS answers that there is no such bundle identifier, `tccutil reset AppleEvents` works but makes every app ask again) and retry so macOS asks. `spotify doctor` re-checks.",
         )
         .with_details(details),
         Some(-600 | -609) => Error::new(

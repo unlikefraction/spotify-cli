@@ -446,13 +446,65 @@ impl Firing {
 /// Keeps `handled_plays` bounded.
 const MAX_HANDLED: usize = 32;
 
+/// Longest `--note`, in characters (it travels inside the Ting notification).
+pub const MAX_NOTE_CHARS: usize = 1000;
+/// Longest `--label`, in characters.
+pub const MAX_LABEL_CHARS: usize = 80;
+
+/// The checks of a trigger request that need no playback state: note and label length,
+/// `--times`, percentage range. [`Trigger::create`] runs them first; callers run them before
+/// reading Spotify so a malformed request fails as `invalid_input` whatever is playing.
+///
+/// # Errors
+/// `invalid_input`.
+pub fn validate_request(
+    condition: Condition,
+    times: Option<u32>,
+    note: Option<&str>,
+    label: Option<&str>,
+) -> Result<()> {
+    if let Some(note) = note
+        && note.chars().count() > MAX_NOTE_CHARS
+    {
+        return Err(Error::invalid(
+            format!("--note is longer than {MAX_NOTE_CHARS} characters."),
+            "Shorten the note; it travels inside the Ting notification.",
+        ));
+    }
+    if let Some(label) = label
+        && label.chars().count() > MAX_LABEL_CHARS
+    {
+        return Err(Error::invalid(
+            format!("--label is longer than {MAX_LABEL_CHARS} characters."),
+            "Use a short label; put details in --note.",
+        ));
+    }
+    if times == Some(0) {
+        return Err(Error::invalid(
+            "--times must be at least 1.",
+            "Omit --times to fire until removed, or use --once.",
+        ));
+    }
+    if let Condition::Remaining(Amount::Percent(p)) | Condition::Elapsed(Amount::Percent(p)) =
+        condition
+        && !(0.0..=100.0).contains(&p)
+    {
+        return Err(Error::invalid(
+            "Percentages must be between 0% and 100%.",
+            "For example --remaining 25% or --elapsed 50%.",
+        ));
+    }
+    Ok(())
+}
+
 impl Trigger {
     /// Validates and prepares a new trigger against the current playback.
     #[allow(clippy::too_many_arguments)] // Mirrors the CLI flags one to one.
     ///
     /// # Errors
     /// `nothing_playing` for `current` scope with nothing loaded; `threshold_passed` when a
-    /// `current` trigger's checkpoint is already behind; `invalid_input` for bad limits.
+    /// `current` trigger's checkpoint is already behind; `invalid_input` for bad limits (see
+    /// [`validate_request`]).
     pub fn create(
         id: String,
         condition: Condition,
@@ -463,37 +515,7 @@ impl Trigger {
         notify_expiry: bool,
         tracker: &Tracker,
     ) -> Result<Self> {
-        if let Some(note) = &note
-            && note.chars().count() > 1000
-        {
-            return Err(Error::invalid(
-                "--note is longer than 1000 characters.",
-                "Shorten the note; it travels inside the Ting notification.",
-            ));
-        }
-        if let Some(label) = &label
-            && label.chars().count() > 80
-        {
-            return Err(Error::invalid(
-                "--label is longer than 80 characters.",
-                "Use a short label; put details in --note.",
-            ));
-        }
-        if times == Some(0) {
-            return Err(Error::invalid(
-                "--times must be at least 1.",
-                "Omit --times to fire until removed, or use --once.",
-            ));
-        }
-        if let Condition::Remaining(Amount::Percent(p)) | Condition::Elapsed(Amount::Percent(p)) =
-            condition
-            && !(0.0..=100.0).contains(&p)
-        {
-            return Err(Error::invalid(
-                "Percentages must be between 0% and 100%.",
-                "For example --remaining 25% or --elapsed 50%.",
-            ));
-        }
+        validate_request(condition, times, note.as_deref(), label.as_deref())?;
         let current_play = tracker.current.clone();
         let scope = match scope_request {
             ScopeRequest::Current => {
@@ -958,6 +980,34 @@ mod tests {
         .expect("every");
         w.see(obs(now + 2_000, PlayerState::Playing, Some(A), 199_000));
         assert!(w.fired.is_empty(), "never fires on shorter tracks");
+    }
+
+    #[test]
+    fn request_checks_need_no_playback() {
+        let ok = |times, note: &str| validate_request(Condition::End, times, Some(note), None);
+        assert!(ok(Some(3), "wrap up").is_ok());
+        assert_eq!(ok(Some(0), "").expect_err("times 0").code, "invalid_input");
+        let long = "x".repeat(MAX_NOTE_CHARS + 1);
+        assert_eq!(ok(None, &long).expect_err("note").code, "invalid_input");
+        assert!(
+            ok(None, &"é".repeat(MAX_NOTE_CHARS)).is_ok(),
+            "counts characters"
+        );
+        let label = "l".repeat(MAX_LABEL_CHARS + 1);
+        assert!(validate_request(Condition::Change, None, None, Some(&label)).is_err());
+        // Nothing is playing in a fresh tracker, yet the request error wins over nothing_playing.
+        let error = Trigger::create(
+            "trg_x".into(),
+            Condition::End,
+            ScopeRequest::Every,
+            Some(0),
+            None,
+            None,
+            true,
+            &Tracker::default(),
+        )
+        .expect_err("times 0");
+        assert_eq!(error.code, "invalid_input");
     }
 
     #[test]

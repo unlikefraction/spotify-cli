@@ -241,6 +241,18 @@ impl Api {
             .1)
     }
 
+    /// `GET /api/v1/version`: the backend's version, supported API majors and `min_cli`, the
+    /// oldest CLI it still supports.
+    ///
+    /// # Errors
+    /// Transport or backend errors.
+    pub async fn version(&self) -> Result<Value> {
+        Ok(self
+            .call(Method::GET, "/api/v1/version", None, None, None)
+            .await?
+            .1)
+    }
+
     /// `POST /api/v1/auth/login`: exchanges an SLT. Use a key derived from the SLT so an uncertain
     /// retry replays instead of consuming it twice.
     ///

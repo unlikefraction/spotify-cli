@@ -98,7 +98,7 @@ type Shared = State<Arc<AppState>>;
 
 /// The router.
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let routes = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/api/v1/iam", get(iam))
@@ -114,10 +114,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/webhook", post(webhook))
         .route("/webhook/", post(webhook))
         .fallback(not_found)
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        // Outside the body limit, so its 413 gets a request id too.
         .layer(middleware::from_fn_with_state(Arc::clone(&state), observe))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(512 * 1024))
-        .with_state(state)
+        .with_state(state);
+    // axum finishes a 405 (its `Allow` header) only after the per-route layers, so framework
+    // errors are rewritten as JSON around the whole router.
+    Router::new()
+        .fallback_service(routes)
+        .layer(middleware::map_response(json_error))
 }
+
+/// Largest request body any route reads.
+const MAX_BODY_BYTES: usize = 512 * 1024;
+
+/// Largest telemetry batch the gateway relays.
+const MAX_TELEMETRY_BYTES: usize = 64 * 1024;
 
 async fn observe(State(state): Shared, request: Request, next: Next) -> Response {
     let started = Instant::now();
@@ -159,7 +171,68 @@ async fn observe(State(state): Shared, request: Request, next: Next) -> Response
     response
 }
 
+/// Rewrites an error the framework produced as plain text or an empty body (axum's 405, the body
+/// limit's 413, an unreadable body) into the documented JSON envelope, keeping its status and its
+/// other headers (such as `Allow`).
+async fn json_error(method: Method, response: Response) -> Response {
+    let status = response.status();
+    let json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if json || !(status.is_client_error() || status.is_server_error()) {
+        return response;
+    }
+    let (mut parts, _) = response.into_parts();
+    let error = match status {
+        StatusCode::METHOD_NOT_ALLOWED => {
+            let allow = parts
+                .headers
+                .get(header::ALLOW)
+                .and_then(|v| v.to_str().ok())
+                .filter(|v| !v.is_empty())
+                .unwrap_or("another method");
+            AppError::new(
+                status,
+                "method_not_allowed",
+                format!("This route does not accept {method}."),
+                format!("Use {allow}; see `spotify docs api` for each route's method."),
+            )
+        }
+        StatusCode::PAYLOAD_TOO_LARGE => AppError::payload_too_large(
+            format!(
+                "The request body exceeds the backend's {} KiB limit.",
+                MAX_BODY_BYTES / 1024
+            ),
+            "Send less: shorten the report or its attachments, or split telemetry into batches of at most 64 KiB.",
+        ),
+        StatusCode::NOT_FOUND => not_found_error(),
+        _ if status.is_client_error() => AppError::invalid(
+            format!("The request could not be read (HTTP {}).", status.as_u16()),
+            "Send a JSON body with `Content-Type: application/json`; see `spotify docs api` for the request shape.",
+        )
+        .with_details(json!({"status": status.as_u16()})),
+        _ => AppError::new(
+            status,
+            "internal",
+            "The server failed unexpectedly.",
+            "Retry; if it persists, report it with `spotify report`.",
+        ),
+    };
+    let (rewritten, body) = error.into_response().into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    for (name, value) in &rewritten.headers {
+        parts.headers.insert(name.clone(), value.clone());
+    }
+    Response::from_parts(parts, body)
+}
+
 async fn not_found() -> AppError {
+    not_found_error()
+}
+
+fn not_found_error() -> AppError {
     AppError::new(
         StatusCode::NOT_FOUND,
         "not_found",
@@ -205,7 +278,12 @@ async fn identity_for(state: &AppState, headers: &HeaderMap) -> AppResult<Arc<dy
         Some(value) => {
             let secret = value
                 .to_str()
-                .map_err(|_| AppError::invalid("X-Testing-Environment-Key is not text.", ""))?;
+                .map_err(|_| {
+                    AppError::invalid(
+                        "X-Testing-Environment-Key is not text.",
+                        "Send the testing plane's ask_… app secret as plain ASCII; `spotify testing use --app-secret-file -` sets it for the CLI.",
+                    )
+                })?;
             state.testing.resolve(secret.trim()).await
         }
     }
@@ -233,7 +311,7 @@ fn idempotency_key(headers: &HeaderMap) -> AppResult<String> {
     if !(16..=255).contains(&value.len()) || !value.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(AppError::invalid(
             "Idempotency-Key must be 16-255 visible ASCII characters.",
-            "",
+            "Send a fresh random key per request (for example a prefixed UUID) and reuse it only to retry that same request.",
         ));
     }
     Ok(value.to_owned())
@@ -327,11 +405,13 @@ async fn bearer(
     state: &AppState,
     headers: &HeaderMap,
 ) -> AppResult<(Arc<dyn Identity>, AuthContext)> {
+    // A bearer that cannot be an access token is refused before the organization is checked.
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
+        .filter(|t| identity::well_formed(t, "oat_"))
         .ok_or_else(AppError::unauthenticated)?;
     let org = headers
         .get("x-org-id")
@@ -442,12 +522,15 @@ async fn report(State(state): Shared, headers: HeaderMap, body: Bytes) -> AppRes
         if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
             return Err(AppError::invalid(
                 "`pr` must be https://github.com/unlikefraction/spotify-cli/pull/<n>.",
-                "",
+                "Link a pull request on unlikefraction/spotify-cli, or leave `pr` out.",
             ));
         }
     }
     if input.attachments.len() > 5 {
-        return Err(AppError::invalid("At most 5 attachments.", ""));
+        return Err(AppError::invalid(
+            "At most 5 attachments.",
+            "Combine logs into at most 5 attachments (each is cut to 20000 characters).",
+        ));
     }
     // Reporter identity is optional; a bad token does not block a bug report.
     let reporter = if headers.contains_key(header::AUTHORIZATION) {
@@ -595,17 +678,35 @@ struct TelemetryInput {
     events: Vec<Value>,
 }
 
-async fn telemetry(State(state): Shared, headers: HeaderMap, body: Bytes) -> AppResult<Response> {
+async fn telemetry(State(state): Shared, headers: HeaderMap, body: Bytes) -> Response {
+    let mut response = match relay_batch(&state, &headers, &body) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
+    };
+    // Refusals carry CORS headers too, so the website can read why a batch was refused.
+    cors(&state, &headers, &mut response);
+    response
+}
+
+fn relay_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> AppResult<()> {
     let off = headers
         .get("x-spotify-telemetry")
         .and_then(|v| v.to_str().ok())
         == Some("off");
-    let mut response = StatusCode::NO_CONTENT.into_response();
-    cors(&state, &headers, &mut response);
-    if off || body.len() > 64 * 1024 {
-        return Ok(response);
+    if off {
+        return Ok(());
     }
-    let input: TelemetryInput = parse(&body)?;
+    if body.len() > MAX_TELEMETRY_BYTES {
+        return Err(AppError::payload_too_large(
+            format!(
+                "The telemetry batch is {} KiB; the gateway relays at most {} KiB.",
+                body.len().div_ceil(1024),
+                MAX_TELEMETRY_BYTES / 1024
+            ),
+            "Split it into smaller batches (at most 64 KiB and 40 events each) and send them separately.",
+        ));
+    }
+    let input: TelemetryInput = parse(body)?;
     let allowed = [
         silicon_spotify_client::telemetry::CLI_DAEMON_TABLE,
         silicon_spotify_client::telemetry::WEB_ANALYTICS_TABLE,
@@ -629,12 +730,15 @@ async fn telemetry(State(state): Shared, headers: HeaderMap, body: Bytes) -> App
         {
             return Err(AppError::forbidden(
                 "This origin may not send telemetry.",
-                "",
+                "Browsers may relay only the website tables, and only from the spotify-cli website; the CLI and daemon send without an Origin header.",
             ));
         }
     }
     if input.events.is_empty() || input.events.len() > 40 {
-        return Err(AppError::invalid("Send 1-40 events per batch.", ""));
+        return Err(AppError::invalid(
+            "Send 1-40 events per batch.",
+            "Split larger batches into several requests; skip the request when there is nothing to send.",
+        ));
     }
     let source = headers
         .get("x-spotify-source")
@@ -650,7 +754,7 @@ async fn telemetry(State(state): Shared, headers: HeaderMap, body: Bytes) -> App
         event["relay"] = json!({"received_at": silicon_spotify_client::model::now_rfc3339(), "source": source, "backend_version": env!("CARGO_PKG_VERSION")});
         state.telemetry.relay(&input.table, event);
     }
-    Ok(response)
+    Ok(())
 }
 
 async fn webhook(State(state): Shared, headers: HeaderMap, body: Bytes) -> AppResult<Response> {
@@ -696,7 +800,3 @@ pub fn production(settings: Settings) -> anyhow::Result<Arc<AppState>> {
         http,
     }))
 }
-
-/// Keep `Method` referenced for the preflight route builder.
-#[allow(dead_code)]
-const _PREFLIGHT: Method = Method::OPTIONS;

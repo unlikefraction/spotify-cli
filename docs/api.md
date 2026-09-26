@@ -1,29 +1,33 @@
 # Backend API (v1)
 
-Origin: `https://backend.spotify.unlikefraction.com`. JSON in and out. Errors:
-`{"error":{"code","message","hint","retryable","details"?}}` with an `X-Request-Id` header.
-Credential-bearing responses are `Cache-Control: no-store`.
+Origin: `https://backend.spotify.unlikefraction.com`. JSON in and out. Every response carries an
+`X-Request-Id` header, and every error, including a wrong method (405 `method_not_allowed`, with
+`Allow`) or a body over 512 KiB (413 `payload_too_large`), is the same envelope the CLI uses:
+`{"error":{"code","message","hint","retryable","details"?}}` with a non-empty `hint`. A missing,
+expired or revoked token is 401 `unauthenticated` (the CLI reports it as `not_authenticated`).
+All codes: `spotify docs errors`. Credential-bearing responses are `Cache-Control: no-store`.
 
 Common headers: `Idempotency-Key` (16–255 visible ASCII; required on auth mutations and reports),
-`Authorization: Bearer oat_…` + `X-Org-ID: <org>` on authenticated routes,
+`Authorization: Bearer oat_…` + `X-Org-ID: <org>` on authenticated routes (a bearer that is not an
+`oat_` token is 401 before `X-Org-ID` is checked),
 `X-Testing-Environment-Key: <test ask_ secret>` to select an IAM testing plane,
 `X-Spotify-Telemetry: on|off`, `X-Spotify-Source: cli|daemon|web`.
 
 | Method & path | Auth | Body → response |
 | --- | --- | --- |
 | `GET /healthz` | — | `{"status":"ok","service":"spotify-cli","version"}` |
-| `GET /readyz` | — | `{"status":"ready"}` or 503 |
+| `GET /readyz` | — | `{"status":"ready"}`, or 503 `{"status":"not_ready","reason":"database"}` |
 | `GET /api/v1/iam` | — | `{"app_id":"spotify","org_id":"unlikefraction","api_version":"v1","iam_url","ting_url","testing_environment_id","ting_types",…}` |
 | `GET /api/v1/version` | — | `{"version","api_versions":["v1"],"min_cli"}` |
-| `POST /api/v1/auth/login` | key | `{"slt"}` → session (below) + `"ting":{"subscribed","subscription_id"?,"error"?}` |
-| `POST /api/v1/auth/refresh` | key | `{"refresh_token"}` → session |
-| `POST /api/v1/auth/logout` | key | `{"token"}` → 204 (revokes the refresh family) |
+| `POST /api/v1/auth/login` | key | `{"slt"}` → session (below) + `"ting":{"subscribed","subscription_id"?,"error"?}`; a refused SLT → 401 `slt_rejected` |
+| `POST /api/v1/auth/refresh` | key | `{"refresh_token"}` → session; a refused refresh token → 401 `unauthenticated` |
+| `POST /api/v1/auth/logout` | key | `{"token"}` → 204 (revokes the refresh family; unknown, expired or malformed tokens also 204) |
 | `GET /api/v1/auth/me` | bearer | `{"authenticated":true,"actor","org_id","membership_id","session_id","scopes","ting_ready","testing_environment_id"}` |
 | `POST /api/v1/ting/subscription` | bearer | `{}` → `{"id":"sub_…","app_id","for","active":true}` |
 | `POST /api/v1/tings` | bearer | `{"type","key","data","metadata"?}` → `{"id":"msg_…","created_at","key","silent","replayed"}` |
-| `POST /api/v1/reports` | key, bearer optional | `{"message","pr"?,"attachments"?,"context"?}` → `{"id":"rep_…","status":"stored|filed","issue_url"?}` |
-| `POST /api/v1/telemetry` | — | `{"table","events":[…]}` (1–40, ≤64 KiB) → 204 |
-| `POST /webhook/` | IAM signature | IAM webhook deliveries → `{"received":true}` |
+| `POST /api/v1/reports` | key, bearer optional | `{"message","pr"?,"attachments"?,"context"?}` (at most 5 attachments) → `{"id":"rep_…","status","issue_url"?}`, `status` is `"stored"` or `"filed"` |
+| `POST /api/v1/telemetry` | — | `{"table","events":[…]}` (1–40 events, ≤64 KiB) → 204; over 64 KiB → 413 `payload_too_large`, 0 or over 40 events → 400 `invalid_input`; with `X-Spotify-Telemetry: off` → 204, nothing recorded |
+| `POST /webhook/` | IAM signature | IAM webhook deliveries → `{"received":true}`; unverified → 401 `webhook_unverified` |
 
 Session:
 

@@ -1,16 +1,21 @@
 //! Spotify commands: parse arguments, call the daemon, render.
 
 use serde_json::{Value, json};
+use silicon_spotify_client::player::SEARCH_MAX_PER_KIND;
 use silicon_spotify_client::timing::{Amount, SeekTarget};
+use silicon_spotify_client::trigger::{self, Condition};
 use silicon_spotify_client::uri::{Kind, SpotifyUri};
 use silicon_spotify_client::{Error, Result};
 
 use crate::Ctx;
 use crate::args::{
     Command, DeviceCommand, KindArg, LibrarySection, PlayArgs, PlaylistCommand, PodcastCommand,
-    QueueCommand, RepeatArg, ScopeArg, Switch, TriggerAdd, TriggerCommand,
+    QueueCommand, QueueKindArg, RepeatArg, ScopeArg, Switch, TriggerAdd, TriggerCommand,
 };
 use crate::render;
+
+/// Most firings `trigger history` returns.
+const HISTORY_MAX: usize = 500;
 
 fn kind(arg: KindArg) -> Kind {
     match arg {
@@ -25,6 +30,92 @@ fn kind(arg: KindArg) -> Kind {
 
 fn parse_uri(value: &str, default: Option<Kind>) -> Result<SpotifyUri> {
     SpotifyUri::parse(value, default)
+}
+
+/// A playlist reference (bare id, URI or link), checked before it reaches the daemon. Returns the
+/// bare id.
+fn playlist_id(value: &str) -> Result<String> {
+    let uri = parse_uri(value, Some(Kind::Playlist))?;
+    if uri.kind != Kind::Playlist {
+        return Err(Error::invalid(
+            format!("{uri} is not a playlist ({}).", uri.kind),
+            "Pass a playlist id, spotify:playlist:<id> or an open.spotify.com/playlist/<id> link; `spotify playlist list` shows yours.",
+        ));
+    }
+    Ok(uri.id)
+}
+
+/// Tracks and albums to add to or remove from a playlist; other kinds are rejected up front so
+/// an edit never stops half way. Episodes are `unsupported` (Spotify playlists hold them, but
+/// spotify_player cannot add them, as the daemon also answers); artists, shows and playlists are
+/// `invalid_input` (no playlist can hold them).
+fn playlist_items(items: &[String]) -> Result<Vec<SpotifyUri>> {
+    const HINT: &str =
+        "Pass spotify:track:<id> or spotify:album:<id> items (links and bare track ids work too).";
+    items
+        .iter()
+        .map(|item| {
+            let uri = parse_uri(item, Some(Kind::Track))?;
+            match uri.kind {
+                Kind::Track | Kind::Album => Ok(uri),
+                Kind::Episode => Err(Error::unsupported(
+                    format!("{uri} is an episode: spotify_player can add or remove only tracks and albums."),
+                    format!("Add or remove episodes in the Spotify app. {HINT}"),
+                )),
+                kind => Err(Error::invalid(
+                    format!("{uri} cannot be added to or removed from a playlist ({kind}s are not playlist items)."),
+                    HINT,
+                )),
+            }
+        })
+        .collect()
+}
+
+/// Checks `--limit` against what the command can honor. Out-of-range values are rejected rather
+/// than clamped, so the output always reflects the limit applied.
+fn check_limit(limit: Option<usize>, max: Option<usize>, hint: &str) -> Result<Option<usize>> {
+    match limit {
+        Some(value) if value == 0 || max.is_some_and(|max| value > max) => {
+            let range = max.map_or_else(|| "1 or more".to_owned(), |max| format!("1 to {max}"));
+            Err(Error::invalid(
+                format!("--limit {value} is out of range: it takes {range}."),
+                hint,
+            )
+            .with_details(json!({"limit": value, "min": 1, "max": max})))
+        }
+        other => Ok(other),
+    }
+}
+
+/// A search's `--limit`: results per kind, at most what spotify_player returns.
+fn search_limit_flag(flag: Option<usize>) -> Result<Option<usize>> {
+    let max = SEARCH_MAX_PER_KIND as usize;
+    check_limit(
+        flag,
+        Some(max),
+        &format!(
+            "spotify_player returns at most {max} results per kind and has no option for more; pass --limit 1 to {max}."
+        ),
+    )
+}
+
+/// Results per kind for `spotify search`: `--limit`, else config `search_limit`, else 10.
+fn search_limit(ctx: &Ctx, flag: Option<usize>) -> Result<usize> {
+    let max = SEARCH_MAX_PER_KIND as usize;
+    if let Some(limit) = search_limit_flag(flag)? {
+        return Ok(limit);
+    }
+    Ok(match ctx.config.search_limit.map(|l| l as usize) {
+        // Saved by a release that allowed up to 50: apply what spotify_player can return.
+        Some(saved) if saved > max => {
+            ctx.hint(&format!(
+                "note: config search_limit is {saved}, but spotify_player returns at most {max} per kind; using {max}. Fix: spotify config set '{{\"search_limit\": {max}}}'"
+            ));
+            max
+        }
+        Some(saved) if saved > 0 => saved,
+        _ => max,
+    })
 }
 
 /// First search hit of a kind.
@@ -174,7 +265,15 @@ pub async fn run(ctx: &Ctx, command: Command) -> Result<()> {
                 .as_deref()
                 .map(|t| parse_uri(t, Some(k.map_or(Kind::Track, kind))))
                 .transpose()?;
-            let value = ctx.daemon("track.info", json!({"uri": uri})).await?;
+            let mut value = ctx.daemon("track.info", json!({"uri": uri})).await?;
+            // Normalize spotify_player's album/artist/track output (`raw`) so the album's tracks
+            // or the artist's top tracks and albums are structured fields, not only raw data.
+            if let (Some(uri), Some(raw)) = (&uri, value.get("raw").filter(|r| !r.is_null())) {
+                let view = silicon_spotify_client::model::item_view(uri.kind.as_str(), raw);
+                if let (Some(object), Value::Object(view)) = (value.as_object_mut(), view) {
+                    object.extend(view);
+                }
+            }
             ctx.emit(&value, render::track);
         }
         Command::Lyrics { target } => {
@@ -199,10 +298,7 @@ pub async fn run(ctx: &Ctx, command: Command) -> Result<()> {
         } => {
             let query = query.join(" ");
             let kinds: Vec<Kind> = kinds.into_iter().map(kind).collect();
-            let limit = limit
-                .or(ctx.config.search_limit.map(|l| l as usize))
-                .unwrap_or(10)
-                .clamp(1, 50);
+            let limit = search_limit(ctx, limit)?;
             let value = ctx
                 .daemon(
                     "search",
@@ -250,6 +346,11 @@ pub async fn run(ctx: &Ctx, command: Command) -> Result<()> {
                 LibrarySection::Top => "top",
                 LibrarySection::Playlists => "playlists",
             };
+            let limit = check_limit(
+                limit,
+                None,
+                "Pass --limit 1 or more, or omit it to show the whole section.",
+            )?;
             let value = ctx
                 .daemon("library.get", json!({"key": key, "limit": limit}))
                 .await?;
@@ -298,7 +399,11 @@ async fn queue(ctx: &Ctx, action: QueueCommand) -> Result<()> {
                 uris.push(parse_uri(item, Some(Kind::Track))?);
             }
             if let Some(query) = &search {
-                let (uri, hit) = first_hit(ctx, query, k.map_or(Kind::Track, kind)).await?;
+                let k = match k {
+                    Some(QueueKindArg::Episode) => Kind::Episode,
+                    Some(QueueKindArg::Track) | None => Kind::Track,
+                };
+                let (uri, hit) = first_hit(ctx, query, k).await?;
                 ctx.hint(&format!(
                     "Found: {} ({uri})",
                     hit.get("name").and_then(Value::as_str).unwrap_or("?")
@@ -355,9 +460,19 @@ async fn queue(ctx: &Ctx, action: QueueCommand) -> Result<()> {
 }
 
 async fn playlist(ctx: &Ctx, action: PlaylistCommand) -> Result<()> {
+    let mut fork_name = None;
     let (op, args): (&str, Value) = match action {
-        PlaylistCommand::List { limit } => ("playlist.list", json!({"limit": limit})),
-        PlaylistCommand::Show { playlist } => ("playlist.show", json!({"id": playlist})),
+        PlaylistCommand::List { limit } => {
+            let limit = check_limit(
+                limit,
+                None,
+                "Pass --limit 1 or more, or omit it to list every playlist.",
+            )?;
+            ("playlist.list", json!({"limit": limit}))
+        }
+        PlaylistCommand::Show { playlist } => {
+            ("playlist.show", json!({"id": playlist_id(&playlist)?}))
+        }
         PlaylistCommand::Create {
             name,
             description,
@@ -367,20 +482,18 @@ async fn playlist(ctx: &Ctx, action: PlaylistCommand) -> Result<()> {
             "playlist.create",
             json!({"name": name, "description": description, "public": public, "collab": collab}),
         ),
-        PlaylistCommand::Delete { playlist } => ("playlist.delete", json!({"id": playlist})),
+        PlaylistCommand::Delete { playlist } => {
+            ("playlist.delete", json!({"id": playlist_id(&playlist)?}))
+        }
         PlaylistCommand::Add { playlist, items } => {
-            let items = items
-                .iter()
-                .map(|i| parse_uri(i, Some(Kind::Track)))
-                .collect::<Result<Vec<_>>>()?;
-            ("playlist.add", json!({"id": playlist, "items": items}))
+            let id = playlist_id(&playlist)?;
+            let items = playlist_items(&items)?;
+            ("playlist.add", json!({"id": id, "items": items}))
         }
         PlaylistCommand::Remove { playlist, items } => {
-            let items = items
-                .iter()
-                .map(|i| parse_uri(i, Some(Kind::Track)))
-                .collect::<Result<Vec<_>>>()?;
-            ("playlist.remove", json!({"id": playlist, "items": items}))
+            let id = playlist_id(&playlist)?;
+            let items = playlist_items(&items)?;
+            ("playlist.remove", json!({"id": id, "items": items}))
         }
         PlaylistCommand::Play { playlist, shuffle } => {
             let uri = parse_uri(&playlist, Some(Kind::Playlist))?;
@@ -398,15 +511,34 @@ async fn playlist(ctx: &Ctx, action: PlaylistCommand) -> Result<()> {
         }
         PlaylistCommand::Import { from, to, delete } => (
             "playlist.import",
-            json!({"from": from, "to": to, "delete": delete}),
+            json!({"from": playlist_id(&from)?, "to": playlist_id(&to)?, "delete": delete}),
         ),
-        PlaylistCommand::Fork { playlist } => ("playlist.fork", json!({"id": playlist})),
+        PlaylistCommand::Fork { playlist, name } => {
+            let name = name.map(|n| n.trim().to_owned());
+            if name.as_deref() == Some("") {
+                return Err(Error::invalid(
+                    "--name is empty.",
+                    "Pass a name for the new playlist, or omit --name to keep the original's.",
+                ));
+            }
+            fork_name.clone_from(&name);
+            (
+                "playlist.fork",
+                json!({"id": playlist_id(&playlist)?, "name": name}),
+            )
+        }
         PlaylistCommand::Sync { playlist, delete } => {
-            ("playlist.sync", json!({"id": playlist, "delete": delete}))
+            let id = playlist.as_deref().map(playlist_id).transpose()?;
+            ("playlist.sync", json!({"id": id, "delete": delete}))
         }
     };
     let value = ctx.daemon(op, args).await?;
     ctx.emit(&value, |v| render::playlist(op, v));
+    if let Some(wanted) = fork_name
+        && value.get("name").and_then(Value::as_str) != Some(wanted.as_str())
+    {
+        ctx.hint("note: the fork kept the original's name (this daemon could not apply --name); rename it in the Spotify app.");
+    }
     Ok(())
 }
 
@@ -425,10 +557,11 @@ async fn podcast(ctx: &Ctx, action: PodcastCommand) -> Result<()> {
             } else {
                 vec![Kind::Show, Kind::Episode]
             };
+            let limit = search_limit_flag(limit)?.unwrap_or(SEARCH_MAX_PER_KIND as usize);
             let value = ctx
                 .daemon(
                     "search",
-                    json!({"query": query.join(" "), "kinds": kinds, "limit": limit.unwrap_or(10)}),
+                    json!({"query": query.join(" "), "kinds": kinds, "limit": limit}),
                 )
                 .await?;
             ctx.emit(&value, render::search);
@@ -520,6 +653,11 @@ async fn trigger(ctx: &Ctx, action: TriggerCommand) -> Result<()> {
             limit,
             everyone,
         } => {
+            let limit = check_limit(
+                limit,
+                Some(HISTORY_MAX),
+                &format!("Pass --limit 1 to {HISTORY_MAX} (default 20)."),
+            )?;
             let value = ctx
                 .daemon(
                     "trigger.history",
@@ -594,14 +732,18 @@ fn isi(ctx: &Ctx) -> Option<String> {
 
 async fn trigger_add(ctx: &Ctx, add: TriggerAdd) -> Result<()> {
     let condition = if let Some(value) = &add.remaining {
-        json!({"kind": "remaining", "at": Amount::parse(value)?})
+        Condition::Remaining(Amount::parse(value)?)
     } else if let Some(value) = add.elapsed.as_ref().or(add.at.as_ref()) {
-        json!({"kind": "elapsed", "at": Amount::parse(value)?})
+        Condition::Elapsed(Amount::parse(value)?)
     } else if add.end {
-        json!({"kind": "end"})
+        Condition::End
     } else {
-        json!({"kind": "change"})
+        Condition::Change
     };
+    let times = if add.once { Some(1) } else { add.times };
+    // The same request checks the daemon runs, before it reads Spotify: a bad --times or --note
+    // is invalid_input whatever is playing.
+    trigger::validate_request(condition, times, add.note.as_deref(), add.label.as_deref())?;
     let scope = match add.scope {
         ScopeArg::Current => {
             if add.track.is_some() {
@@ -629,7 +771,6 @@ async fn trigger_add(ctx: &Ctx, add: TriggerAdd) -> Result<()> {
             "Save it with `spotify testing use --app-secret-file -` (then unset the variable), or add --local.",
         ));
     }
-    let times = if add.once { Some(1) } else { add.times };
     let value = ctx
         .daemon(
             "trigger.add",

@@ -1,13 +1,15 @@
 # Configuration
 
 Settings live in `$SILICON_HOME/.spotify/config.json` (0600). Set any number of keys with one JSON
-object; `null` resets a key to its default. Unknown keys, duplicate keys and wrong types are
-rejected before anything changes.
+object; `null` resets a key to its default. Unknown keys, duplicate keys, wrong types and
+out-of-range values are rejected (`invalid_input`) before anything changes, and the error names the
+key and what it accepts, e.g. `verify_timeout_ms must be an integer from 200 to 15000, not "fast".`
+Only the keys you set are checked, so a stale value of another key never blocks a change.
 
 ```sh
 spotify config set '{"telemetry": false}'
 spotify config set '{"strategy": "applescript", "launch_spotify": false}'
-spotify config set '{"notify_isi": "planner", "search_limit": 20}'
+spotify config set '{"notify_isi": "planner", "search_limit": 5}'
 spotify config set '{"strategy": null}'
 spotify config show          # effective values, defaults filled in, env overrides
 spotify config get strategy
@@ -29,7 +31,7 @@ Stemcell applies `silicon.app_configs.spotify` with exactly this command
 | `spotify_player_binary` | absolute path | auto-detect | spotify_player executable. |
 | `spotify_player_config_dir` | absolute path | `~/.config/spotify-player` | spotify_player `-c`. |
 | `spotify_player_cache_dir` | absolute path | `~/.cache/spotify-player` | spotify_player `-C` (its Spotify tokens). |
-| `search_limit` | 1–50 | `10` | Results per kind. |
+| `search_limit` | 1–10 | `10` | Results per kind for `spotify search` (spotify_player returns at most 10). A larger value saved by an earlier release (which allowed up to 50) is applied as 10. |
 | `notify_isi` | string | unset | ISI named in Ting metadata when `ISI` is not set. |
 | `auto_update` | bool | `true` | Daemon installs new releases hourly (script installs). |
 | `output` | `human` \| `json` | `human` | Default output format. |
@@ -52,7 +54,7 @@ Stemcell applies `silicon.app_configs.spotify` with exactly this command
 | `ISI` | Recorded as `metadata.isi` on notifications from triggers you create. |
 | `SPOTIFY_API_URL` | Backend origin for this process. |
 | `SPOTIFY_TEST_APP_SECRET` | Select a testing plane for this process. |
-| `SPOTIFY_TELEMETRY`, `SPACE_STATION_TELEMETRY`, `SILICON_TELEMETRY` | `0|false|off|no` disables telemetry. |
+| `SPOTIFY_TELEMETRY`, `SPACE_STATION_TELEMETRY`, `SILICON_TELEMETRY` | `0`, `false`, `off` or `no` (any case) disables telemetry. |
 | `SPOTIFY_DAEMON_HOME` | Daemon state directory (else `~/.silicon-spotify`). |
 | `SPOTIFY_WARM_PLAYER=off` | Do not run the warm spotify_player instance. |
 | `SPOTIFY_DAEMON_AUTOSTART=0` | Never start the daemon on demand (commands that need it fail with `daemon_unavailable`). |

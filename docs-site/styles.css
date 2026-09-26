@@ -37,6 +37,8 @@ code, pre { font-family: var(--mono); font-size: 0.88em; }
 pre { background: var(--code); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; overflow-x: auto; line-height: 1.5; }
 pre code { background: none; border: 0; padding: 0; }
 ::selection { background: var(--accent-pale); }
+[hidden] { display: none !important; }
+.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 
 .top { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px clamp(16px, 4vw, 40px); background: color-mix(in srgb, var(--paper) 88%, transparent); backdrop-filter: blur(10px); border-bottom: 1px solid var(--line); }
 .brand { display: flex; align-items: center; gap: 10px; color: var(--ink); font-weight: 600; }
@@ -74,17 +76,38 @@ h1 { font-weight: 600; font-size: clamp(2.1rem, 5vw, 3.4rem); line-height: 1.08;
 .grid span { font-family: var(--mono); font-size: 12px; color: var(--muted); }
 
 .docs { display: grid; grid-template-columns: 230px minmax(0, 780px) 200px; gap: clamp(20px, 3vw, 48px); max-width: 1400px; margin: 0 auto; padding: 32px clamp(16px, 4vw, 40px) 64px; }
-.side { position: sticky; top: 76px; align-self: start; display: flex; flex-direction: column; gap: 2px; font-size: 15px; }
+.side { position: sticky; top: 76px; z-index: 4; align-self: start; font-size: 15px; }
+.side nav { display: flex; flex-direction: column; gap: 2px; }
 .side .group { margin: 16px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); }
-.side a { color: var(--ink); padding: 4px 10px; border-radius: 7px; }
-.side a[aria-current="page"] { background: var(--accent-pale); color: var(--accent); font-weight: 600; }
+.side nav a { color: var(--ink); padding: 4px 10px; border-radius: 7px; }
+.side nav a[aria-current="page"] { background: var(--accent-pale); color: var(--accent); font-weight: 600; }
+.search { position: relative; margin-bottom: 4px; }
+.search input { width: 100%; font: 15px var(--sans); color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 8px; padding: 7px 34px 7px 10px; }
+.search input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.search kbd { position: absolute; right: 8px; top: 8px; font: 12px/1 var(--mono); color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 3px 6px; pointer-events: none; }
+.search input:focus ~ kbd, .search input:not(:placeholder-shown) ~ kbd { display: none; }
+.search-pop { position: absolute; top: calc(100% + 6px); left: 0; width: min(460px, calc(100vw - 32px)); max-height: min(440px, 70vh); overflow-y: auto; padding: 6px; background: var(--paper); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: 0 10px 30px #1f24211f; }
+.search-pop ul { list-style: none; margin: 0; padding: 0; }
+.search-pop a { display: block; padding: 8px 10px; border-radius: 7px; color: var(--ink); line-height: 1.45; }
+.search-pop a:hover, .search-pop a:focus { background: var(--surface); text-decoration: none; }
+.search-pop a:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.search-pop .where { color: var(--muted); }
+.search-pop .snippet { display: block; margin-top: 2px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.search-pop mark { background: var(--accent-pale); color: var(--accent); border-radius: 3px; }
+.search-note { margin: 6px 10px; font-size: 14px; color: var(--muted); }
 .article { min-width: 0; }
 .article h1 { font-size: clamp(2rem, 4vw, 2.6rem); }
 .article h2 { font-size: 1.5rem; margin: 2.2em 0 0.6em; letter-spacing: -0.015em; }
 .article h3 { font-size: 1.15rem; margin: 1.8em 0 0.5em; }
 .article h1 + p { font-size: 1.08rem; color: var(--muted); }
 .anchor { color: inherit; }
+/* Search results and the table of contents link to headings: keep them clear of the sticky header. */
+.article [id] { scroll-margin-top: 72px; }
 .anchor:hover { text-decoration: none; color: var(--accent); }
+.codeblock { margin: 1em 0; background: var(--code); border: 1px solid var(--line); border-radius: var(--radius); }
+.codeblock pre { margin: 0; border: 0; border-radius: 0 0 var(--radius) var(--radius); }
+.codeblock-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 34px; padding: 4px 6px 4px 16px; border-bottom: 1px solid var(--line); font: 12px/1.4 var(--mono); color: var(--muted); }
+.codeblock-head .copy { align-self: center; padding: 3px 10px; font-size: 12px; border-radius: 6px; }
 .article table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14.5px; display: block; overflow-x: auto; }
 .article th, .article td { text-align: left; border-bottom: 1px solid var(--line); padding: 8px 10px; vertical-align: top; }
 .article th { font-weight: 600; background: var(--surface); }
@@ -95,14 +118,20 @@ h1 { font-weight: 600; font-size: clamp(2.1rem, 5vw, 3.4rem); line-height: 1.08;
 .toc a:hover { color: var(--ink); }
 
 .foot { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 22px clamp(16px, 4vw, 40px); border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
-.telemetry { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.telemetry { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; }
+.telemetry label { cursor: pointer; }
+.telemetry input { margin: 0 6px 0 0; vertical-align: -2px; }
 
 @media (max-width: 1150px) { .docs { grid-template-columns: 210px minmax(0, 1fr); } .toc { display: none; } }
 @media (max-width: 760px) {
   .docs { grid-template-columns: 1fr; padding-top: 16px; }
-  .side { position: static; flex-direction: row; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
+  .side { position: static; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
+  .side nav { flex-direction: row; flex-wrap: wrap; gap: 6px; }
   .side .group { display: none; }
-  .side a { border: 1px solid var(--line); }
+  .side nav a { border: 1px solid var(--line); }
+  .search { margin-bottom: 10px; }
+  .search input { font-size: 16px; }
+  .search kbd { display: none; }
   .top nav a:nth-child(2), .top nav a:nth-child(3) { display: none; }
   .install { flex-direction: column; align-items: stretch; }
   .copy { align-self: flex-end; }

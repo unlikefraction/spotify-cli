@@ -13,7 +13,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Serialize;
 use serde_json::{Value, json};
 use silicon_iam_client::{
-    Client, Credential, EnvironmentKey, IdempotencyKey, Mutation, WebhookSecret,
+    ApiError, Client, Credential, EnvironmentKey, IdempotencyKey, Mutation, WebhookSecret,
     WebhookSecretKeyring, WebhookVerifier, models,
 };
 use uuid::Uuid;
@@ -166,57 +166,175 @@ fn dependency() -> AppError {
     AppError::dependency("iam")
 }
 
+/// Codes with which IAM refuses the token a request carries (never this app's own credential).
+const TOKEN_REFUSALS: [&str; 5] = [
+    "invalid_grant",
+    "invalid_token",
+    "refresh_token_reuse",
+    "token_expired",
+    "token_revoked",
+];
+
+/// Whether IAM refused this application's credential (a backend misconfiguration, never the user).
+fn client_rejected(api: &ApiError) -> bool {
+    matches!(api.code.as_str(), "invalid_client" | "unauthorized_client")
+}
+
+/// Whether IAM refused the token in the request body (unknown, malformed, expired, used or
+/// revoked) rather than this app's credential, the idempotency key or a rate limit.
+fn token_refused(api: &ApiError) -> bool {
+    !client_rejected(api)
+        && !api.is_idempotency_conflict()
+        && (matches!(api.status, 400 | 410 | 422)
+            || (api.status == 401 && TOKEN_REFUSALS.contains(&api.code.as_str())))
+}
+
+/// The error for an explicit IAM refusal of the presented token.
+fn refused_by_iam(refused: AppError, api: &ApiError) -> AppError {
+    refused.with_details(json!({"iam_code": api.code, "request_id": api.request_id}))
+}
+
 fn map_error(error: &silicon_iam_client::Error) -> AppError {
     if let Some(api) = error.api() {
-        if api.code == "invalid_client" {
+        if client_rejected(api) {
             tracing::error!(
-                "IAM rejected the application credential (invalid_client): check SPOTIFY_IAM_APP_SECRET"
+                status = api.status,
+                code = %api.code,
+                "IAM rejected the application credential: check SPOTIFY_IAM_APP_SECRET"
             );
             return dependency();
         }
         if matches!(api.status, 400 | 401 | 410)
-            && matches!(
-                api.code.as_str(),
-                "invalid_grant" | "refresh_token_reuse" | "unauthenticated" | "invalid_token"
-            )
+            && (api.code == "unauthenticated" || TOKEN_REFUSALS.contains(&api.code.as_str()))
         {
-            return AppError::unauthenticated()
-                .with_details(json!({"iam_code": api.code, "request_id": api.request_id}));
+            return refused_by_iam(AppError::unauthenticated(), api);
         }
         return match api.status {
+            // IAM's `code` is the contract; an idempotency conflict is one whatever its status.
+            status if status == 409 || api.is_idempotency_conflict() => AppError::conflict(
+                "IAM rejected a reused or conflicting operation.",
+                "Retry the original request with its original idempotency key, or log in again.",
+            )
+            .with_details(json!({"iam_code": api.code})),
+            400 => AppError::invalid(
+                format!("IAM rejected the request: {}.", api.message),
+                "Check the values sent (see `spotify docs api`); a malformed token needs a fresh `spotify login '<SLT>'`.",
+            )
+            .with_details(json!({"iam_code": api.code, "request_id": api.request_id})),
             403 | 404 => AppError::forbidden(
                 format!("IAM refused: {} ({}).", api.message, api.code),
                 "Check the app's scopes and your consent; log in again if scopes changed.",
             )
             .with_details(json!({"iam_code": api.code, "request_id": api.request_id})),
-            409 => AppError::conflict(
-                "IAM rejected a reused or conflicting operation.",
-                "Retry the original request with its original idempotency key, or log in again.",
-            )
-            .with_details(json!({"iam_code": api.code})),
             422 => AppError::invalid(
                 format!("IAM rejected the request: {}.", api.message),
                 "Check the input.",
             ),
             429 => AppError::rate_limited(),
-            _ => dependency(),
+            status => {
+                // Status, code and IAM's request id only: bodies and messages may echo input.
+                tracing::warn!(
+                    dependency = "iam",
+                    status,
+                    code = %api.code,
+                    iam_request_id = ?api.request_id,
+                    "IAM answered with an unexpected error"
+                );
+                dependency()
+            }
         };
     }
     if matches!(error, silicon_iam_client::Error::RateLimited { .. }) {
         return AppError::rate_limited();
     }
-    tracing::warn!(dependency = "iam", "IAM request failed");
+    tracing::warn!(
+        dependency = "iam",
+        failure = failure_kind(error),
+        status = ?unstructured_status(error),
+        iam_request_id = ?error.request_id(),
+        "IAM request failed"
+    );
     dependency()
 }
 
-fn validate_token(value: &str, prefix: &str) -> AppResult<()> {
-    if !value.starts_with(prefix)
-        || value.len() <= prefix.len()
-        || value.len() > 8192
-        || !value
+/// The kind of a non-envelope failure, for logs (transport and decode texts may echo input).
+fn failure_kind(error: &silicon_iam_client::Error) -> &'static str {
+    match error {
+        silicon_iam_client::Error::Transport(e) if e.is_timeout() => "timeout",
+        silicon_iam_client::Error::Transport(_) => "transport",
+        silicon_iam_client::Error::Decode(_) => "decode",
+        silicon_iam_client::Error::UnstructuredResponse { .. } => "unstructured_response",
+        silicon_iam_client::Error::ResponseTooLarge { .. } => "response_too_large",
+        silicon_iam_client::Error::ApiVersionUnsupported { .. } => "api_version_unsupported",
+        silicon_iam_client::Error::Invalid(_) => "invalid_request",
+        _ => "other",
+    }
+}
+
+fn unstructured_status(error: &silicon_iam_client::Error) -> Option<u16> {
+    match error {
+        silicon_iam_client::Error::UnstructuredResponse { status, .. } => Some(*status),
+        _ => None,
+    }
+}
+
+/// IAM refused an SLT login. A refusal of the SLT itself (including a malformed-request 400 or an
+/// expired-SLT 410) is `slt_rejected`; the app's credential, idempotency and rate limits keep
+/// their own mapping.
+fn login_error(error: &silicon_iam_client::Error) -> AppError {
+    match error.api() {
+        Some(api) if token_refused(api) || (api.status == 401 && api.code == "unauthenticated") => {
+            refused_by_iam(AppError::slt_rejected(), api)
+        }
+        _ => map_error(error),
+    }
+}
+
+/// IAM refused a refresh. Clients delete the saved session on a 401, so only an explicit refusal
+/// of the refresh token (a token code, or 410 Gone) becomes `unauthenticated`. A plain 400 or 422
+/// means the request itself was malformed, which an IAM-issued refresh token never causes; it
+/// must not wipe every saved session, so it stays `invalid_input`.
+fn refresh_error(error: &silicon_iam_client::Error) -> AppError {
+    match error.api() {
+        Some(api) if api.status == 410 && token_refused(api) => {
+            refused_by_iam(AppError::unauthenticated(), api)
+        }
+        _ => map_error(error),
+    }
+}
+
+/// RFC 7009: revoking a token IAM does not recognise (unknown, malformed, expired or already
+/// revoked) is a success, since nothing it could authorize remains. A rejected app credential,
+/// an idempotency conflict or a rate limit is still an error.
+fn revocation(result: Result<(), silicon_iam_client::Error>) -> AppResult<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => match error.api() {
+            Some(api) if token_refused(api) => {
+                tracing::info!(
+                    status = api.status,
+                    code = %api.code,
+                    "IAM did not recognise the token to revoke; logout is complete"
+                );
+                Ok(())
+            }
+            _ => Err(map_error(&error)),
+        },
+    }
+}
+
+/// Whether `value` has the shape of an IAM token with `prefix` (`oat_`, `ort_`).
+pub(crate) fn well_formed(value: &str, prefix: &str) -> bool {
+    value.starts_with(prefix)
+        && value.len() > prefix.len()
+        && value.len() <= 8192
+        && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-    {
+}
+
+fn validate_token(value: &str, prefix: &str) -> AppResult<()> {
+    if !well_formed(value, prefix) {
         return Err(AppError::unauthenticated());
     }
     Ok(())
@@ -431,14 +549,14 @@ impl Identity for Iam {
     async fn login(&self, slt: &SecretString, key: &str) -> AppResult<AppSession> {
         let value = slt.expose_secret();
         if value.is_empty() || value.len() > 8192 || !value.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err(AppError::unauthenticated());
+            return Err(AppError::slt_rejected());
         }
         let response = self
             .client
             .oauth()
             .login(&self.app_id, value, &mutation("login", key)?)
             .await
-            .map_err(|e| map_error(&e))?;
+            .map_err(|e| login_error(&e))?;
         self.validated(response).await
     }
 
@@ -453,29 +571,38 @@ impl Identity for Iam {
                 &mutation("refresh", key)?,
             )
             .await
-            .map_err(|e| map_error(&e))?;
+            .map_err(|e| refresh_error(&e))?;
         self.validated(response).await
     }
 
     async fn logout(&self, token: &SecretString, key: &str) -> AppResult<()> {
-        let hint = if token.expose_secret().starts_with("ort_") {
-            validate_token(token.expose_secret(), "ort_")?;
-            models::OAuthRevocationRequestTokenTypeHint::RefreshToken
-        } else {
-            validate_token(token.expose_secret(), "oat_")?;
-            models::OAuthRevocationRequestTokenTypeHint::AccessToken
-        };
-        self.client
-            .oauth()
-            .revoke(
-                &models::OAuthRevocationRequest {
-                    token: token.expose_secret().to_owned(),
-                    token_type_hint: Some(hint),
-                },
-                &mutation("logout", key)?,
+        let (prefix, hint) = if token.expose_secret().starts_with("ort_") {
+            (
+                "ort_",
+                models::OAuthRevocationRequestTokenTypeHint::RefreshToken,
             )
-            .await
-            .map_err(|e| map_error(&e))
+        } else {
+            (
+                "oat_",
+                models::OAuthRevocationRequestTokenTypeHint::AccessToken,
+            )
+        };
+        if !well_formed(token.expose_secret(), prefix) {
+            // IAM never issued a token of this shape, so nothing it authorizes can remain (RFC 7009).
+            return Ok(());
+        }
+        revocation(
+            self.client
+                .oauth()
+                .revoke(
+                    &models::OAuthRevocationRequest {
+                        token: token.expose_secret().to_owned(),
+                        token_type_hint: Some(hint),
+                    },
+                    &mutation("logout", key)?,
+                )
+                .await,
+        )
     }
 
     async fn authenticate(&self, token: &SecretString, org_id: &str) -> AppResult<AuthContext> {
@@ -599,7 +726,12 @@ impl Identity for Iam {
         if let Some(key) = self.client.environment() {
             delivery
                 .verify_testing_environment(key)
-                .map_err(|_| AppError::forbidden("Webhook testing environment mismatch.", ""))?;
+                .map_err(|_| {
+                    AppError::forbidden(
+                        "Webhook testing environment mismatch.",
+                        "Only deliveries for this backend's own IAM testing environment are accepted; check the application's webhook in that environment.",
+                    )
+                })?;
         }
         Ok(delivery.event().clone())
     }

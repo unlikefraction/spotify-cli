@@ -5,7 +5,7 @@ desktop app on macOS through `spotify_player` and AppleScript (with verification
 Spotify ids and times, run the playback-trigger engine, and call the spotify-cli backend.
 
 ```toml
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.1" }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.2" }
 ```
 
 ```rust

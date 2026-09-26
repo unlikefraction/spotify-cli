@@ -144,24 +144,139 @@ pub fn outcome(v: &Value) -> String {
     out
 }
 
+/// `3 tracks`, `1 track`.
+fn count(n: u64, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
+fn names(item: &Value) -> String {
+    item["by"]
+        .as_array()
+        .map(|b| {
+            b.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+/// Numbered item lines, at most `max` (then `… N more`). Albums show release date and type.
+fn numbered(out: &mut String, items: &[Value], max: usize) {
+    for (index, item) in items.iter().take(max).enumerate() {
+        let mut line = item_line(item);
+        if let Some(date) = item.get("release_date").and_then(Value::as_str)
+            && item.get("kind").and_then(Value::as_str) == Some("album")
+        {
+            let facts = match item.get("album_type").and_then(Value::as_str) {
+                Some(kind) => format!(" ({date}, {kind})"),
+                None => format!(" ({date})"),
+            };
+            // After the name and artists, before the URI line.
+            match line.find('\n') {
+                Some(at) => line.insert_str(at, &facts),
+                None => line.push_str(&facts),
+            }
+        }
+        let _ = writeln!(out, "  {:>3}. {line}", index + 1);
+    }
+    if items.len() > max {
+        let _ = writeln!(out, "  … {} more (--json lists all)", items.len() - max);
+    }
+}
+
+/// `spotify track spotify:album:…`.
+fn album(v: &Value) -> String {
+    let item = &v["item"];
+    let mut out = s(item, "/name").to_owned();
+    let by = names(item);
+    if !by.is_empty() {
+        let _ = write!(out, " — {by}");
+    }
+    let mut facts = Vec::new();
+    if let Some(kind) = item.get("album_type").and_then(Value::as_str) {
+        facts.push(kind.to_owned());
+    }
+    if let Some(date) = v.get("release_date").and_then(Value::as_str) {
+        facts.push(format!("released {date}"));
+    }
+    facts.push(count(v["track_count"].as_u64().unwrap_or(0), "track"));
+    if let Some(duration) = v.get("duration").and_then(Value::as_str) {
+        facts.push(duration.to_owned());
+    }
+    let _ = writeln!(out, "\n  {}\n  {}", facts.join(" · "), s(item, "/uri"));
+    let tracks = v["tracks"].as_array().cloned().unwrap_or_default();
+    numbered(&mut out, &tracks, usize::MAX);
+    out
+}
+
+/// `spotify track spotify:artist:…`.
+fn artist(v: &Value) -> String {
+    let item = &v["item"];
+    let mut out = format!("{}\n  {}", s(item, "/name"), s(item, "/uri"));
+    let genres: Vec<&str> = v["genres"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !genres.is_empty() {
+        let _ = write!(out, "\n  genres: {}", genres.join(", "));
+    }
+    let mut facts = Vec::new();
+    if let Some(followers) = v.get("followers").and_then(Value::as_u64) {
+        facts.push(format!("{followers} followers"));
+    }
+    if let Some(popularity) = v.get("popularity").and_then(Value::as_u64) {
+        facts.push(format!("popularity {popularity}/100"));
+    }
+    if !facts.is_empty() {
+        let _ = write!(out, "\n  {}", facts.join(" · "));
+    }
+    out.push('\n');
+    for (key, title, max) in [
+        ("top_tracks", "Top tracks", 10),
+        ("albums", "Albums and singles", 10),
+    ] {
+        let items = v[key].as_array().cloned().unwrap_or_default();
+        if !items.is_empty() {
+            let _ = writeln!(out, "{title} ({}):", items.len());
+            numbered(&mut out, &items, max);
+        }
+    }
+    let related: Vec<&str> = v["related_artists"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| a.get("name").and_then(Value::as_str))
+        .take(10)
+        .collect();
+    if !related.is_empty() {
+        let _ = writeln!(out, "Related: {}", related.join(", "));
+    }
+    out
+}
+
 /// `spotify track`.
 #[must_use]
 pub fn track(v: &Value) -> String {
     if let Some(playlist) = v.get("playlist").filter(|p| !p.is_null()) {
         return playlist_show(v, playlist);
     }
+    match v.get("kind").and_then(Value::as_str) {
+        Some("album") if !v["item"].is_null() => return album(v),
+        Some("artist") if !v["item"].is_null() => return artist(v),
+        _ => {}
+    }
     if let Some(item) = v.get("item").filter(|i| !i.is_null()) {
         let mut out = format!(
             "{} — {}\n  {}",
             s(item, "/name"),
-            item["by"]
-                .as_array()
-                .map(|b| b
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", "))
-                .unwrap_or_default(),
+            names(item),
             s(item, "/uri")
         );
         if let Some(album) = item.get("album").and_then(Value::as_str) {
@@ -207,15 +322,7 @@ pub fn track(v: &Value) -> String {
 }
 
 fn item_line(item: &Value) -> String {
-    let by = item["by"]
-        .as_array()
-        .map(|b| {
-            b.iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
+    let by = names(item);
     let mut line = s(item, "/name").to_owned();
     if !by.is_empty() {
         let _ = write!(line, " — {by}");
@@ -341,9 +448,9 @@ pub fn queue(v: &Value) -> String {
 
 fn playlist_show(v: &Value, playlist: &Value) -> String {
     let mut out = format!(
-        "{} — {} tracks, {}\n  {}\n",
+        "{} — {}, {}\n  {}\n",
         s(playlist, "/name"),
-        v["track_count"],
+        count(v["track_count"].as_u64().unwrap_or(0), "track"),
         s(v, "/duration"),
         s(playlist, "/uri")
     );
@@ -361,6 +468,26 @@ pub fn playlist(op: &str, v: &Value) -> String {
         "playlist.show" => playlist_show(v, &v["playlist"]),
         "playlist.create" => format!("Created playlist {} ({}).", s(v, "/name"), s(v, "/uri")),
         "playlist.delete" => format!("{}\n{}", s(v, "/message"), s(v, "/note")),
+        "playlist.fork" => {
+            let mut out = match v.get("uri").and_then(Value::as_str) {
+                Some(uri) => {
+                    let name = v
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(|n| format!("'{n}' "))
+                        .unwrap_or_default();
+                    format!(
+                        "Forked spotify:playlist:{} into {name}({uri}).",
+                        s(v, "/from")
+                    )
+                }
+                None => s(v, "/message").to_owned(),
+            };
+            if let Some(note) = v.get("note").and_then(Value::as_str) {
+                let _ = write!(out, "\n{note}");
+            }
+            out
+        }
         "playlist.add" | "playlist.remove" => v["results"]
             .as_array()
             .into_iter()
@@ -566,4 +693,79 @@ pub fn daemon_status(v: &Value) -> String {
     }
     let _ = write!(out, "\n  log: {}", s(v, "/log"));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use silicon_spotify_client::model::item_view;
+
+    use super::*;
+
+    fn song(id: &str, name: &str, secs: u64) -> Value {
+        json!({"id": id, "name": name, "artists": [{"id": "7Ln80lUS6He07XvHI8qqHH", "name": "Arctic Monkeys"}],
+            "album": {"id": "78bpIziExqiI9qztvNFlQu", "name": "AM"}, "duration": {"secs": secs, "nanos": 0}})
+    }
+
+    #[test]
+    fn albums_and_artists_render_their_details() {
+        // What `spotify track spotify:album:78bpIziExqiI9qztvNFlQu` gets: the daemon's `raw`
+        // (spotify_player's output) normalized by `item_view`.
+        let raw = json!({"album": {"id": "78bpIziExqiI9qztvNFlQu", "release_date": "2013-09-09", "name": "AM",
+            "artists": [{"id": "7Ln80lUS6He07XvHI8qqHH", "name": "Arctic Monkeys"}], "typ": "album"},
+            "tracks": [song("5FVd6KXrgO9B3JPmC8OPst", "Do I Wanna Know?", 272)]});
+        let text = track_view("album", &raw);
+        assert!(text.starts_with("AM — Arctic Monkeys\n  album · released 2013-09-09 · 1 track · 4:32\n  spotify:album:78bpIziExqiI9qztvNFlQu\n"), "{text}");
+        assert!(
+            text.contains("1. Do I Wanna Know? — Arctic Monkeys (4:32)"),
+            "{text}"
+        );
+        let raw = json!({"artist": {"id": "7Ln80lUS6He07XvHI8qqHH", "name": "Arctic Monkeys"},
+            "top_tracks": [song("5XeFesFbtLpXzIVDNQP22n", "I Wanna Be Yours", 184)],
+            "albums": [{"id": "2rkuPRtC7rZlcsOCwTmdpF", "release_date": "2005-10-17", "name": "Dancefloor",
+                "artists": [{"id": "7Ln80lUS6He07XvHI8qqHH", "name": "Arctic Monkeys"}], "typ": "single"}],
+            "related_artists": [{"id": "77SW9BnxLY8rJ0RciFqkHh", "name": "The Neighbourhood"}]});
+        let text = track_view("artist", &raw);
+        assert!(
+            text.starts_with("Arctic Monkeys\n  spotify:artist:7Ln80lUS6He07XvHI8qqHH\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Top tracks (1):\n    1. I Wanna Be Yours"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1. Dancefloor — Arctic Monkeys (2005-10-17, single)\n"),
+            "{text}"
+        );
+        assert!(text.contains("Related: The Neighbourhood"), "{text}");
+    }
+
+    fn track_view(kind: &str, raw: &Value) -> String {
+        let mut value = json!({"item": null, "raw": raw});
+        if let (Some(object), Value::Object(view)) = (value.as_object_mut(), item_view(kind, raw)) {
+            object.extend(view);
+        }
+        track(&value)
+    }
+
+    #[test]
+    fn playlist_counts_are_pluralized() {
+        let one = json!({"playlist": {"name": "Mix", "uri": "spotify:playlist:x"}, "track_count": 1, "duration": "3:00", "tracks": []});
+        assert!(playlist("playlist.show", &one).starts_with("Mix — 1 track, 3:00"));
+        let two = json!({"playlist": {"name": "Mix", "uri": "spotify:playlist:x"}, "track_count": 2, "duration": "6:00", "tracks": []});
+        assert!(playlist("playlist.show", &two).starts_with("Mix — 2 tracks, 6:00"));
+    }
+
+    #[test]
+    fn forks_show_the_new_playlist() {
+        let forked = json!({"forked": true, "from": "37i9dQZF1DXcBWIGoYBM5M", "id": "3PgK3VZ2qzkM0B12w8hHnf",
+            "uri": "spotify:playlist:3PgK3VZ2qzkM0B12w8hHnf", "name": "Focus (mine)", "message": "..."});
+        assert_eq!(
+            playlist("playlist.fork", &forked),
+            "Forked spotify:playlist:37i9dQZF1DXcBWIGoYBM5M into 'Focus (mine)' (spotify:playlist:3PgK3VZ2qzkM0B12w8hHnf)."
+        );
+        let old = json!({"forked": true, "from": "x", "message": "Forked playlist."});
+        assert_eq!(playlist("playlist.fork", &old), "Forked playlist.");
+    }
 }

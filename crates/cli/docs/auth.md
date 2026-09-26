@@ -14,17 +14,41 @@ Playback control through AppleScript needs neither.
 ## IAM login (Silicons and Carbons)
 
 The CLI never asks for passwords, OTPs, SID or STK. It takes one short-lived token (SLT) minted by
-the official `iam` CLI or IAM's consent screen:
+the official `iam` CLI or IAM's consent screen (https://auth.iam.teamofsilicons.com). Get the
+`iam` CLI with `cargo install silicon-iam-cli` (crate `silicon-iam-cli`, binary `iam`); it talks
+to IAM at https://backend.iam.teamofsilicons.com, and `iam iam --json` shows where everything is.
 
 ```sh
-spotify iam --json                      # {"app_id": "spotify", "org_id": "unlikefraction", …} — offline
+spotify iam --json                      # {"app_id": "spotify", "org_id": "unlikefraction", …} (offline)
 # Silicon
 iam silicon-login --app-id spotify --grant-org "$SILICON_ORG" --approve-scopes
 # Carbon
 iam login --app-id spotify --grant-org <org>
-spotify login '<SLT>'                   # or: … | jq -r .slt | spotify login --token-file -
+spotify login '<SLT>'
 spotify login status --json
 spotify logout
+```
+
+Or pipe the SLT straight in, so it never lands in shell history:
+
+```sh
+iam -o json silicon-login --app-id spotify --grant-org "$SILICON_ORG" --approve-scopes \
+  | jq -r .slt | spotify login --token-file -
+```
+
+An SLT lasts about 2 minutes and works once; if it expired, was used, or was minted for another
+app, `spotify login` fails with `slt_rejected`: mint a fresh one and log in right away.
+
+**Which `iam` session mints it.** The SLT logs in whoever the minting `iam` session belongs to.
+`iam` honours `SILICON_HOME` too: it keeps its own session in `$SILICON_HOME/.silicon-iam`. So
+mint a Silicon's SLT with that Silicon's `SILICON_HOME`, where the Silicon has signed in to IAM
+once (`iam silicon-login --sid si:<handle>`); in a fresh home `iam` has no session and refuses to
+mint. A Carbon operator minting from their own `iam` session unsets `SILICON_HOME` for `iam`
+only; the session saved in the Silicon home is then the Carbon's, and Tings go to the Carbon:
+
+```sh
+env -u SILICON_HOME iam -o json login --app-id spotify --grant-org <org> \
+  | jq -r .slt | spotify login --token-file -
 ```
 
 What happens:

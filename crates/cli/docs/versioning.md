@@ -1,5 +1,8 @@
 # Versioning
 
+Which contracts spotify-cli versions, how each one changes, and how the CLI, the daemon and the
+backend find out whether they still fit together.
+
 ## Contracts and versions
 
 | Contract | Version | Where |
@@ -22,8 +25,10 @@ Rules:
 
 - CLI ↔ daemon: every request carries `v` and `client_version`. A daemon older than the CLI is
   restarted automatically; an unknown op returns `unknown_op` naming the fix.
-- CLI ↔ backend: the CLI checks `GET /api/v1/version` in `spotify doctor`; the backend's
-  `min_cli` says which CLIs it still supports.
+- CLI ↔ backend: `spotify doctor` reads `GET /api/v1/version` (shown in the `backend_reachable`
+  check's `detail.version`). When the backend names a `min_cli`, the required check
+  `cli_version_supported` fails for an older CLI, with the fix `spotify update`. Offline, or with
+  a backend that sends no `min_cli`, the check is left out.
 
 ## Compatibility matrix
 

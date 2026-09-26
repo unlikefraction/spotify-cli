@@ -10,7 +10,7 @@ use silicon_spotify_client::applescript::{self, Runner};
 use silicon_spotify_client::control::{Controller, PlayTarget, RepeatMode, Strategy, VolumeTarget};
 use silicon_spotify_client::ipc::Request;
 use silicon_spotify_client::model::{Item, Playback, PlayerState, now_rfc3339};
-use silicon_spotify_client::player::SpotifyPlayer;
+use silicon_spotify_client::player::{Output, SpotifyPlayer};
 use silicon_spotify_client::timing::SeekTarget;
 use silicon_spotify_client::trigger::Tracker;
 use silicon_spotify_client::uri::{Kind, SpotifyUri};
@@ -560,7 +560,15 @@ fn track_info(daemon: &Daemon, settings: &Settings, uri: Option<&SpotifyUri>) ->
             if kind == "playlist" {
                 return Ok(playlist_view(&value));
             }
-            Ok(json!({"item": Item::from_player_json(kind, &value), "raw": value}))
+            let mut out = json!({"item": Item::from_player_json(kind, &value)});
+            if let (Some(object), Value::Object(view)) = (
+                out.as_object_mut(),
+                silicon_spotify_client::model::item_view(kind, &value),
+            ) {
+                object.extend(view);
+            }
+            out["raw"] = value;
+            Ok(out)
         }
         None => {
             let playback = daemon.read()?;
@@ -638,6 +646,13 @@ fn lyrics(daemon: &Daemon, settings: &Settings, uri: Option<&SpotifyUri>) -> Res
 }
 
 fn search(settings: &Settings, query: &str, kinds: &[Kind], limit: usize) -> Result<Value> {
+    let max = silicon_spotify_client::player::SEARCH_MAX_PER_KIND as usize;
+    if !(1..=max).contains(&limit) {
+        return Err(Error::invalid(
+            format!("limit must be from 1 to {max}, not {limit}."),
+            format!("spotify_player returns at most {max} results per kind."),
+        ));
+    }
     if query.trim().is_empty() {
         return Err(Error::invalid(
             "The search query is empty.",
@@ -756,19 +771,8 @@ async fn playlist(daemon: &Arc<Daemon>, request: &Request, settings: Settings) -
             "playlist.create" => {
                 let name = a.name.clone().filter(|n| !n.trim().is_empty()).ok_or_else(|| Error::invalid("A playlist needs a name.", "Example: spotify playlist create 'Deep focus' --description 'no vocals'"))?;
                 let description = a.description.clone().unwrap_or_default();
-                let mut args = vec!["playlist", "new"];
-                if a.public {
-                    args.push("--public");
-                }
-                if a.collab {
-                    args.push("--collab");
-                }
-                args.push(&name);
-                args.push(&description);
-                let output = player.run(&args)?;
-                // "Playlist 'NAME' with id 'ID' was created."
-                let id = output.stdout.rsplit_once("with id '").and_then(|(_, rest)| rest.split('\'').next()).map(str::to_owned);
-                Ok(json!({"created": true, "id": id, "uri": id.as_ref().map(|i| format!("spotify:playlist:{i}")), "name": name, "public": a.public, "collaborative": a.collab, "message": output.stdout}))
+                let (id, output) = create_playlist(&player, &name, &description, a.public, a.collab)?;
+                Ok(json!({"created": true, "id": id, "uri": id.as_deref().map(playlist_uri), "name": name, "public": a.public, "collaborative": a.collab, "message": output.stdout}))
             }
             "playlist.delete" => {
                 let id = id("delete")?;
@@ -807,19 +811,38 @@ async fn playlist(daemon: &Arc<Daemon>, request: &Request, settings: Settings) -
             "playlist.import" => {
                 let from = SpotifyUri::parse(a.from.as_deref().unwrap_or_default(), Some(Kind::Playlist))?.id;
                 let to = SpotifyUri::parse(a.to.as_deref().unwrap_or_default(), Some(Kind::Playlist))?.id;
-                let mut args = vec!["playlist", "import"];
-                if a.delete {
-                    args.push("--delete");
-                }
-                args.push(&from);
-                args.push(&to);
-                let output = player.run(&args)?;
+                let output = import_playlist(&player, &from, &to, a.delete)?;
                 Ok(json!({"imported": true, "from": from, "to": to, "message": output.stdout}))
             }
             "playlist.fork" => {
-                let id = id("fork")?;
-                let output = player.run(&["playlist", "fork", &id])?;
-                Ok(json!({"forked": true, "from": id, "message": output.stdout}))
+                let from = id("fork")?;
+                let Some(name) = a.name.clone() else {
+                    let output = player.run(&["playlist", "fork", &from])?;
+                    let (id, name) = forked_playlist(&output.stdout).unzip();
+                    return Ok(json!({"forked": true, "from": from, "id": id, "uri": id.as_deref().map(playlist_uri), "name": name, "message": output.stdout}));
+                };
+                if name.trim().is_empty() || name.chars().count() > 100 {
+                    return Err(Error::invalid("A playlist name must be 1 to 100 characters.", "Example: spotify playlist fork <playlist-id> --name 'Deep focus (mine)'"));
+                }
+                // spotify_player cannot name a fork, so do what its fork does under the chosen
+                // name: read the source (so a bad id creates nothing), create, import.
+                let source = player.json(&["get", "item", "--id", &from, "playlist"])?;
+                let description = a.description.clone().or_else(|| source.pointer("/playlist/desc").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+                let (id, created) = create_playlist(&player, &name, &description, a.public, a.collab)?;
+                let id = id.ok_or_else(|| {
+                    Error::new("spotify_player_failed", format!("spotify_player created the playlist '{name}' but did not print its id, so nothing was imported into it."), format!("Find its id with `spotify playlist list`, then run `spotify playlist import {from} <id>`."))
+                        .with_details(json!({"stdout": created.stdout}))
+                })?;
+                let uri = playlist_uri(&id);
+                let imported = import_playlist(&player, &from, &id, false).map_err(|error| Error {
+                    message: format!("Created the playlist '{name}' ({uri}), but importing {from} into it failed: {}", error.message),
+                    hint: format!("Retry the import with `spotify playlist import {from} {id}` (or remove the playlist with `spotify playlist delete {id}`). {}", error.hint),
+                    details: Some(json!({"created": {"id": id, "uri": uri, "name": name}, "cause": error.details})),
+                    ..error
+                })?;
+                Ok(json!({"forked": true, "from": from, "id": id, "uri": uri, "name": name, "public": a.public, "collaborative": a.collab,
+                    "message": format!("Forked {from}.\nNew playlist: {id}:{name}\n{}", imported.stdout),
+                    "note": "spotify_player cannot name a fork, so this created a playlist with that name and imported the source into it, as its fork does."}))
             }
             "playlist.sync" => {
                 let mut args = vec!["playlist", "sync"];
@@ -837,6 +860,88 @@ async fn playlist(daemon: &Arc<Daemon>, request: &Request, settings: Settings) -
         }
     })
     .await
+}
+
+/// `spotify_player playlist new`; returns the new playlist's bare id (when the output names it).
+fn create_playlist(
+    player: &SpotifyPlayer,
+    name: &str,
+    description: &str,
+    public: bool,
+    collab: bool,
+) -> Result<(Option<String>, Output)> {
+    let output = player.run(&new_playlist_args(name, description, public, collab))?;
+    Ok((created_playlist_id(&output.stdout), output))
+}
+
+/// Arguments for `spotify_player playlist new`. `--` keeps a name or description that starts
+/// with `-` from being read as a flag, and an empty description is left out because
+/// spotify_player rejects an empty one (it then uses none).
+fn new_playlist_args<'a>(
+    name: &'a str,
+    description: &'a str,
+    public: bool,
+    collab: bool,
+) -> Vec<&'a str> {
+    let mut args = vec!["playlist", "new"];
+    if public {
+        args.push("--public");
+    }
+    if collab {
+        args.push("--collab");
+    }
+    args.push("--");
+    args.push(name);
+    if !description.is_empty() {
+        args.push(description);
+    }
+    args
+}
+
+/// `spotify_player playlist import` (also records the import for `playlist sync`).
+fn import_playlist(player: &SpotifyPlayer, from: &str, to: &str, delete: bool) -> Result<Output> {
+    let mut args = vec!["playlist", "import"];
+    if delete {
+        args.push("--delete");
+    }
+    args.push(from);
+    args.push(to);
+    player.run(&args)
+}
+
+/// The id in `playlist new` output, `Playlist 'NAME' with id 'ID' was created.`, where ID is a
+/// bare id or (0.25) a full `spotify:playlist:` URI.
+fn created_playlist_id(stdout: &str) -> Option<String> {
+    let (_, rest) = stdout.rsplit_once("with id '")?;
+    bare_playlist_id(rest.split('\'').next()?)
+}
+
+/// The new playlist (id, name) in `playlist fork` output: `Forked FROM.`, then
+/// `New playlist: ID:NAME` (ID bare or a URI), then the import report (`Importing from …`).
+fn forked_playlist(stdout: &str) -> Option<(String, String)> {
+    let (_, rest) = stdout.split_once("New playlist: ")?;
+    let rest = rest.strip_prefix("spotify:playlist:").unwrap_or(rest);
+    let end = rest
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(rest.len());
+    let (id, tail) = rest.split_at(end);
+    // Names can span lines, so the name runs up to the import report.
+    let name = tail.strip_prefix(':').map_or("", |tail| {
+        tail.split_once("\nImporting from ")
+            .map_or_else(|| tail.lines().next().unwrap_or_default(), |(name, _)| name)
+    });
+    Some((bare_playlist_id(id)?, name.to_owned()))
+}
+
+fn bare_playlist_id(raw: &str) -> Option<String> {
+    SpotifyUri::parse(raw, Some(Kind::Playlist))
+        .ok()
+        .filter(|uri| uri.kind == Kind::Playlist)
+        .map(|uri| uri.id)
+}
+
+fn playlist_uri(id: &str) -> String {
+    format!("spotify:playlist:{id}")
 }
 
 fn saved_shows(settings: &Settings) -> Result<Value> {
@@ -1105,4 +1210,81 @@ fn queue_edit(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
     };
     daemon.save_queue(&live);
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ID: &str = "0NiLR6uUU0Mk0bfN4VRu5u";
+
+    #[test]
+    fn created_playlist_ids_are_bare_whatever_spotify_player_prints() {
+        for stdout in [
+            format!("Playlist 'Deep focus' with id 'spotify:playlist:{ID}' was created."),
+            format!("Playlist 'Deep focus' with id '{ID}' was created."),
+            // A name that looks like the marker does not confuse it.
+            format!("Playlist 'with id 'x'' with id 'spotify:playlist:{ID}' was created."),
+        ] {
+            assert_eq!(
+                created_playlist_id(&stdout).as_deref(),
+                Some(ID),
+                "{stdout}"
+            );
+        }
+        assert_eq!(created_playlist_id("Playlist 'x' was created."), None);
+        assert_eq!(
+            created_playlist_id("Playlist 'x' with id 'spotify:track:abc' was created."),
+            None
+        );
+    }
+
+    #[test]
+    fn new_playlist_args_survive_dashes_and_empty_descriptions() {
+        assert_eq!(
+            new_playlist_args("Deep focus", "", false, false),
+            ["playlist", "new", "--", "Deep focus"]
+        );
+        assert_eq!(
+            new_playlist_args("-80s-", "- no vocals", true, true),
+            [
+                "playlist",
+                "new",
+                "--public",
+                "--collab",
+                "--",
+                "-80s-",
+                "- no vocals"
+            ]
+        );
+    }
+
+    #[test]
+    fn forked_playlists_are_parsed_from_the_report() {
+        let stdout = format!(
+            "Forking '37i9dQZF1DXcBWIGoYBM5M'...\n\nForked 37i9dQZF1DXcBWIGoYBM5M.\nNew playlist: {ID}:Deep focus: late\nImporting from 37i9dQZF1DXcBWIGoYBM5M:Deep focus: late to {ID}:Deep focus: late...\nNew tracks imported to Deep focus: late:"
+        );
+        assert_eq!(
+            forked_playlist(&stdout),
+            Some((ID.to_owned(), "Deep focus: late".to_owned()))
+        );
+        let uri_form = format!("Forked x.\nNew playlist: spotify:playlist:{ID}:Mix\n");
+        assert_eq!(
+            forked_playlist(&uri_form),
+            Some((ID.to_owned(), "Mix".to_owned()))
+        );
+        let two_lines = format!(
+            "Forked x.\nNew playlist: {ID}:Late night\nfocus, part 2\nImporting from x:y to {ID}:z..."
+        );
+        assert_eq!(
+            forked_playlist(&two_lines).map(|(_, name)| name).as_deref(),
+            Some("Late night\nfocus, part 2")
+        );
+        let id_only = format!("Forked x.\nNew playlist: {ID}\nImporting from x:y to {ID}:z...");
+        assert_eq!(
+            forked_playlist(&id_only),
+            Some((ID.to_owned(), String::new()))
+        );
+        assert_eq!(forked_playlist("Forked x.\nImporting…"), None);
+    }
 }

@@ -203,7 +203,7 @@ pub fn send_body(
     if !data.is_object() || !metadata.is_object() {
         return Err(AppError::invalid(
             "`data` and `metadata` must be JSON objects.",
-            "",
+            "Send both as objects, e.g. {\"data\": {\"trigger\": {…}}, \"metadata\": {}}; `metadata` may be left out.",
         ));
     }
     let body = serde_json::to_vec(&json!({

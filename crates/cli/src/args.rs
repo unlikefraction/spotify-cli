@@ -97,7 +97,7 @@ pub enum Command {
     /// Play something (a URI, a link, a search, Liked Songs, a radio) or resume.
     #[command(
         long_about = "Without arguments: resume. With a target: start it. Targets are spotify:<kind>:<id> URIs, open.spotify.com links, or bare ids with --type. --search plays the first match.\n\nHow it plays: spotify_player (Web API) first; if it errors or Spotify.app does not change within verify_timeout_ms (default 2.5 s), AppleScript plays it. Starting a single track by id through spotify_player is known to fail on the desktop app, so tracks usually report `via: applescript` with the reason in `fallback`.",
-        after_help = "Examples:\n  spotify play                                   Resume\n  spotify play spotify:track:0BxE4FqsDD1Ot4YuBXwAPp\n  spotify play https://open.spotify.com/album/78bpIziExqiI9qztvNFlQu --shuffle\n  spotify play --search 'arctic monkeys 505'\n  spotify play --search 'lofi beats' --type playlist\n  spotify play spotify:track:<id> --context spotify:playlist:<id>   Track, then keep going in the playlist\n  spotify play --liked --random\n  spotify play --radio spotify:artist:<id>\n\nNext: spotify status · spotify queue add <uri> · spotify trigger add --end"
+        after_help = "Examples:\n  spotify play                                   Resume\n  spotify play spotify:track:0BxE4FqsDD1Ot4YuBXwAPp\n  spotify play https://open.spotify.com/album/78bpIziExqiI9qztvNFlQu --shuffle\n  spotify play --search 'arctic monkeys 505'\n  spotify play --search 'lofi beats' --type playlist\n  spotify play spotify:track:<id> --context spotify:playlist:<id>   Track, then the playlist\n  spotify play --liked --random\n  spotify play --radio spotify:artist:<id>\n\nNext: spotify status · spotify queue add <uri> · spotify trigger add --end"
     )]
     Play(PlayArgs),
     /// Resume playback (same as `spotify play` with no target).
@@ -158,7 +158,7 @@ pub enum Command {
     /// Details about the current song, or about any track, album, artist or playlist.
     #[command(
         visible_alias = "song",
-        after_help = "Examples:\n  spotify track                               The current song (+ artists, album, release date)\n  spotify track spotify:album:78bpIziExqiI9qztvNFlQu\n  spotify track https://open.spotify.com/artist/7Ln80lUS6He07XvHI8qqHH\n\nNext: spotify lyrics · spotify playlist add <playlist> <uri>"
+        after_help = "Examples:\n  spotify track                               The current song (+ artists, album, release date)\n  spotify track spotify:album:78bpIziExqiI9qztvNFlQu\n  spotify track https://open.spotify.com/artist/7Ln80lUS6He07XvHI8qqHH\n  spotify track 37i9dQZF1DXcBWIGoYBM5M --type playlist\n\nAlbums show their release date and track list; artists their top tracks, albums and related artists; playlists their tracks. Podcast shows and episodes cannot be looked up by id (use `spotify podcast search`).\n\nNext: spotify lyrics · spotify playlist add <playlist> <uri>"
     )]
     Track {
         /// URI, link or id (default: the current song).
@@ -186,7 +186,7 @@ pub enum Command {
         /// Kinds, comma-separated: track, album, artist, playlist, show, episode (default: all).
         #[arg(long = "type", value_delimiter = ',', value_enum)]
         kinds: Vec<KindArg>,
-        /// Results per kind (1-50; default: config search_limit, 10).
+        /// Results per kind, 1-10 (spotify_player returns at most 10; default: config search_limit, 10).
         #[arg(long)]
         limit: Option<usize>,
         /// Play the first result.
@@ -201,7 +201,7 @@ pub enum Command {
         /// Section.
         #[arg(value_enum)]
         section: LibrarySection,
-        /// Show at most this many.
+        /// Show at most this many (1 or more; default: all).
         #[arg(long)]
         limit: Option<usize>,
     },
@@ -264,7 +264,7 @@ pub enum Command {
         args_conflicts_with_subcommands = true,
         subcommand_precedence_over_arg = true,
         long_about = "Exchanges an IAM short-lived token (SLT, ~2 minutes, single use) through the spotify-cli backend for an app session, saved in $SILICON_HOME/.spotify/session.json (0600), and registers you as a Ting recipient so triggers can notify you. The CLI never asks for passwords, OTPs or SID/STK: only the SLT.\n\nMint the SLT with the official iam CLI (or the web consent screen):\n  Silicon: iam silicon-login --app-id spotify --grant-org <org> --approve-scopes\n  Carbon:  iam login --app-id spotify --grant-org <org>",
-        after_help = "Examples:\n  spotify login 'oac_…'\n  iam -o json silicon-login --app-id spotify --grant-org unlikefraction --approve-scopes | jq -r .slt | spotify login --token-file -\n  spotify login status --json\n\nThe exchange uses an idempotency key derived from the SLT, so retrying after a network error replays instead of burning the token."
+        after_help = "Examples:\n  spotify login 'oac_…'\n  iam -o json silicon-login --app-id spotify --grant-org <org> --approve-scopes \\\n    | jq -r .slt | spotify login --token-file -\n  spotify login status --json\n\nThe exchange uses an idempotency key derived from the SLT, so retrying after a network error replays instead of burning the token."
     )]
     Login(LoginArgs),
     /// Log out: revoke the session in IAM and delete it locally.
@@ -320,7 +320,7 @@ pub enum Command {
     },
     /// Run, install and inspect spotify-daemon.
     #[command(
-        after_help = "Workflow:\n  spotify daemon install     Start at login (launchd) and now\n  spotify daemon status      Version, uptime, Spotify state, triggers, deliveries, warm spotify_player\n  spotify daemon logs\n  spotify daemon restart\n  spotify daemon uninstall\n\nThe CLI starts the daemon on demand, and restarts it when the CLI is newer."
+        after_help = "Workflow:\n  spotify daemon install     Start at login (launchd) and now\n  spotify daemon status      Version, uptime, Spotify, triggers, deliveries, spotify_player\n  spotify daemon logs\n  spotify daemon restart\n  spotify daemon uninstall\n\nThe CLI starts the daemon on demand, and restarts it when the CLI is newer."
     )]
     Daemon {
         #[command(subcommand)]
@@ -329,13 +329,13 @@ pub enum Command {
     /// Report a bug (optionally with the pull request that fixes it).
     #[command(
         long_about = "spotify-cli is open source: reproduce, patch and open a pull request at https://github.com/unlikefraction/spotify-cli, then report it here with --pr. Reports go to the maintainers through the backend (your text, --pr, versions, OS, and --attach files you choose; no tokens or logs are collected automatically). If the backend is unreachable the report is saved locally with a `gh issue create` command to file it yourself.",
-        after_help = "Examples:\n  spotify report 'queue add fails with 403 for episodes; repro: spotify queue add spotify:episode:<id>'\n  spotify report 'seek drifts 2 s on podcasts' --pr https://github.com/unlikefraction/spotify-cli/pull/42\n  spotify report 'daemon crash' --attach ~/.silicon-spotify/daemon.log"
+        after_help = "Examples:\n  spotify report 'queue add fails with 403 for episodes; repro: spotify queue add <episode-uri>'\n  spotify report 'seek drifts 2 s' --pr https://github.com/unlikefraction/spotify-cli/pull/42\n  spotify report 'daemon crash' --attach ~/.silicon-spotify/daemon.log"
     )]
     Report {
         /// What happened, what you expected, and how to reproduce it.
         message: String,
-        /// Pull request with a fix: https://github.com/unlikefraction/spotify-cli/pull/<n>
-        #[arg(long)]
+        /// Pull request that fixes it (github.com/unlikefraction/spotify-cli/pull/<n>).
+        #[arg(long, value_name = "URL")]
         pr: Option<String>,
         /// Attach a text file (repeatable; at most 5, 64 KiB each).
         #[arg(long, value_name = "FILE")]
@@ -419,6 +419,13 @@ pub enum KindArg {
     Episode,
 }
 
+/// What `queue add --search` can queue: Spotify's queue holds single items only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum QueueKindArg {
+    Track,
+    Episode,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum LibrarySection {
     Liked,
@@ -439,9 +446,9 @@ pub enum QueueCommand {
         /// Add the first search hit instead.
         #[arg(long)]
         search: Option<String>,
-        /// Kind for --search (track or episode; default track).
+        /// Kind for --search (default track).
         #[arg(long = "type", value_enum)]
-        kind: Option<KindArg>,
+        kind: Option<QueueKindArg>,
         /// Put at the front instead of the end.
         #[arg(long)]
         next: bool,
@@ -469,7 +476,7 @@ pub enum PlaylistCommand {
     /// Your playlists (id and name).
     #[command(visible_alias = "ls")]
     List {
-        /// Show at most this many.
+        /// Show at most this many (1 or more; default: all).
         #[arg(long)]
         limit: Option<usize>,
     },
@@ -540,9 +547,15 @@ pub enum PlaylistCommand {
         delete: bool,
     },
     /// Copy a playlist into a new one you own.
+    #[command(
+        after_help = "Examples:\n  spotify playlist fork 37i9dQZF1DXcBWIGoYBM5M\n  spotify playlist fork spotify:playlist:<id> --name 'Focus (mine)' --json | jq -r .uri"
+    )]
     Fork {
         /// Playlist id, URI or link.
         playlist: String,
+        /// Name of the new playlist (default: the original's name).
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Re-run imports for one playlist or all.
     Sync {
@@ -567,7 +580,7 @@ pub enum PodcastCommand {
         /// Only shows.
         #[arg(long)]
         shows: bool,
-        /// Results per kind.
+        /// Results per kind, 1-10 (spotify_player returns at most 10; default 10).
         #[arg(long)]
         limit: Option<usize>,
     },
@@ -600,7 +613,7 @@ pub enum DeviceCommand {
 pub enum TriggerCommand {
     /// Create a trigger.
     #[command(
-        after_help = "Exactly one condition: --remaining, --elapsed/--at, --end or --change.\nTimes: 30s, 1:30, 1m30s, 250ms; percentages: 25%.\n\nExamples:\n  spotify trigger add --remaining 30s --note 'wrap up the call'\n  spotify trigger add --remaining 25%\n  spotify trigger add --elapsed 50%\n  spotify trigger add --end --scope every --label song-over\n  spotify trigger add --change --once --scope every     Next track change, whatever the reason\n  spotify trigger add --remaining 5s --local            No Ting: watch with `trigger wait` / `trigger history`"
+        after_help = "Exactly one condition: --remaining, --elapsed/--at, --end or --change.\nTimes: 30s, 1:30, 1m30s, 250ms; percentages: 25%.\n\nExamples:\n  spotify trigger add --remaining 30s --note 'wrap up the call'\n  spotify trigger add --remaining 25%\n  spotify trigger add --elapsed 50%\n  spotify trigger add --end --scope every --label song-over\n  spotify trigger add --change --once --scope every     Next track change, whatever the reason\n  spotify trigger add --remaining 5s --local            Local only: no Ting (see `trigger wait`)"
     )]
     Add(TriggerAdd),
     /// List active triggers (--all includes finished ones).
@@ -630,9 +643,9 @@ pub enum TriggerCommand {
     History {
         /// Only this trigger.
         id: Option<String>,
-        /// How many (default 20).
+        /// How many, 1-500 (default 20).
         #[arg(long)]
-        limit: Option<i64>,
+        limit: Option<usize>,
         /// Every home on this machine.
         #[arg(long)]
         everyone: bool,

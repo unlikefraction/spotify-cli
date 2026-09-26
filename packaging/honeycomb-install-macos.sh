@@ -25,4 +25,11 @@ if env -u SILICON_HOME "$bin/spotify" daemon install --json >/dev/null 2>&1 || e
 else
   echo "warning: could not start spotify-daemon now; it starts on the first spotify command (spotify daemon install for login start)"
 fi
+# Same wording as install.sh. This runs unattended, so it reads the state once and never waits.
+automation=$(env -u SILICON_HOME "$bin/spotify" daemon status --json 2>/dev/null | sed -n 's/.*"automation": *"\([a-z_]*\)".*/\1/p' | head -1)
+case "$automation" in
+  granted) ;;
+  denied) echo "spotify-daemon may not control Spotify yet: System Settings → Privacy & Security → Automation → spotify-daemon → Spotify." ;;
+  *) echo "macOS asks once whether spotify-daemon may control Spotify: click Allow." ;;
+esac
 exit 0

@@ -295,6 +295,9 @@ pub struct Item {
     /// Release date (albums, episodes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_date: Option<String>,
+    /// `album`, `single`, `compilation` or `appears_on` (albums).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_type: Option<String>,
     /// Explicit content flag (tracks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explicit: Option<bool>,
@@ -373,6 +376,11 @@ impl Item {
                 .get("release_date")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            album_type: (kind == "album")
+                .then(|| value.get("album_type").or_else(|| value.get("typ")))
+                .flatten()
+                .and_then(Value::as_str)
+                .map(|t| t.to_ascii_lowercase()),
             explicit: value.get("explicit").and_then(Value::as_bool),
             description,
         })
@@ -387,6 +395,70 @@ impl Item {
             format!("{} — {}", self.name, self.by.join(", "))
         }
     }
+}
+
+/// Details of one album, artist or track from `spotify_player get item --id <id> <kind>`, as
+/// `spotify track <uri>` prints them.
+///
+/// spotify_player wraps albums as `{"album", "tracks"}` and artists as `{"artist", "top_tracks",
+/// "albums", "related_artists"}`; a track is the bare object. The result always has `kind` and
+/// `item` (the normalized [`Item`], `null` only when the output has no id), plus per kind:
+/// - album: `release_date`, `track_count`, `duration_ms`, `duration`, `tracks`;
+/// - artist: `top_tracks`, `albums`, `related_artists`, and `genres`, `followers`, `popularity`
+///   when spotify_player reports them.
+#[must_use]
+pub fn item_view(kind: &str, value: &Value) -> Value {
+    let list = |key: &str, of: &str| -> Vec<Item> {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| Item::from_player_json(of, v))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // The object itself sits under its kind's key, or is the whole value.
+    let object = value
+        .get(kind)
+        .filter(|inner| inner.is_object())
+        .unwrap_or(value);
+    let item = Item::from_player_json(kind, object);
+    let mut view = serde_json::json!({"kind": kind, "item": item});
+    match kind {
+        "album" => {
+            let tracks = list("tracks", "track");
+            let total_ms: u64 = tracks.iter().filter_map(|t| t.duration_ms).sum();
+            view["release_date"] =
+                serde_json::json!(item.as_ref().and_then(|i| i.release_date.clone()));
+            view["track_count"] = serde_json::json!(tracks.len());
+            view["duration_ms"] = serde_json::json!(total_ms);
+            view["duration"] = serde_json::json!(clock(total_ms));
+            view["tracks"] = serde_json::json!(tracks);
+        }
+        "artist" => {
+            view["top_tracks"] = serde_json::json!(list("top_tracks", "track"));
+            view["albums"] = serde_json::json!(list("albums", "album"));
+            view["related_artists"] = serde_json::json!(list("related_artists", "artist"));
+            if let Some(genres) = object.get("genres").and_then(Value::as_array) {
+                view["genres"] = Value::Array(genres.clone());
+            }
+            // The Web API nests followers as {"total": n}; accept a bare number too.
+            if let Some(followers) = object
+                .get("followers")
+                .and_then(|f| f.get("total").unwrap_or(f).as_u64())
+            {
+                view["followers"] = serde_json::json!(followers);
+            }
+            if let Some(popularity) = object.get("popularity").and_then(Value::as_u64) {
+                view["popularity"] = serde_json::json!(popularity);
+            }
+        }
+        _ => {}
+    }
+    view
 }
 
 /// Truncates on a character boundary, adding `…`.
@@ -447,6 +519,56 @@ mod tests {
         let item = Item::from_player_json("playlist", &playlist).expect("playlist");
         assert_eq!(item.by, vec!["Playlist Owner".to_owned()]);
         assert_eq!(item.description, None);
+    }
+
+    #[test]
+    fn album_and_artist_views_unwrap_spotify_player_output() {
+        let album_ref = json!({"id":"78bpIziExqiI9qztvNFlQu","release_date":"2013-09-09","name":"AM",
+            "artists":[{"id":"7Ln80lUS6He07XvHI8qqHH","name":"Arctic Monkeys"}],"typ":"album","added_at":0});
+        let track = |id: &str, name: &str, secs: u64| {
+            json!({"id":id,"name":name,"artists":[{"id":"7Ln80lUS6He07XvHI8qqHH","name":"Arctic Monkeys"}],
+                "album":album_ref,"duration":{"secs":secs,"nanos":0},"explicit":false})
+        };
+        // `spotify_player get item --id 78bpIziExqiI9qztvNFlQu album` (0.25.1).
+        let album = json!({"album": album_ref, "tracks": [
+            track("5FVd6KXrgO9B3JPmC8OPst", "Do I Wanna Know?", 272),
+            track("2AT8iROs4FQueDv2c8q2KE", "R U Mine?", 201),
+        ]});
+        let view = item_view("album", &album);
+        assert_eq!(view["item"]["name"], "AM");
+        assert_eq!(view["item"]["uri"], "spotify:album:78bpIziExqiI9qztvNFlQu");
+        assert_eq!(view["item"]["by"], json!(["Arctic Monkeys"]));
+        assert_eq!(view["item"]["album_type"], "album");
+        assert_eq!(view["release_date"], "2013-09-09");
+        assert_eq!(view["track_count"], 2);
+        assert_eq!(view["duration"], "7:53");
+        assert_eq!(view["tracks"][1]["name"], "R U Mine?");
+        // `spotify_player get item --id 7Ln80lUS6He07XvHI8qqHH artist` (0.25.1): no genres,
+        // followers or popularity, so those keys are absent rather than null.
+        let artist = json!({"artist":{"id":"7Ln80lUS6He07XvHI8qqHH","name":"Arctic Monkeys"},
+            "top_tracks":[track("5XeFesFbtLpXzIVDNQP22n", "I Wanna Be Yours", 184)],
+            "albums":[album_ref, {"id":"2rkuPRtC7rZlcsOCwTmdpF","release_date":"2005-10-17",
+                "name":"I Bet You Look Good On The Dancefloor","artists":[],"typ":"single","added_at":0}],
+            "related_artists":[{"id":"77SW9BnxLY8rJ0RciFqkHh","name":"The Neighbourhood"}]});
+        let view = item_view("artist", &artist);
+        assert_eq!(view["item"]["name"], "Arctic Monkeys");
+        assert_eq!(view["item"]["uri"], "spotify:artist:7Ln80lUS6He07XvHI8qqHH");
+        assert_eq!(view["top_tracks"][0]["duration"], "3:04");
+        assert_eq!(view["albums"][1]["album_type"], "single");
+        assert_eq!(view["related_artists"][0]["name"], "The Neighbourhood");
+        assert!(view.get("genres").is_none() && view.get("popularity").is_none());
+        let web = json!({"id":"a","name":"A","genres":["indie rock"],"followers":{"total":7},"popularity":81});
+        let view = item_view("artist", &web);
+        assert_eq!(view["genres"], json!(["indie rock"]));
+        assert_eq!(view["followers"], 7);
+        assert_eq!(view["popularity"], 81);
+        // A track is the bare object.
+        let view = item_view(
+            "track",
+            &track("5FVd6KXrgO9B3JPmC8OPst", "Do I Wanna Know?", 272),
+        );
+        assert_eq!(view["item"]["album"], "AM");
+        assert!(view["item"].get("album_type").is_none());
     }
 
     #[test]

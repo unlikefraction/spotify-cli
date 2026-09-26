@@ -117,6 +117,8 @@ pub async fn handle(daemon: &Arc<Daemon>, request: &Request) -> Option<Result<Va
 
 async fn add(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
     let a: AddArgs = args(request)?;
+    // A bad spec is reported as such before anything is read, even when Spotify cannot be.
+    let scope = checked_scope(&a)?;
     let home = home_of(request)?;
     let home_key = home.key();
     // Who will be notified, and can they be?
@@ -156,17 +158,6 @@ async fn add(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
     // track ending, a new one starting) are evaluated for existing triggers and the queue too.
     let d = Arc::clone(daemon);
     blocking(move || crate::watcher::observe_now(&d).map(drop)).await?;
-    let scope = match a.scope {
-        ScopeArg::Current => ScopeRequest::Current,
-        ScopeArg::Every => ScopeRequest::Every,
-        ScopeArg::Track(uri) => ScopeRequest::Track(
-            silicon_spotify_client::uri::SpotifyUri::parse(
-                &uri,
-                Some(silicon_spotify_client::uri::Kind::Track),
-            )?
-            .uri(),
-        ),
-    };
     let id = format!("trg_{}", &uuid::Uuid::now_v7().simple().to_string()[16..]);
     let trigger = {
         let live = daemon.live();
@@ -210,6 +201,36 @@ async fn add(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
         trigger.scope.name()
     );
     Ok(json!({"trigger": describe(&stored), "now_playing": current.and_then(|p| p.track)}))
+}
+
+/// The requested scope, after every check that needs no playback (times, note, label,
+/// percentages, the track URI). Binding `current` to the playing item comes after the reading.
+fn checked_scope(a: &AddArgs) -> Result<ScopeRequest> {
+    silicon_spotify_client::trigger::validate_request(
+        a.condition,
+        a.times,
+        a.note.as_deref(),
+        a.label.as_deref(),
+    )?;
+    Ok(match &a.scope {
+        ScopeArg::Current => ScopeRequest::Current,
+        ScopeArg::Every => ScopeRequest::Every,
+        ScopeArg::Track(uri) => {
+            use silicon_spotify_client::uri::{Kind, SpotifyUri};
+            let uri = SpotifyUri::parse(uri, Some(Kind::Track))?;
+            // Only a playing item's own URI can match: an album or playlist never would.
+            if !matches!(uri.kind, Kind::Track | Kind::Episode) {
+                return Err(Error::invalid(
+                    format!(
+                        "--track needs a track or episode; {} is not one.",
+                        uri.uri()
+                    ),
+                    "Example: spotify trigger add --end --scope track --track spotify:track:<id>",
+                ));
+            }
+            ScopeRequest::Track(uri.uri())
+        }
+    })
 }
 
 fn describe(stored: &StoredTrigger) -> Value {
@@ -360,7 +381,15 @@ fn history(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
     let rows = daemon.db.history(
         home.as_deref(),
         a.id.as_deref(),
-        a.limit.unwrap_or(20).clamp(1, 500),
+        match a.limit.unwrap_or(20) {
+            limit @ 1..=500 => limit,
+            other => {
+                return Err(Error::invalid(
+                    format!("limit must be from 1 to 500, not {other}."),
+                    "Example: spotify trigger history --limit 50",
+                ));
+            }
+        },
     )?;
     Ok(json!({"firings": rows.iter().map(firing_view).collect::<Vec<_>>()}))
 }
@@ -717,20 +746,161 @@ pub async fn relay_telemetry(daemon: Arc<Daemon>) {
         let Ok(api) = Api::new(&api_url, "daemon") else {
             continue;
         };
-        let events: Vec<silicon_spotify_client::telemetry::Event> = batch
-            .iter()
-            .filter_map(|(_, v)| serde_json::from_value(v.clone()).ok())
-            .collect();
-        let ids: Vec<String> = batch.into_iter().map(|(id, _)| id).collect();
-        match api.telemetry(&events).await {
-            Ok(()) => {
+        for (events, ids) in telemetry_chunks(batch) {
+            if events.is_empty() {
+                // Unreadable or oversized rows: nothing to send, just forget them.
                 let _ = daemon.db.drop_telemetry(&ids);
+                continue;
             }
-            Err(error) if !error.retryable => {
-                // The backend rejected the batch; drop it rather than retry forever.
-                let _ = daemon.db.drop_telemetry(&ids);
+            match api.telemetry(&events).await {
+                Ok(()) => {
+                    let _ = daemon.db.drop_telemetry(&ids);
+                }
+                Err(error) if !error.retryable => {
+                    // The backend rejected the batch; drop it rather than retry forever.
+                    let _ = daemon.db.drop_telemetry(&ids);
+                }
+                // Keep the rest for the next round.
+                Err(_) => break,
             }
-            Err(_) => {}
         }
+    }
+}
+
+/// The gateway takes at most 64 KiB per request; stay under it with room for the envelope.
+const TELEMETRY_BATCH_BYTES: usize = 60 * 1024;
+
+/// Splits queued telemetry rows into requests under [`TELEMETRY_BATCH_BYTES`], each with the
+/// row ids it covers. Rows that do not parse, or that alone exceed the limit, come back as a
+/// chunk with no events so the caller drops them.
+fn telemetry_chunks(
+    batch: Vec<(String, Value)>,
+) -> Vec<(Vec<silicon_spotify_client::telemetry::Event>, Vec<String>)> {
+    let mut chunks = Vec::new();
+    let mut unusable = Vec::new();
+    let (mut events, mut ids, mut size) = (Vec::new(), Vec::new(), 0usize);
+    for (id, value) in batch {
+        let Ok(event) = serde_json::from_value::<silicon_spotify_client::telemetry::Event>(value)
+        else {
+            unusable.push(id);
+            continue;
+        };
+        let len = serde_json::to_vec(&event).map_or(usize::MAX, |bytes| bytes.len() + 1);
+        if len > TELEMETRY_BATCH_BYTES {
+            unusable.push(id);
+            continue;
+        }
+        if size + len > TELEMETRY_BATCH_BYTES && !events.is_empty() {
+            chunks.push((std::mem::take(&mut events), std::mem::take(&mut ids)));
+            size = 0;
+        }
+        events.push(event);
+        ids.push(id);
+        size += len;
+    }
+    if !events.is_empty() {
+        chunks.push((events, ids));
+    }
+    if !unusable.is_empty() {
+        chunks.push((Vec::new(), unusable));
+    }
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn add_args(spec: Value) -> AddArgs {
+        let mut value = json!({
+            "condition": {"kind": "end"},
+            "scope": "every",
+            "target": {"api_url": "https://api.test", "slot": "default"},
+        });
+        for (key, v) in spec.as_object().into_iter().flatten() {
+            value[key] = v.clone();
+        }
+        serde_json::from_value(value).expect("add args")
+    }
+
+    fn check(spec: Value) -> Result<ScopeRequest> {
+        checked_scope(&add_args(spec))
+    }
+
+    #[test]
+    fn bad_specs_fail_without_playback() {
+        for spec in [
+            json!({"times": 0}),
+            json!({"scope": "current", "times": 0}),
+            json!({"note": "n".repeat(1001)}),
+            json!({"label": "l".repeat(81)}),
+            json!({"condition": {"kind": "elapsed", "at": {"unit": "percent", "value": 101.0}}}),
+            json!({"scope": {"track": "not a track"}}),
+            json!({"scope": {"track": "spotify:album:4uLU6hMCjMI75M1A2tKUQC"}}),
+        ] {
+            let code = check(spec.clone()).err().map(|e| e.code);
+            assert_eq!(code.as_deref(), Some("invalid_input"), "{spec}");
+        }
+    }
+
+    #[test]
+    fn good_specs_pass_without_playback() {
+        for spec in [
+            json!({}),
+            // Binding to the playing item is checked after the reading, not here.
+            json!({"scope": "current"}),
+            json!({"times": 3, "note": "n".repeat(1000), "label": "l".repeat(80)}),
+            json!({"scope": {"track": "spotify:track:4uLU6hMCjMI75M1A2tKUQC"}}),
+            json!({"scope": {"track": "spotify:episode:4uLU6hMCjMI75M1A2tKUQC"}}),
+            json!({"condition": {"kind": "remaining", "at": {"unit": "millis", "value": 30000}}}),
+        ] {
+            let result = check(spec.clone());
+            assert!(result.is_ok(), "{spec}: {result:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+
+    fn event(id: &str, bytes: usize) -> (String, Value) {
+        (
+            id.to_owned(),
+            json!({"id": id, "type": "cli.command.completed", "data": {"pad": "x".repeat(bytes)}, "metadata": {}}),
+        )
+    }
+
+    #[test]
+    fn telemetry_batches_stay_under_the_gateway_limit() {
+        let batch: Vec<_> = (0..40).map(|i| event(&format!("e{i}"), 4_000)).collect();
+        let chunks = telemetry_chunks(batch);
+        assert!(chunks.len() > 1);
+        let mut seen = 0;
+        for (events, ids) in &chunks {
+            assert_eq!(events.len(), ids.len());
+            assert!(
+                serde_json::to_vec(events)
+                    .map(|b| b.len())
+                    .unwrap_or(usize::MAX)
+                    <= 64 * 1024
+            );
+            seen += ids.len();
+        }
+        assert_eq!(seen, 40);
+    }
+
+    #[test]
+    fn unusable_rows_are_returned_for_dropping() {
+        let batch = vec![
+            event("ok", 10),
+            ("bad".to_owned(), json!({"nope": true})),
+            event("huge", 70_000),
+        ];
+        let chunks = telemetry_chunks(batch);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].1, vec!["ok".to_owned()]);
+        assert!(chunks[1].0.is_empty());
+        assert_eq!(chunks[1].1, vec!["bad".to_owned(), "huge".to_owned()]);
     }
 }

@@ -4,7 +4,7 @@
 import { readFileSync, writeFileSync, mkdirSync, rmSync, copyFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Marked } from "marked";
+import { Marked, Renderer } from "marked";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -32,6 +32,7 @@ const topics = [
 
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 const slug = (s) => s.toLowerCase().replace(/<[^>]+>/g, "").replace(/`/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+const base = new Renderer();
 
 function render(markdown) {
   const toc = [];
@@ -48,12 +49,65 @@ function render(markdown) {
         const external = /^https?:/.test(href);
         return `<a href="${esc(href)}"${title ? ` title="${esc(title)}"` : ""}${external ? ' rel="noopener"' : ""}>${text}</a>`;
       },
+      // A header strip above each block holds the language and the copy button site.js adds,
+      // so the button never covers code at any width.
+      code(token) {
+        const lang = (token.lang || "").split(/\s/)[0];
+        return `<div class="codeblock"><div class="codeblock-head"><span>${esc(lang)}</span></div>${base.code(token)}</div>\n`;
+      },
     },
   });
   let html = marked.parse(markdown);
   // `spotify docs <topic>` references become links to the page.
   html = html.replace(/<code>spotify docs ([a-z]+)<\/code>/g, (m, t) => (topics.some(([n]) => n === t) ? `<a href="/docs/${t}/"><code>spotify docs ${t}</code></a>` : m));
   return { html, toc };
+}
+
+// Inline tokens as plain text: code spans, emphasis and links keep only their text.
+const plain = (tokens) => tokens.map((t) => (t.type === "html" ? "" : t.tokens ? plain(t.tokens) : (t.text ?? " "))).join("");
+
+// Whole sentences within `max` characters. A longer first sentence is kept whole up to 200,
+// beyond that it is cut at a word.
+function clip(text, max = 160) {
+  let out = "";
+  for (const sentence of text.split(/(?<=[.!?])(?<!\b(?:e\.g|i\.e|vs)\.)\s+/)) {
+    if (out && out.length + 1 + sentence.length > max) break;
+    out = out ? `${out} ${sentence}` : sentence;
+  }
+  const cut = out.length <= 200 ? out : `${out.slice(0, out.lastIndexOf(" ", max - 1)).replace(/[,;:]$/, "")}…`;
+  return /[.!?…]$/.test(cut) ? cut : `${cut}.`; // a paragraph that ends in a URL or code span
+}
+
+// A guide's summary for <meta name="description"> and llms.txt: the first prose paragraph of its
+// intro or first section (headings, tables, code and lists are not paragraphs; a lead-in's colon
+// becomes a full stop, and one-line lead-ins like "Rules:" are skipped). A guide without one is
+// summarised by its section headings.
+function summarize(tokens, title) {
+  let sections = 0;
+  for (const t of tokens) {
+    if (t.type === "heading" && t.depth === 2 && ++sections > 1) break;
+    if (t.type !== "paragraph") continue;
+    const text = plain(t.tokens).replace(/\s+/g, " ").trim().replace(/:$/, ".");
+    if (text.split(" ").length >= 5) return clip(text);
+  }
+  const headings = tokens.filter((t) => t.type === "heading" && t.depth === 2).map((t) => plain(t.tokens));
+  return clip(headings.length ? `${title}: ${headings.join(", ")}.` : title);
+}
+
+// Search entries: the intro and each `##` section of a guide, linked to its anchor.
+function sections(tokens, toc, name, title) {
+  const out = [{ topic: name, title, section: null, url: `/docs/${name}/`, text: "" }];
+  let h2 = 0;
+  for (const t of tokens) {
+    if (t.type === "heading" && t.depth === 2) {
+      const { id } = toc[h2++];
+      out.push({ topic: name, title, section: plain(t.tokens), url: `/docs/${name}/#${id}`, text: "" });
+    } else if (t.type !== "heading" || t.depth > 2) {
+      out.at(-1).text += ` ${t.type === "code" ? t.text : t.raw}`;
+    }
+  }
+  for (const entry of out) entry.text = entry.text.replace(/[#`*|>]/g, " ").replace(/-{3,}/g, " ").replace(/\s+/g, " ").trim();
+  return out.filter((entry) => entry.section || entry.text);
 }
 
 const mark = `<svg viewBox="0 0 64 64" aria-hidden="true" class="mark"><rect x="4" y="4" width="56" height="56" rx="14" fill="currentColor"/><path d="M18 40c9-4 19-4 28 2M20 31c8-3.5 17-3.5 25 1.5M22 23c7-3 14.5-3 21 1" stroke="var(--paper)" stroke-width="4" fill="none" stroke-linecap="round"/></svg>`;
@@ -81,13 +135,21 @@ function shell({ title, description, body, path, nav = "" }) {
 ${body}
 <footer class="foot">
   <span>spotify-cli ${esc(version)} · open source · <a href="${repo}">${repo.replace("https://", "")}</a> · <a href="/llms.txt">llms.txt</a> · <a href="/docs/versioning/">Version policy</a></span>
-  <label class="telemetry"><input type="checkbox" id="telemetry-toggle" checked> Share anonymous usage</label>
+  <div class="telemetry" hidden><label><input type="checkbox" id="telemetry-toggle">Anonymous usage stats<span id="telemetry-note">: page path, referrer host, window size; no cookies</span></label> <a href="/docs/telemetry/">Details</a></div>
 </footer>
 <script src="/site.js" defer></script>
 </body>
 </html>
 `;
 }
+
+// Docs search: hidden until site.js wires it up, since it needs the index and script.
+const searchForm = `<form class="search" role="search" hidden>
+<label class="sr-only" for="search-input">Search the docs</label>
+<input id="search-input" type="search" placeholder="Search the docs" autocomplete="off" spellcheck="false" enterkeyhint="go" aria-keyshortcuts="/" aria-controls="search-results"><kbd aria-hidden="true">/</kbd>
+<p class="sr-only" id="search-status" role="status"></p>
+<div class="search-pop" id="search-results" hidden><p class="search-note"></p><ul></ul></div>
+</form>`;
 
 function docsNav(current) {
   const groups = {};
@@ -114,11 +176,11 @@ const llms = [
 for (const [name, title] of topics) {
   const markdown = readFileSync(join(root, "docs", `${name}.md`), "utf8");
   const { html, toc } = render(markdown);
-  const first = markdown.split("\n").find((l) => l && !l.startsWith("#")) || title;
-  const description = first.replace(/[`*]/g, "").slice(0, 160);
+  const tokens = new Marked().lexer(markdown);
+  const description = summarize(tokens, title);
   const tocHtml = toc.length ? `<aside class="toc"><p>On this page</p>${toc.map((t) => `<a href="#${t.id}">${t.text}</a>`).join("")}</aside>` : "";
   const body = `<div class="docs">
-<nav class="side">${docsNav(name)}</nav>
+<div class="side">${searchForm}<nav aria-label="Guides">${docsNav(name)}</nav></div>
 <main class="article"><p class="eyebrow">spotify-cli / Docs</p>${html}
 <p class="offline">Offline: <code>spotify docs ${name}</code> · Source: <a href="${repo}/blob/main/docs/${name}.md">docs/${name}.md</a></p></main>
 ${tocHtml}
@@ -127,7 +189,7 @@ ${tocHtml}
   writeFileSync(join(dist, "docs", name, "index.html"), shell({ title: `${title} · spotify-cli`, description, body, path: `/docs/${name}/` }));
   mkdirSync(join(dist, "markdown"), { recursive: true });
   writeFileSync(join(dist, "markdown", `${name}.md`), markdown);
-  search.push({ topic: name, title, url: `/docs/${name}/`, text: markdown.replace(/[#`*|>]/g, " ").replace(/\s+/g, " ").slice(0, 6000) });
+  search.push(...sections(tokens, toc, name, title));
   sitemap.push(`${origin}/docs/${name}/`);
   llms.push(`- [${title}](${origin}/markdown/${name}.md): ${description}`);
 }
@@ -156,10 +218,12 @@ spotify trigger add --end --scope every</code></pre></article>
   <h2>For Silicons</h2>
   <ol>
     <li><code>spotify iam --json</code> → <code>{"app_id": "spotify", …}</code></li>
-    <li><code>iam silicon-login --app-id spotify --grant-org "$SILICON_ORG" --approve-scopes</code></li>
+    <li><code>cargo install silicon-iam-cli</code> — the official <code>iam</code> CLI, if you do not have it</li>
+    <li><code>iam silicon-login --app-id spotify --grant-org "$SILICON_ORG" --approve-scopes</code> — prints a short-lived token (SLT)</li>
     <li><code>spotify login '&lt;SLT&gt;'</code> — exchanges it and registers you with Ting</li>
     <li><code>spotify trigger add --elapsed 50%</code> — you receive <code>spotify.trigger.fired</code></li>
   </ol>
+  <p>New to IAM, Silicons, SLTs or Ting? <a href="/docs/usage/#concepts">Concepts</a> explains each in a sentence or two.</p>
   <p>Every command documents itself (<code>spotify &lt;command&gt; --help</code>), the whole tree is machine-readable (<code>spotify commands --json</code>), guides are bundled offline (<code>spotify docs</code>), and every error says what failed, why, and the exact fix.</p>
 </section>
 <section class="grid">

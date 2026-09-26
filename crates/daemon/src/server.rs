@@ -297,6 +297,11 @@ async fn doctor(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
             .any(|p| std::path::Path::new(p).exists())
             || std::env::var_os("HOME").is_some_and(|h| std::path::Path::new(&h).join("Applications/Spotify.app").exists());
         checks.push(check("spotify_app_installed", installed, json!(installed), "Install Spotify: https://www.spotify.com/download/mac/ or `brew install --cask spotify`."));
+        // Doctor re-checks: wait out a fail-fast window left by a recent timeout, so this reading
+        // really asks Spotify (and so decides the permission state below).
+        if let Some(left) = crate::macos::backoff_remaining() {
+            std::thread::sleep(left);
+        }
         match d.read() {
             Ok(playback) => {
                 let running = playback.state != PlayerState::NotRunning;
@@ -318,7 +323,18 @@ async fn doctor(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
                 json!({"state": automation.as_str()}),
                 "Spotify is not answering Apple Events. If macOS shows \"spotify-daemon\" wants access to control \"Spotify\", click Allow (it may be behind other windows); otherwise Spotify is busy, retry.",
             )),
-            _ => checks.push(check("automation_permission", true, json!({"state": automation.as_str()}), "")),
+            crate::macos::Automation::Unknown => {
+                // No Apple Event reached Spotify yet (usually it is closed): nothing to report.
+                let mut unknown = check(
+                    "automation_permission",
+                    false,
+                    json!({"state": automation.as_str()}),
+                    "Decided by the first Apple Event to a running Spotify: start it (`spotify launch`), then run `spotify doctor` again.",
+                );
+                unknown["optional"] = json!(true);
+                checks.push(unknown);
+            }
+            crate::macos::Automation::Granted => checks.push(check("automation_permission", true, json!({"state": automation.as_str()}), "")),
         }
         match settings.player() {
             Ok(player) => {
@@ -334,7 +350,7 @@ async fn doctor(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
         let notifications = d.live().notifications;
         checks.push(check("playback_notifications", true, json!({"received": notifications}), ""));
         checks.push(check("daemon", true, json!({"version": VERSION, "pid": std::process::id()}), ""));
-        let ok = checks.iter().all(|c| c["ok"] == json!(true) || c["check"] == json!("spotify_player_warm_instance"));
+        let ok = checks.iter().all(|c| c["ok"] == json!(true) || c.get("optional") == Some(&json!(true)) || c["check"] == json!("spotify_player_warm_instance"));
         Ok(json!({"ok": ok, "checks": checks}))
     })
     .await

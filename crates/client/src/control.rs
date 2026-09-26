@@ -238,6 +238,8 @@ impl Controller<'_> {
             sleep(Duration::from_millis(400));
             match self.status() {
                 Ok(playback) if playback.state != PlayerState::NotRunning => return Ok(playback),
+                // Waiting cannot fix a refusal.
+                Err(error) if error.code == "automation_permission_denied" => return Err(error),
                 _ if Instant::now() > deadline => {
                     return Err(Error::new(
                         "spotify_not_running",

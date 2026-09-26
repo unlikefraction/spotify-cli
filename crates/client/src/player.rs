@@ -8,6 +8,7 @@
 //! before (or even when) nothing happened. Never treat exit 0 as proof; [`crate::control`]
 //! verifies every playback effect against Spotify.app.
 
+use std::borrow::Cow;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -40,6 +41,10 @@ pub struct Output {
     /// Wall time.
     pub elapsed: Duration,
 }
+
+/// `spotify_player search` returns at most this many results per kind and has no option for
+/// more, so larger search limits are rejected rather than silently returning fewer.
+pub const SEARCH_MAX_PER_KIND: u32 = 10;
 
 /// Where `spotify_player` is searched for when it is not on PATH (launchd and Stemcell run with a
 /// minimal PATH).
@@ -150,23 +155,13 @@ impl SpotifyPlayer {
         }
     }
 
-    /// Runs and parses stdout as JSON (`null` becomes `Value::Null`).
+    /// Runs and parses stdout as JSON (`null` becomes `Value::Null`). See [`parse_json`].
     ///
     /// # Errors
     /// Classified failures, or `spotify_player_failed` when stdout is not JSON.
     pub fn json(&self, args: &[&str]) -> Result<Value> {
         let output = self.run(args)?;
-        if output.stdout.is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_str(&output.stdout).map_err(|_| {
-            Error::new(
-                "spotify_player_failed",
-                format!("`spotify_player {}` printed something that is not JSON.", args.join(" ")),
-                "Your spotify_player version may be unsupported (tested with 0.25). Run `spotify doctor`.",
-            )
-            .with_details(serde_json::json!({"stdout": crate::model::truncate(&output.stdout, 400)}))
-        })
+        parse_json(&output.stdout, args)
     }
 
     /// `spotify_player --version`, without requiring auth.
@@ -357,6 +352,12 @@ pub fn classify(stderr: &str, stdout: &str, args: &[&str]) -> Error {
             "Wait a minute and retry.",
         )
         .retryable()
+    } else if lower.contains("status code 400") || lower.contains("400 bad request") {
+        // Spotify answers 400 for ids it cannot parse; the cause is the input, not a bug.
+        Error::invalid(
+            "Spotify rejected the request as malformed (HTTP 400), usually because an id or URI is not valid.",
+            "Spotify ids are 22 letters and digits: pass spotify:<kind>:<id>, https://open.spotify.com/<kind>/<id> or a bare id (find one with `spotify search '<query>'`). If the input is right, report it with `spotify report`.",
+        )
     } else if lower.contains("404")
         || lower.contains("cannot find")
         || lower.contains("no device with name")
@@ -396,6 +397,81 @@ pub fn classify(stderr: &str, stdout: &str, args: &[&str]) -> Error {
     error.with_details(details)
 }
 
+/// Parses spotify_player's JSON stdout (empty becomes `Value::Null`).
+///
+/// spotify_player copies Spotify's strings into its output verbatim, so a playlist name or
+/// description can carry raw control characters (a name typed across two lines), which strict
+/// JSON forbids inside strings. Those are escaped first; nothing outside string literals changes.
+///
+/// # Errors
+/// `spotify_player_failed` when stdout is still not JSON; the hint only suspects the
+/// spotify_player version when the output is not JSON at all.
+pub fn parse_json(stdout: &str, args: &[&str]) -> Result<Value> {
+    let stdout = stdout.trim();
+    if stdout.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&escape_controls_in_strings(stdout)).map_err(|error| {
+        let command = format!("spotify_player {}", args.join(" "));
+        let details = serde_json::json!({
+            "command": command,
+            "stdout": crate::model::truncate(stdout, 400),
+            "parse_error": error.to_string(),
+        });
+        if stdout.starts_with(['{', '[']) {
+            Error::new(
+                "spotify_player_failed",
+                format!("`{command}` printed malformed JSON ({error})."),
+                "Retry once. If it persists, report it with `spotify report` (include the details).",
+            )
+        } else {
+            Error::new(
+                "spotify_player_failed",
+                format!("`{command}` printed text instead of JSON."),
+                "This spotify_player version may print a different format (tested with 0.25). Run `spotify doctor`.",
+            )
+        }
+        .with_details(details)
+    })
+}
+
+/// Escapes raw control characters (U+0000–U+001F) inside JSON string literals. Borrows the input
+/// when there are none.
+fn escape_controls_in_strings(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    // Bytes of `text` before this index are already in `out`.
+    let mut copied = 0;
+    let mut in_string = false;
+    let mut after_backslash = false;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if !in_string {
+            in_string = byte == b'"';
+        } else if after_backslash {
+            after_backslash = false;
+        } else if byte == b'\\' {
+            after_backslash = true;
+        } else if byte == b'"' {
+            in_string = false;
+        } else if byte < 0x20 {
+            out.extend_from_slice(&bytes[copied..index]);
+            match byte {
+                b'\n' => out.extend_from_slice(b"\\n"),
+                b'\r' => out.extend_from_slice(b"\\r"),
+                b'\t' => out.extend_from_slice(b"\\t"),
+                other => out.extend_from_slice(format!("\\u{other:04x}").as_bytes()),
+            }
+            copied = index + 1;
+        }
+    }
+    if copied == 0 {
+        return Cow::Borrowed(text);
+    }
+    out.extend_from_slice(&bytes[copied..]);
+    // Only ASCII bytes were replaced, so the UTF-8 sequences around them are intact.
+    String::from_utf8(out).map_or(Cow::Borrowed(text), Cow::Owned)
+}
+
 fn find_on_path(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
@@ -431,6 +507,10 @@ mod tests {
             c("Bad request: http error: status code 429 Too Many Requests"),
             "rate_limited"
         );
+        assert_eq!(
+            c("Bad request: http error: status code 400 Bad Request"),
+            "invalid_input"
+        );
         assert_eq!(c("Bad request: something odd"), "spotify_player_failed");
         assert_eq!(
             c(
@@ -438,5 +518,38 @@ mod tests {
             ),
             "spotify_player_busy"
         );
+    }
+
+    #[test]
+    fn parses_json_with_raw_control_characters_in_strings() {
+        // The shape `spotify_player search queen` (0.25.1) printed: a playlist name typed across
+        // lines arrives with a raw newline inside the string.
+        let stdout = "{\"tracks\":[],\"playlists\":[{\"id\":\"6S5eKpEJcVEzXdb8TkO3Ud\",\"collaborative\":false,\"name\":\"Mai teri queen aave\nDil di clean aave\",\"owner\":[\"Owner\",\"owner_id\"],\"desc\":\"tab\there \\\"quoted\\\" \\\\ bell\u{7}\"}]}\n";
+        assert!(
+            serde_json::from_str::<Value>(stdout).is_err(),
+            "strict JSON rejects it"
+        );
+        let value = parse_json(stdout, &["search", "queen"]).expect("parses");
+        let playlist = &value["playlists"][0];
+        assert_eq!(playlist["name"], "Mai teri queen aave\nDil di clean aave");
+        assert_eq!(playlist["desc"], "tab\there \"quoted\" \\ bell\u{7}");
+        assert_eq!(playlist["owner"][0], "Owner");
+        // Valid JSON and whitespace between tokens are untouched.
+        assert_eq!(
+            escape_controls_in_strings("{\n\t\"a\": \"b\\n\"\n}"),
+            "{\n\t\"a\": \"b\\n\"\n}"
+        );
+        assert_eq!(parse_json("  ", &["x"]).expect("empty"), Value::Null);
+    }
+
+    #[test]
+    fn unparseable_output_says_why() {
+        let malformed = parse_json("{\"tracks\": [", &["search", "x"]).expect_err("malformed");
+        assert_eq!(malformed.code, "spotify_player_failed");
+        assert!(malformed.message.contains("malformed JSON"));
+        assert!(!malformed.hint.contains("version"), "{}", malformed.hint);
+        let text = parse_json("Usage: spotify_player search", &["search", "x"]).expect_err("text");
+        assert!(text.message.contains("instead of JSON"));
+        assert!(text.hint.contains("version"));
     }
 }

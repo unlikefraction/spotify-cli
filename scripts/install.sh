@@ -97,11 +97,20 @@ install_silicon_spotify() {
       case "${SHELL:-}" in
         */zsh) rc="$HOME/.zshrc"; line="export PATH=\"$dir:\$PATH\"" ;;
         */bash) rc="$HOME/.bash_profile"; [ "$os" = Linux ] && rc="$HOME/.bashrc"; line="export PATH=\"$dir:\$PATH\"" ;;
-        */fish) rc="$HOME/.config/fish/config.fish"; line="fish_add_path $dir"; mkdir -p "$HOME/.config/fish" ;;
+        */fish) rc="$HOME/.config/fish/config.fish"; line="fish_add_path '$dir'"; mkdir -p "$HOME/.config/fish" ;;
         *) rc="$HOME/.profile"; line="export PATH=\"$dir:\$PATH\"" ;;
       esac
-      if ! grep -q 'silicon-spotify' "$rc" 2>/dev/null; then
-        printf '\n# silicon-spotify\n%s\n' "$line" >>"$rc"
+      # Skip only when a block we wrote (marker line, then this exact line) already adds this
+      # directory; another install directory, or the text elsewhere in the file, does not count.
+      # "# silicon-spotify" is the marker older installers wrote.
+      if [ -f "$rc" ] && SPOTIFY_RC_LINE="$line" awk '
+        { sub(/\r$/, "") }
+        (prev == "# spotify-cli" || prev == "# silicon-spotify") && $0 == ENVIRON["SPOTIFY_RC_LINE"] { found = 1 }
+        { prev = $0 }
+        END { exit !found }' "$rc" 2>/dev/null; then
+        say "  $rc already adds $dir to PATH (open a new shell, or: export PATH=\"$dir:\$PATH\")"
+      else
+        printf '\n# spotify-cli\n%s\n' "$line" >>"$rc"
         say "  added $dir to PATH in $rc (open a new shell, or: export PATH=\"$dir:\$PATH\")"
       fi
       ;;
@@ -153,7 +162,7 @@ install_silicon_spotify() {
   # 4. Running -----------------------------------------------------------------------------------
   step 4/5 "Starting Spotify and spotify-daemon (and at every login)"
   /usr/bin/open -g -j -a Spotify 2>/dev/null || true
-  started=1
+  started=1 automation=unknown # never inherited from the environment: it picks the final reminder
   if "$dir/spotify" daemon install >/dev/null 2>"$tmp/daemon.err"; then
     say "  spotify-daemon: running, starts at login (launchd agent com.unlikefraction.spotify.daemon)"
   elif "$dir/spotify" daemon start >/dev/null 2>>"$tmp/daemon.err"; then
@@ -194,7 +203,12 @@ install_silicon_spotify() {
   say "  spotify status              what is playing"
   say "  spotify login '<SLT>'       Silicons: identity for Ting triggers (spotify login --help)"
   say ""
-  say "macOS will ask once whether spotify-daemon may control Spotify: click OK."
+  # Repeat the one thing still needed from the person at the keyboard, if anything.
+  case "${automation:-unknown}" in
+    granted) ;;
+    denied) say "spotify-daemon may not control Spotify yet: System Settings → Privacy & Security → Automation → spotify-daemon → Spotify." ;;
+    *) say "macOS asks once whether spotify-daemon may control Spotify: click Allow." ;;
+  esac
   say "Docs: https://spotify.unlikefraction.com/docs · spotify docs"
 }
 

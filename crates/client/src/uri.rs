@@ -89,7 +89,7 @@ impl FromStr for Kind {
 pub struct SpotifyUri {
     /// What the id names.
     pub kind: Kind,
-    /// The base62 id (usually 22 characters).
+    /// The base62 id (22 characters).
     pub id: String,
 }
 
@@ -97,7 +97,7 @@ impl SpotifyUri {
     /// Builds a URI after validating the id.
     ///
     /// # Errors
-    /// Returns `invalid_input` when the id is empty, too long or not alphanumeric.
+    /// Returns `invalid_input` when the id is not 22 base62 characters (letters and digits).
     pub fn new(kind: Kind, id: &str) -> Result<Self> {
         validate_id(id)?;
         Ok(Self {
@@ -168,10 +168,13 @@ impl SpotifyUri {
         }
         match default_kind {
             Some(kind) => Self::new(kind, value),
-            None => Err(Error::invalid(
-                format!("`{value}` is a bare id, but its kind is unknown."),
-                "Pass a full URI such as spotify:track:<id> or spotify:playlist:<id>, or an open.spotify.com link.",
-            )),
+            None => {
+                validate_id(value)?;
+                Err(Error::invalid(
+                    format!("`{value}` is a bare id, but its kind is unknown."),
+                    "Pass a full URI such as spotify:track:<id> or spotify:playlist:<id>, or an open.spotify.com link.",
+                ))
+            }
         }
     }
 }
@@ -182,20 +185,30 @@ impl fmt::Display for SpotifyUri {
     }
 }
 
+/// The forms [`SpotifyUri::parse`] accepts, for hints.
+pub const ACCEPTED_FORMS: &str = "Accepted forms: spotify:<kind>:<id>, https://open.spotify.com/<kind>/<id>, or a bare 22-character id (with --type where the kind is not implied).";
+
+/// Length of every Spotify id (base62).
+pub const ID_LEN: usize = 22;
+
 fn malformed(value: &str) -> Error {
     Error::invalid(
         format!("`{value}` is not a Spotify reference this CLI understands."),
-        "Accepted forms: spotify:<kind>:<id>, https://open.spotify.com/<kind>/<id>, or a bare 22-character id with --type.",
+        ACCEPTED_FORMS,
     )
 }
 
+/// Checks the id's shape locally, so a typo fails as `invalid_input` instead of reaching Spotify
+/// (which answers 400 or 404).
 fn validate_id(id: &str) -> Result<()> {
-    if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+    if id.len() != ID_LEN || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return Err(Error::invalid(
             format!(
-                "`{id}` is not a Spotify id; ids are base62 (letters and digits), usually 22 characters."
+                "`{id}` is not a Spotify id: ids are exactly {ID_LEN} letters and digits (base62)."
             ),
-            "Copy the id from `spotify search` output or a share link.",
+            format!(
+                "{ACCEPTED_FORMS} Find ids with `spotify search '<query>'` or copy a share link."
+            ),
         ));
     }
     Ok(())
@@ -221,16 +234,47 @@ mod tests {
         let bare = SpotifyUri::parse(id, Some(Kind::Album)).expect("bare");
         assert_eq!(bare.uri(), format!("spotify:album:{id}"));
         let legacy =
-            SpotifyUri::parse("spotify:user:someone:playlist:37i9dQZF1DX", None).expect("legacy");
+            SpotifyUri::parse("spotify:user:someone:playlist:37i9dQZF1DXcBWIGoYBM5M", None)
+                .expect("legacy");
         assert_eq!(legacy.kind, Kind::Playlist);
     }
 
     #[test]
     fn rejects_garbage_with_guidance() {
-        let error = SpotifyUri::parse("hello world", None).expect_err("bare without kind");
+        let error = SpotifyUri::parse("hello world", None).expect_err("not an id");
         assert_eq!(error.code, "invalid_input");
+        assert!(
+            error.message.contains("not a Spotify id"),
+            "{}",
+            error.message
+        );
+        let error =
+            SpotifyUri::parse("0BxE4FqsDD1Ot4YuBXwAPp", None).expect_err("bare without kind");
+        assert!(
+            error.message.contains("kind is unknown"),
+            "{}",
+            error.message
+        );
         assert!(SpotifyUri::parse("https://example.com/track/abc", None).is_err());
-        assert!(SpotifyUri::parse("spotify:podcast:abc", None).is_ok());
+        assert!(SpotifyUri::parse("spotify:podcast:4rOoJ6Egrf8K2IrywzwOMk", None).is_ok());
         assert!(SpotifyUri::parse("spotify:track:ab-c", None).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_ids_before_they_reach_spotify() {
+        for (input, kind) in [
+            ("garbage", Some(Kind::Track)),
+            ("notatrack", Some(Kind::Track)),
+            ("spotify:track:abc", None),
+            ("https://open.spotify.com/album/78bpIziExqiI9qztvNFlQ", None),
+            ("0BxE4FqsDD1Ot4YuBXwAPpX", Some(Kind::Track)),
+            ("0BxE4FqsDD1Ot4YuBXwAP_", Some(Kind::Track)),
+        ] {
+            let error = SpotifyUri::parse(input, kind).expect_err(input);
+            assert_eq!(error.code, "invalid_input", "{input}");
+            assert!(error.hint.contains("spotify:<kind>:<id>"), "{input}");
+        }
+        // A well-formed id passes even when Spotify has no such item (that is `not_found`).
+        assert!(SpotifyUri::parse("0000000000000000000000", Some(Kind::Playlist)).is_ok());
     }
 }

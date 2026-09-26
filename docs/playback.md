@@ -1,5 +1,8 @@
 # Playback control
 
+How `play`, `pause`, `seek` and the other controls reach Spotify.app, how every result is
+verified, and what happens when the first path fails.
+
 ## The rule: spotify_player first, verified, AppleScript fallback
 
 spotify-cli drives Spotify through two tools:

@@ -166,6 +166,85 @@ fn print_error(json: bool, error: &Error) {
     }
 }
 
+/// A clap parse error as a `usage` error, keeping everything clap says: the missing arguments,
+/// the possible values, its tips and the usage line.
+///
+/// clap renders `error: <what>` with indented continuation lines, then blank-line separated
+/// `tip:` lines, `Usage: …` and a `--help` pointer.
+fn usage_error(rendered: &str) -> Error {
+    let mut lines = rendered.lines();
+    let first = lines
+        .next()
+        .unwrap_or("invalid arguments")
+        .trim_start_matches("error: ")
+        .trim()
+        .to_owned();
+    let mut listed = Vec::new();
+    let mut possible: Vec<String> = Vec::new();
+    let mut tips = Vec::new();
+    let mut usage = None;
+    let mut in_error_block = true;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            in_error_block = false;
+        } else if let Some(values) = trimmed
+            .strip_prefix("[possible values: ")
+            .and_then(|v| v.strip_suffix(']'))
+        {
+            possible = values.split(", ").map(str::to_owned).collect();
+        } else if let Some(tip) = trimmed.strip_prefix("tip: ") {
+            tips.push(tip.to_owned());
+        } else if trimmed.starts_with("Usage:") {
+            usage = Some(trimmed.to_owned());
+        } else if in_error_block {
+            listed.push(trimmed.to_owned());
+        }
+    }
+    let message = if listed.is_empty() {
+        first
+    } else {
+        format!("{first} {}", listed.join(", "))
+    };
+    let mut hint = Vec::new();
+    if !possible.is_empty() {
+        hint.push(format!("Possible values: {}.", possible.join(", ")));
+    }
+    for tip in &tips {
+        let mut chars = tip.chars();
+        let tip: String = chars
+            .next()
+            .map(|c| c.to_uppercase().chain(chars).collect())
+            .unwrap_or_default();
+        hint.push(format!("{}.", tip.trim_end_matches('.')));
+    }
+    if let Some(usage) = &usage {
+        // `<QUERY>...` already ends in dots.
+        hint.push(if usage.ends_with('.') {
+            usage.clone()
+        } else {
+            format!("{usage}.")
+        });
+    }
+    hint.push("Run the command with --help for arguments and examples.".into());
+    let mut details = serde_json::Map::new();
+    if !possible.is_empty() {
+        details.insert("possible_values".into(), json!(possible));
+    }
+    if let Some(usage) = usage {
+        details.insert(
+            "usage".into(),
+            json!(usage.trim_start_matches("Usage:").trim()),
+        );
+    }
+    let error = Error::new("usage", message, hint.join(" "));
+    if details.is_empty() {
+        error
+    } else {
+        error.with_details(Value::Object(details))
+    }
+}
+
 fn build_ctx(cli: &Cli) -> Result<Ctx> {
     let home = Home::resolve()?;
     let config = home.config()?;
@@ -276,28 +355,7 @@ fn main() {
                     std::process::exit(2);
                 }
                 _ if wants_json => {
-                    let message = error.render().to_string();
-                    let first = message
-                        .lines()
-                        .next()
-                        .unwrap_or("invalid arguments")
-                        .trim_start_matches("error: ")
-                        .to_owned();
-                    let usage = message
-                        .lines()
-                        .find(|l| l.starts_with("Usage:"))
-                        .unwrap_or_default()
-                        .to_owned();
-                    print_error(
-                        true,
-                        &Error::new(
-                            "usage",
-                            first,
-                            format!(
-                                "{usage}. Run the command with --help for arguments and examples."
-                            ),
-                        ),
-                    );
+                    print_error(true, &usage_error(&error.render().to_string()));
                     std::process::exit(2);
                 }
                 _ => {
@@ -345,10 +403,96 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory as _;
+    use serde_json::json;
 
     #[test]
     fn grammar_is_consistent() {
         // Catches duplicate argument ids, bad defaults and conflicting names at test time.
         crate::args::Cli::command().debug_assert();
+    }
+
+    fn parse_error(args: &[&str]) -> silicon_spotify_client::Error {
+        let error = crate::args::Cli::command()
+            .try_get_matches_from(args)
+            .expect_err("usage error");
+        super::usage_error(&error.render().to_string())
+    }
+
+    #[test]
+    fn usage_errors_keep_what_clap_says() {
+        let error = parse_error(&["spotify", "config", "set", "--json"]);
+        assert_eq!(error.code, "usage");
+        assert_eq!(
+            error.message,
+            "the following required arguments were not provided: <JSON>"
+        );
+        assert!(
+            error
+                .hint
+                .contains("Usage: spotify config set --json <JSON>."),
+            "{}",
+            error.hint
+        );
+        let error = parse_error(&["spotify", "search", "x", "--type", "bogus", "--json"]);
+        assert_eq!(error.message, "invalid value 'bogus' for '--type <KINDS>'");
+        assert!(
+            error
+                .hint
+                .starts_with("Possible values: track, album, artist, playlist, show, episode."),
+            "{}",
+            error.hint
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .map(|d| d["possible_values"][0].clone()),
+            Some(json!("track"))
+        );
+        let error = parse_error(&["spotify", "search", "x", "--limt", "3"]);
+        assert!(
+            error.hint.contains("A similar argument exists: '--limit'."),
+            "{}",
+            error.hint
+        );
+        assert!(
+            error.hint.contains("<QUERY>... Run the command"),
+            "no extra period after `...`: {}",
+            error.hint
+        );
+        let error = parse_error(&["spotify", "trigger", "add"]);
+        assert!(error.message.contains("--remaining"), "{}", error.message);
+        assert!(!error.hint.starts_with('.'), "{}", error.hint);
+    }
+
+    /// Help is wrapped at 100 columns (`max_term_width`), so an indented example line longer
+    /// than that would be broken in two and no longer copyable.
+    #[test]
+    fn help_examples_fit_on_one_line() {
+        fn walk(command: &clap::Command, path: &str, long: &mut Vec<String>) {
+            let texts = [
+                command.get_about(),
+                command.get_long_about(),
+                command.get_after_help(),
+                command.get_after_long_help(),
+            ];
+            for text in texts.into_iter().flatten() {
+                for line in text.to_string().lines() {
+                    if line.starts_with("  ") && line.chars().count() > 100 {
+                        long.push(format!("{path}: {line}"));
+                    }
+                }
+            }
+            for sub in command.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), long);
+            }
+        }
+        let mut long = Vec::new();
+        walk(&crate::args::Cli::command(), "spotify", &mut long);
+        assert!(
+            long.is_empty(),
+            "example lines over 100 columns:\n{}",
+            long.join("\n")
+        );
     }
 }

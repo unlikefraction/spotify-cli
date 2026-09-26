@@ -21,9 +21,9 @@ deploy/         backend deployment (systemd, Caddy, CloudFormation), Honeycomb a
 ## Use the library
 
 ```toml
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.1" }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.2" }
 # no HTTP at all:
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.1", default-features = false }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.2", default-features = false }
 ```
 
 ```rust
@@ -45,7 +45,15 @@ let outcome = spotify.seek(SeekTarget::parse("50%")?)?;   // Outcome { via, fall
 
 The trigger engine is pure: feed `trigger::Tracker::observe` readings, pass the events to
 `trigger::evaluate`, deliver the returned `Firing`s however you like (`Firing::data()` is the Ting
-payload, `Firing::key()` the idempotency key).
+payload, `Firing::key()` the idempotency key). `trigger::validate_request` checks a request's
+note, label, `times` and percentage without any playback state, so run it before reading Spotify.
+
+`uri::SpotifyUri::parse` accepts only ids of exactly 22 base62 characters (`uri::ACCEPTED_FORMS`
+lists the forms), so malformed references fail as `invalid_input` before they reach Spotify.
+`player::parse_json` reads spotify_player's JSON even when strings hold raw control characters,
+and `model::item_view` turns its `get item` output for albums and artists into `kind`, `item` and
+per-kind lists. spotify_player returns at most `player::SEARCH_MAX_PER_KIND` (10) search results
+per kind.
 
 ## Talk to the daemon
 

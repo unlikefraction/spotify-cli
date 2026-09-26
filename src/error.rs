@@ -8,6 +8,9 @@ use serde_json::json;
 /// Result alias.
 pub type AppResult<T> = Result<T, AppError>;
 
+/// The hint an error without a specific one is sent with.
+const GENERIC_HINT: &str = "See `spotify docs api` for the request shape; if it persists, report it with `spotify report`.";
+
 /// A failure with a stable code, a status and an agent-readable hint.
 #[derive(Clone, Debug)]
 pub struct AppError {
@@ -55,6 +58,19 @@ impl AppError {
         )
     }
 
+    /// 401 `slt_rejected`: IAM refused the short-lived login token itself.
+    ///
+    /// 401 like `unauthenticated`, so clients that only branch on the status still treat it as
+    /// "not signed in"; the code and hint name the SLT instead of a session refresh.
+    pub fn slt_rejected() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "slt_rejected",
+            "IAM rejected the short-lived login token (SLT): it expired (SLTs last about 2 minutes), was already used, or was minted for another app.",
+            "Mint a fresh SLT for app `spotify` and log in right away: iam silicon-login --app-id spotify --grant-org <org> --approve-scopes, then spotify login '<SLT>'.",
+        )
+    }
+
     /// 403 `forbidden`.
     pub fn forbidden(message: impl Into<String>, hint: impl Into<String>) -> Self {
         Self::new(StatusCode::FORBIDDEN, "forbidden", message, hint)
@@ -78,6 +94,16 @@ impl AppError {
             "rate_limited",
             "Too many requests.",
             "Wait a moment and retry.",
+        )
+    }
+
+    /// 413 `payload_too_large`.
+    pub fn payload_too_large(message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            message,
+            hint,
         )
     }
 
@@ -111,11 +137,18 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        let retryable = self.retryable();
+        // Every documented error carries a next step; a call site that forgot one still gets this.
+        let hint = if self.hint.trim().is_empty() {
+            GENERIC_HINT.to_owned()
+        } else {
+            self.hint
+        };
         let mut body = json!({"error": {
             "code": self.code,
             "message": self.message,
-            "hint": self.hint,
-            "retryable": self.retryable(),
+            "hint": hint,
+            "retryable": retryable,
         }});
         if let Some(details) = &self.details {
             body["error"]["details"] = details.clone();
