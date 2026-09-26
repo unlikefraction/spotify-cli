@@ -21,9 +21,9 @@ deploy/         backend deployment (systemd, Caddy, CloudFormation), Honeycomb a
 ## Use the library
 
 ```toml
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.3" }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.4" }
 # no HTTP at all:
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.3", default-features = false }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.4", default-features = false }
 ```
 
 ```rust
@@ -93,11 +93,17 @@ The socket accepts only the same OS user. Some fields a client may rely on:
 
 - `queue.add` takes `{"uris": […], "next": bool, "known": [{"uri", "name", "by", "duration_ms"}]}`;
   `known` (optional) holds facts the caller already has, such as the search hit it picked, so the
-  daemon need not look them up. Older daemons ignore it.
+  daemon need not look them up; it looks up only the fields `known` lacks (empty strings count as
+  missing). Older daemons ignore it. The answer `{"added", "queue"}` may carry
+  `metadata_pending` (the `q_…` ids of added episodes whose facts the daemon still looks up in
+  the background) and `note`.
 - `track.info` adds `liked: true|false` for songs when the Liked Songs check answers in 2.5 s.
 - `spotify.launch` answers `{"launched", "already_running", "playback"}`.
 - `player.next` may carry `skipped` (a managed item whose hand-off was still in flight).
 - `queue.list`'s `spotify_upcoming` may carry `current_repeats_left_out` and `note`.
+- `player.status` with `{"full": true}` may set `web.relinked: true` (the Web API plays
+  Spotify.app's song under another id); `player.like` then refuses with a non-retryable
+  `track_mismatch` whose `details` carry `relinked: true` and `matched_by`.
 
 ## Build and test
 

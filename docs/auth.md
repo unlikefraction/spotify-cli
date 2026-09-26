@@ -87,7 +87,8 @@ spotify-cli also reads two things from that cache. The Spotify user id in `crede
 your Liked Songs list, so `spotify play --liked` can play it through AppleScript. The cached
 access tokens serve two read-only Web API lookups spotify_player has no command for: whether a
 song is in Liked Songs (`liked` in `spotify track`) and an episode's name, show and length
-(`spotify queue add`). Those requests go only to `https://api.spotify.com` (HTTPS, no
+(`spotify queue add`, and later `spotify queue` or the daemon in the background when a first
+lookup failed). Those requests go only to `https://api.spotify.com` (HTTPS, no
 redirects); tokens are never logged or stored anywhere else, and after a 429 no lookup is sent
 until Spotify's `Retry-After` has passed (30 s when it gives none, at most 10 minutes).
 

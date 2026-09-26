@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.1.4 — 2026-09-26
+
+Daemon and its spotify_player:
+
+- The warm spotify_player re-reads playback every 20 s instead of every 3 s. The 3 s poll (10
+  GETs per 30-second window) kept the owner's own client ID rate-limited even while idle: a 429
+  about every 30 s, each `Retry-After` (6–15 s) freezing spotify_player's view and stalling
+  commands for that long (`spotify track` and `queue add --search` took about 9 s, `like` refused
+  a song the view had not caught up with). 20 s is 1–2 GETs per window, so commands keep most of
+  the quota. A positive `playback_refresh_duration_in_ms` in your `app.toml` is now kept when it
+  is slower, and raised to 10 s when faster. `spotify daemon status` reads
+  "playback refresh every 20 s" (`refresh_ms: 20000`). The first daemon start after the update
+  replaces the 0.1.3 copy.
+- spotify_player's view can now be up to about 20 s behind a change made in Spotify.app. Commands
+  that depend on it already compare it with Spotify.app first. The queue's resume point, which
+  took the interrupted context from that view unchecked, now reads the Web API once when the view
+  names another item than the Web API's queue. A list started moments before the queue
+  interrupts it is now the one resumed, not the list before it.
+
+Playback control:
+
+- Relinked songs (Spotify plays the same recording from another release under another id, so
+  Spotify.app and the Web API name different ids) are recognised: by the Web API item's
+  `linked_from`, or by the same title, a length within 1 s and the same album name.
+  `spotify status --full` counts such a song as the current item: `web.relinked: true` (new,
+  present only when true), no `web.stale` and no `web_state_stale` warning, served from
+  spotify_player's memory instead of a fresh Web API read on every call. Before, it was stale
+  forever, with a hint to retry in a few seconds. The checks before spotify_player's relative
+  seek, `next` and `previous`, and the context kept to restore after a failed start, also count
+  it as Spotify.app's song.
+- `like` and `unlike` on a relinked song refuse at once, without the volume nudge and the wait,
+  with `track_mismatch` that is now not retryable: spotify_player would save or remove the
+  substitute's id, not the one Spotify.app shows. `details` add `relinked: true` and `matched_by`
+  (`linked_from` or `title_length_album`); the hint points to the heart in Spotify.app.
+- The `web_state_stale` hint for another item now says the Web API usually catches up within
+  seconds, and that if it keeps reporting another item, `web` describes that item.
+- `play --liked` without `--random` plays Liked Songs in list order from its first song. A
+  shuffle Spotify kept for Liked Songs (from an earlier `--random`, or set in Spotify.app) is
+  turned off, and stays off, and the list is started again; before, it played shuffled and
+  always from the same song.
+- `play --liked --random` switches Liked Songs' shuffle off and on, so Spotify draws a new order,
+  then skips once, so it starts at a random song every time; before, a kept shuffle started on
+  the same song again and again.
+- Each of those steps is checked in Spotify.app: one that does not show is a retryable
+  `verification_failed` naming the step (Liked Songs keeps playing), never a success. A Liked
+  Songs start that does not show within 2.5 s fails then (with `--random` it took about 5 s, and
+  a start that showed late counted as a success without its shuffle step).
+
+Queue:
+
+- Queued episodes get their name, show and length more reliably. What the caller knows (the
+  search hit of `queue add --search`) is kept field by field and the rest is looked up, so an
+  episode picked with `--search` gets its show; an empty name or show counts as missing.
+- Facts a lookup did not get are looked up again: after a rate limit, in the background once
+  `Retry-After` has passed (for up to 10 minutes), and after other failures up to 3 tries per
+  item; `spotify queue` also looks them up itself for up to 2.5 s. Before, an episode queued
+  while Spotify was rate-limiting stayed `episode <id>` for good. When a lookup is left to the
+  background, the `queue add` reply carries `metadata_pending` (the queued item ids) and a
+  `note`.
+- The `spotify queue` note on repeats of the item playing now names its kind ("the track
+  playing now") and gives a cause (repeat-one, no context, or nothing else up next in its album
+  or playlist) only when spotify_player's view of that item shows it and Spotify.app's repeat flag
+  agrees; otherwise it names none. Before, it blamed an episode without a context or repeat-one,
+  also for a track at the end of its album with repeat off.
+
 ## 0.1.3 — 2026-09-26
 
 Playback control:

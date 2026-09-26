@@ -125,6 +125,8 @@ pub fn playback(p: &Value) -> String {
     }
     if stale {
         flags.push("web data out of date".into());
+    } else if p.pointer("/web/relinked").and_then(Value::as_bool) == Some(true) {
+        flags.push("relinked".into());
     }
     if !flags.is_empty() {
         let _ = writeln!(out, "  {}", flags.join(" · "));
@@ -533,6 +535,9 @@ pub fn queue_added(v: &Value) -> String {
     );
     for item in &added {
         let _ = write!(out, "\n  + {}", queue_item_label(item));
+    }
+    if let Some(note) = v.get("note").and_then(Value::as_str) {
+        let _ = write!(out, "\n{}", one_line(note));
     }
     out
 }
@@ -1236,8 +1241,8 @@ mod tests {
         let owner = json!({"pid": 4242, "parent_pid": 1, "kind": "your_spotify_player", "command": "spotify_player"});
         for (warm, expected) in [
             (
-                json!({"state": "running", "pid": 812, "port": 8080, "refresh_ms": 3000, "port_owner_pid": 812, "serves_cli": true}),
-                "running (pid 812, 127.0.0.1:8080, playback refresh every 3 s, serves spotify-cli)",
+                json!({"state": "running", "pid": 812, "port": 8080, "refresh_ms": 20000, "port_owner_pid": 812, "serves_cli": true}),
+                "running (pid 812, 127.0.0.1:8080, playback refresh every 20 s, serves spotify-cli)",
             ),
             (
                 json!({"state": "running", "pid": 812, "port": 8080, "refresh_ms": 1500, "serves_cli": null,

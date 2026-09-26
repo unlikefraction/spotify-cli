@@ -69,9 +69,19 @@ worse on the desktop app. They normally report `via: applescript` with no `fallb
   from its `credentials.json`), so `next` and `previous` stay in it. spotify_player's
   `playback start liked` (up to `--limit` tracks, default 200, as a list of ids that also empties
   the desktop app) runs only when that user id is unknown or under strategy `spotify_player`.
-  `--random` turns on shuffle for Liked Songs and skips to a random song; Spotify remembers
-  shuffle per list, so it stays on for Liked Songs afterwards. Without `--random`, Liked Songs
-  keeps its own shuffle setting.
+  Spotify keeps a shuffle setting per list and switches to Liked Songs' own when the list starts;
+  shuffled, it starts at the song its kept order starts with, the same one every time. So once
+  AppleScript's start shows:
+  - Without `--random` it plays in list order from its first song. A kept shuffle, also one set
+    in Spotify.app, is turned off (it stays off for Liked Songs) and the list is started again,
+    so the shuffled start plays for a moment first; the result shows `shuffling: false`.
+  - `--random` switches shuffle off and on, so Spotify draws a new order, then skips once, so
+    every start is a random song. Shuffle stays on for Liked Songs until a plain `play --liked`
+    turns it off.
+  - Each step is checked in Spotify.app. When the start does not show within 2.5 s the error is
+    `verification_failed` (retryable) at once, and no shuffle step is sent. When a shuffle
+    change, the restart in order or the skip does not show, the error is `verification_failed`
+    (retryable) saying which step; Liked Songs keeps playing.
 
 Albums, playlists, artists, radios and resume follow the rule: spotify_player first.
 
@@ -92,13 +102,18 @@ playing. That memory can lag behind Spotify.app, so before such a command the co
 | `next`, `previous` | it has playback loaded (`next` also: the Web API allows skipping from this item, else `not_allowed_in_context` and AppleScript skips) |
 | `seek` | it is on the item Spotify.app plays |
 | `repeat` | always; it steps from the mode it believes and each step is confirmed ([Repeat](#repeat)) |
-| `like`, `unlike` | its track is the song Spotify.app plays ([Like and unlike](#like-and-unlike)) |
+| `like`, `unlike` | its track is the song Spotify.app plays, by id ([Like and unlike](#like-and-unlike)) |
+
+A song Spotify plays under another id than Spotify.app shows counts as the same item, except for
+`like` and `unlike` ([Relinked songs](#relinked-songs)).
 
 When they disagree under `auto`, AppleScript makes the change at once and `fallback.reason.code`
 is `state_mismatch` (`details.spotify_player` and `details.spotify_app` say what each believes).
 Under strategy `spotify_player`, `state_mismatch` is the error (retryable: retry after the next
-track change, or run `spotify daemon restart`). The daemon's spotify_player refreshes its view
-every 3 s (`spotify docs daemon`), so this is rare.
+track change, or run `spotify daemon restart`). The daemon's spotify_player re-reads playback
+every 20 s (by default) and right after its own commands (`spotify docs daemon`), so after a change made in
+Spotify.app its view can be up to about 20 s behind; under `auto` that only means AppleScript
+makes the change.
 
 ## Refusals are noticed at once
 
@@ -128,7 +143,7 @@ wait for the timeout as before.
 | `play <track> --context <list>` | AppleScript `play track <uri> in context <list>` | — | that track playing |
 | `play <album/playlist/artist>` | `playback start context` (`--shuffle`) | `play track <uri>` | a new item playing |
 | `play <show>` | AppleScript `play track <uri>` | — | a new item playing |
-| `play --liked` | AppleScript: the Liked Songs list | — | a new item playing |
+| `play --liked` | AppleScript: the Liked Songs list, then its shuffle steps | — | a new item playing, then each step |
 | `play --radio` | `playback start radio` | none | a new item playing |
 | `pause` | `playback pause` | `pause` | state is not playing |
 | `toggle` | `playback pause` or `playback play` | `pause` or `play` | state flipped |
@@ -188,8 +203,12 @@ playing. So `like` and `unlike`:
   1.1 s for it to catch up;
 - refuse with `track_mismatch` (retryable, nothing changed; `details`: `spotify_app`,
   `spotify_player`, `catch_up_failed`) when it does not;
-- fail with `track_mismatch` (not retryable) when spotify_player's track changed while the
-  command ran, because the like may have hit another song: check `spotify library liked`.
+- refuse at once, without the nudge, when spotify_player plays the same song under another id
+  (a [relinked song](#relinked-songs)): `track_mismatch`, not retryable, nothing changed, with
+  `details.relinked: true`;
+- fail with `track_mismatch` (not retryable, no `relinked`) when spotify_player's track changed
+  while the command ran, because the like may have hit another song: check
+  `spotify library liked`.
 
 ## When a start fails
 
@@ -203,23 +222,49 @@ was paused. The error's `details.restored` holds the playback afterwards, or
 
 `spotify status` reads Spotify.app only (~50 ms). `spotify status --full` adds what only the Web
 API knows, under `web`: `context_uri`, `context_type`, `device`, `repeat_state` (tells repeat-one
-apart), `shuffle_state`, plus `item_uri`, `is_playing`, `source` and `stale` (present only when
-true).
+apart), `shuffle_state`, plus `item_uri`, `is_playing`, `source`, and `stale` and `relinked`
+(each present only when true).
 
 - `source: spotify_player`: the running instance's memory, used when it agrees with Spotify.app
-  (same item, repeat and shuffle; a play state that disagrees is left out).
+  (same item, relinked included, repeat and shuffle; a play state that disagrees is left out).
 - `source: web_api`: otherwise a one-shot Web API read (a separate spotify_player sign-in plus a
   request, 1–4 s). An agent polling `status --full` while the memory is out of date adds that
   Web API load each time.
 - `stale: true`: even that read is for another item (or failed, and the memory is shown).
   Repeat and shuffle that contradict Spotify.app are left out, and the warning `web_state_stale`
-  says why.
+  says why (retryable: the Web API usually catches up within seconds of a change in Spotify.app;
+  if it keeps reporting another item, `web` describes that item, not the one Spotify.app plays).
+- `relinked: true` (present only when true): the Web API plays Spotify.app's song under another
+  id, so `item_uri` differs from `track.uri`. That is current, not stale: no `web_state_stale`,
+  and the memory can serve it (`source: spotify_player`) without a Web API read each time
+  ([Relinked songs](#relinked-songs)).
 
 Other warnings: `no_active_device` (the Web API sees no playback), `timeout`, `rate_limited` and
 spotify_player's own errors. Warnings never fail the command; the human output prints them as
 `note:` lines. When `web.stale` is true the human output takes repeat from Spotify.app's own flag
 (never "repeat one" from out-of-date data) and ends the flags line with "web data out of date".
 Time left, `(-m:ss)`, is rounded to the nearest second (19.6 s left shows 0:20).
+
+## Relinked songs
+
+When the release a song was saved or started from cannot play in your market, Spotify plays the
+same recording from another release (track relinking). Spotify.app then shows the id it was asked
+for, with the substitute's title, album and length, while the Web API, and so spotify_player,
+reports the substitute's id. spotify-cli counts the two as one song when the Web API item's
+`linked_from` names Spotify.app's id, or when the title (ignoring case and surrounding spaces),
+the length (within 1 s) and the album name agree. The same recording on a release with another
+album name (a single and its album, a deluxe edition) is another item.
+
+- `status --full` treats it as the current item: `web.relinked: true`, `web.item_uri` is the
+  substitute's id, and it is not `stale`.
+- The checks before spotify_player's commands count it as Spotify.app's song: its relative seek
+  is not refused with `state_mismatch`, `next` and `previous` heed what the Web API allows for
+  it, and a failed start can put it back in its playlist or album.
+- `like` and `unlike` refuse it at once: spotify_player's `like` saves or removes the id it plays,
+  which is the substitute's, not the one Spotify.app shows. The error is `track_mismatch`, not
+  retryable, and nothing changed. `details`: `spotify_app`, `spotify_player`, `relinked: true`,
+  `matched_by` (`linked_from` or `title_length_album`). Its hint points to the heart in
+  Spotify.app; other songs are not affected.
 
 ## Spotify.app not running
 
@@ -235,8 +280,8 @@ when `launch_spotify` is true (default); set it false to get `spotify_not_runnin
 The daemon keeps one headless spotify_player instance running on a pseudo-terminal it owns
 (streaming, media keys and notifications off, so it never becomes a playback device). With it,
 spotify_player commands take ~20 ms instead of ~1.5 s, and its view of playback is refreshed every
-3 s. `spotify daemon status` shows it as `warm spotify_player: running (…)`; details in
-`spotify docs daemon`.
+20 s (slow enough to leave Spotify's rate limit to commands). `spotify daemon status` shows it as
+`warm spotify_player: running (…)`; details in `spotify docs daemon`.
 
 ## Known limits
 
@@ -245,5 +290,10 @@ spotify_player commands take ~20 ms instead of ~1.5 s, and its view of playback 
   `spotify status --full` and retry in a minute.
 - `status --full` from the instance's memory does not notice a new context when the same item
   plays on (the same song replayed from another list).
-- If Spotify.app and the Web API report different ids for one song (relinked tracks), `like` and
-  `unlike` refuse with `track_mismatch` every time; they never change the wrong song.
+- `like` and `unlike` cannot change a [relinked song](#relinked-songs): use the heart in
+  Spotify.app. They never change the wrong song.
+- Two releases of one recording with the same album name (a clean and an explicit edition) look
+  relinked while spotify_player's view is still on the other one after a switch in Spotify.app
+  (up to about 20 s): a `like` then gets the relinked refusal instead of waiting to catch up, and
+  `status --full` may show the other one's context. `like` still never changes the wrong id.
+- A local file has no Web API id, so `status --full` marks it `web.stale` every time.

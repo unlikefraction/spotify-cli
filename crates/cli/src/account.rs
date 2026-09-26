@@ -983,11 +983,11 @@ mod tests {
 
     #[test]
     fn doctor_says_who_holds_the_warm_port() {
-        let detail = json!({"state": "running", "pid": 812, "port": 8080, "refresh_ms": 3000,
+        let detail = json!({"state": "running", "pid": 812, "port": 8080, "refresh_ms": 20000,
             "serves_cli": true, "port_owner_pid_now": 999});
         assert_eq!(
             warm_check_state(&detail),
-            "running (pid 812, 127.0.0.1:8080, playback refresh every 3 s, serves spotify-cli); the port is held by pid 999 now"
+            "running (pid 812, 127.0.0.1:8080, playback refresh every 20 s, serves spotify-cli); the port is held by pid 999 now"
         );
         // Before the note line, which stays on its own line.
         let detail = json!({"state": "running", "pid": 812, "port": 8080, "serves_cli": null,

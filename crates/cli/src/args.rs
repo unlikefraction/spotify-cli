@@ -18,7 +18,7 @@ worked. Triggers watch the playing track and notify the Silicon that set them th
 An always-on daemon (spotify-daemon) watches Spotify, fires triggers and keeps spotify_player warm.
 The CLI starts it on demand; `spotify daemon install` runs it at login.";
 
-const LIKE_AFTER: &str = "spotify_player can like or unlike only the song it believes is playing, so the command waits (up to verify_timeout_ms + ~1 s) until that is the song Spotify.app plays. If it does not catch up, nothing changes and the error is track_mismatch (retryable). Podcast episodes, ads and local files are unsupported.\n\nNext: spotify library liked";
+const LIKE_AFTER: &str = "spotify_player can like or unlike only the song it believes is playing, so the command waits (up to verify_timeout_ms + ~1 s) until that is the song Spotify.app plays. If it does not catch up, nothing changes and the error is track_mismatch (retryable). A relinked song (Spotify.app and the Web API name different ids for it) is liked only when the ids prove it is the same song; otherwise nothing changes and track_mismatch is not retryable (details.relinked). Podcast episodes, ads and local files are unsupported.\n\nNext: spotify library liked";
 
 const ROOT_AFTER: &str = "\
 Start here:
@@ -89,7 +89,7 @@ pub enum Command {
     /// Show what Spotify is playing (track, position, remaining, volume, shuffle, repeat).
     #[command(
         visible_alias = "now",
-        long_about = "Reads Spotify.app directly (AppleScript, ~50 ms). --full adds what only the Web API knows, under `web`: the playing context (playlist/album), the device and the exact repeat mode, plus item_uri, is_playing, source and stale.\n\nThose facts come from the daemon's spotify_player when its view matches Spotify.app (`source: spotify_player`), otherwise from a fresh Web API read (`source: web_api`, 1-4 s). When even that is for another item, `web.stale` is true, repeat and shuffle that contradict Spotify.app are left out, and the warning `web_state_stale` says so. Other warnings: no_active_device (the Web API sees no playback), timeout, rate_limited. Warnings never fail the command.",
+        long_about = "Reads Spotify.app directly (AppleScript, ~50 ms). --full adds what only the Web API knows, under `web`: the playing context (playlist/album), the device and the exact repeat mode, plus item_uri, is_playing, source, stale and relinked (true when Spotify serves the same song under another id; that is not stale).\n\nThose facts come from the daemon's spotify_player when its view matches Spotify.app (`source: spotify_player`), otherwise from a fresh Web API read (`source: web_api`, 1-4 s). When even that is for another item, `web.stale` is true, repeat and shuffle that contradict Spotify.app are left out, and the warning `web_state_stale` says so. Other warnings: no_active_device (the Web API sees no playback), timeout, rate_limited. Warnings never fail the command.",
         after_help = "Examples:\n  spotify status\n  spotify now --json | jq .playback.remaining_ms\n  spotify status --full\n\nNext: spotify track (song details) · spotify lyrics · spotify trigger add --remaining 30s"
     )]
     Status {
@@ -392,8 +392,9 @@ pub struct PlayArgs {
     /// Play the Liked Songs list itself (next and previous stay in it).
     #[arg(long, conflicts_with_all = ["target", "search", "radio"])]
     pub liked: bool,
-    /// With --liked: turn shuffle on for Liked Songs (Spotify keeps it) and start at a random
-    /// song. Without it, Liked Songs keeps its own shuffle setting.
+    /// With --liked: start at a random song with a newly drawn shuffle order (Liked Songs'
+    /// shuffle stays on). Without it, Liked Songs plays in list order and its remembered
+    /// shuffle is turned off.
     #[arg(long, requires = "liked")]
     pub random: bool,
     /// With --liked: at most this many tracks. Applies only when spotify_player starts the list

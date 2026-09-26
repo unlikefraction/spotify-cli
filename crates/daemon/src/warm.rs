@@ -25,7 +25,8 @@
 //!   daemon's exit hangs the terminal up and the kernel sends it SIGHUP. A normal shutdown also
 //!   stops its process group ([`stop`]); anything that still survives is stopped by the next
 //!   daemon's first start.
-//! - Its playback state is refreshed every [`REFRESH_MS`] (see there).
+//! - Its playback state is refreshed every [`REFRESH_MS`], or as `app.toml` sets it (see
+//!   there); `spotify daemon status` shows the interval it runs with (`refresh_ms`).
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -47,17 +48,33 @@ use crate::service::Daemon;
 pub const DEFAULT_CLIENT_PORT: u16 = 8080;
 
 /// How often the warm copy re-reads playback from the Web API (`GET /v1/me/player`), passed as
-/// `-o playback_refresh_duration_in_ms`.
+/// `-o playback_refresh_duration_in_ms` (see [`refresh_ms`] for `app.toml`'s own value).
 ///
 /// spotify_player answers `get key playback`, `like`, relative seeks and play/pause toggles from
 /// its in-memory state, which with its default (0) changes only on its own events, so it goes
-/// stale as soon as someone uses Spotify.app. 3 s bounds that staleness at one small GET every
-/// 3 s: 20 a minute, 10 per 30-second rolling window (the window Spotify rate-limits on).
-/// Spotify does not publish its limits; that is a small, steady load (spotify_player's other
-/// background requests, such as the queue, are throttled to one per 5 s), well under what gets
-/// clients 429s even with a development-mode client ID, and leaves the quota to real commands.
-/// A smaller positive value in the user's own `app.toml` is kept.
-pub const REFRESH_MS: u64 = 3_000;
+/// stale as soon as someone uses Spotify.app. This poll only has to bound that staleness loosely:
+/// spotify-cli never acts on the view unchecked. Its state checks compare the view with
+/// Spotify.app first and, when they disagree, send a command that changes nothing (the instance
+/// re-reads the Web API 1 s and 3 s after each command it runs) or read the Web API once.
+///
+/// Every poll spends the client ID's quota, which spotify_player's commands, its re-reads after
+/// them and the daemon's own lookups share. Spotify does not publish its limits (a rolling
+/// 30-second window). With a development-mode client ID, a 3 s poll (10 per window) drew a 429
+/// about every 30 s even while idle, after 7–8 polls. Each `Retry-After` (6–15 s) froze the view
+/// and stalled commands for that long. 20 s is 1–2 GETs per window, a small part of that budget,
+/// so commands keep the rest. Until a check catches it up, the view can then be up to about 20 s
+/// behind.
+///
+/// spotify_player reads the setting only when it starts, and no command changes it, so the poll
+/// keeps this rate while Spotify.app is paused or closed. Slowing it then would mean restarting
+/// the copy: a new sign-in, and a gap in which commands fall back to one-off clients. That costs
+/// more than the one GET per 20 s it would save.
+pub const REFRESH_MS: u64 = 20_000;
+
+/// The fastest poll the daemon runs: a smaller positive `playback_refresh_duration_in_ms` in
+/// `app.toml` (set for your own spotify_player) is raised to this. 10 s is 3 GETs per
+/// 30-second window, still well under the rate at which the 3 s poll drew 429s.
+const MIN_REFRESH_MS: u64 = 10_000;
 
 /// The overrides that mark a daemon's warm copy (every daemon version passed exactly these, in
 /// this order, and nothing else passes them).
@@ -266,11 +283,22 @@ fn app_config(player: &SpotifyPlayer) -> AppConfig {
         .unwrap_or_default()
 }
 
-/// The refresh interval to run with: [`REFRESH_MS`], or the user's own smaller positive value.
+/// The refresh interval to run with: [`REFRESH_MS`] when `app.toml` sets none (or 0, "only on
+/// events"). A positive value there is kept, however slow (a slower poll leaves more quota for
+/// commands), and raised to [`MIN_REFRESH_MS`] when faster than that.
 fn refresh_ms(configured: Option<u64>) -> u64 {
     configured
         .filter(|&ms| ms > 0)
-        .map_or(REFRESH_MS, |ms| ms.min(REFRESH_MS))
+        .map_or(REFRESH_MS, |ms| ms.max(MIN_REFRESH_MS))
+}
+
+/// An interval for the log: `20 s`, `1500 ms`.
+fn interval(ms: u64) -> String {
+    if ms >= 1_000 && ms.is_multiple_of(1_000) {
+        format!("{} s", ms / 1_000)
+    } else {
+        format!("{ms} ms")
+    }
 }
 
 /// A process of this user, as far as the kernel tells us.
@@ -965,7 +993,8 @@ pub async fn run(daemon: Arc<Daemon>) {
                         ),
                     );
                     log!(
-                        "warm spotify_player pid {pid} holds 127.0.0.1:{port}; running (playback refresh every {refresh} ms)"
+                        "warm spotify_player pid {pid} holds 127.0.0.1:{port}; running (playback refresh every {})",
+                        interval(refresh)
                     );
                 } else {
                     set(
@@ -1135,8 +1164,23 @@ mod tests {
         assert_eq!(parse_app_toml(""), AppConfig::default());
         assert_eq!(refresh_ms(Some(0)), REFRESH_MS);
         assert_eq!(refresh_ms(None), REFRESH_MS);
-        assert_eq!(refresh_ms(Some(1_000)), 1_000);
-        assert_eq!(refresh_ms(Some(60_000)), REFRESH_MS);
+        // Your slower poll is kept; a faster one is raised to the floor.
+        assert_eq!(refresh_ms(Some(60_000)), 60_000);
+        assert_eq!(refresh_ms(Some(15_000)), 15_000);
+        assert_eq!(refresh_ms(Some(1_000)), MIN_REFRESH_MS);
+        assert_eq!(refresh_ms(Some(3_000)), MIN_REFRESH_MS);
+    }
+
+    #[test]
+    fn the_poll_leaves_most_of_the_quota_to_commands() {
+        // Spotify rate-limits on a rolling 30 s window; a 3 s poll (10 per window) alone drew a
+        // 429 about every 30 s. The default and the floor stay at a few GETs per window.
+        let per_window = |ms: u64| 30_000_u64.div_ceil(ms);
+        assert!(per_window(REFRESH_MS) <= 2, "{}", per_window(REFRESH_MS));
+        assert!(per_window(MIN_REFRESH_MS) <= 3);
+        const { assert!(MIN_REFRESH_MS <= REFRESH_MS) };
+        assert_eq!(interval(REFRESH_MS), "20 s");
+        assert_eq!(interval(1_500), "1500 ms");
     }
 
     #[test]

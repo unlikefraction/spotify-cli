@@ -219,6 +219,12 @@ pub struct WebPlayback {
     /// contradict Spotify.app are left out.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stale: bool,
+    /// The Web API plays the song Spotify.app shows under another id (track relinking: Spotify
+    /// substitutes the same recording from another release), so `item_uri` is not Spotify.app's
+    /// `track.uri`. Recognised by the item's `linked_from`, or by the same title, a length
+    /// within a second and the same album name. The facts are current, not `stale`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relinked: bool,
 }
 
 impl WebPlayback {
@@ -248,8 +254,130 @@ impl WebPlayback {
             device: value.get("device").and_then(Device::from_json),
             source: None,
             stale: false,
+            relinked: false,
         })
     }
+}
+
+/// How the Web API's current item was recognised as the song Spotify.app plays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SameSong {
+    /// The same id.
+    Id,
+    /// A relinked copy whose `linked_from` names Spotify.app's id.
+    LinkedFrom,
+    /// Another id with the same title, a length within a second and the same album name.
+    Metadata,
+}
+
+impl SameSong {
+    /// The name error details use.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Id => "id",
+            Self::LinkedFrom => "linked_from",
+            Self::Metadata => "title_length_album",
+        }
+    }
+}
+
+/// Longest difference in length between Spotify.app's song and the Web API's item for them to
+/// count as one recording under two ids.
+const SAME_LENGTH_MS: u64 = 1000;
+
+/// The Web API's current item in `spotify_player get key playback` JSON: enough to recognise the
+/// song Spotify.app plays when the two name it with different ids.
+///
+/// When the release a song was saved or started from cannot play in the account's market,
+/// Spotify plays the same recording from another release (track relinking). Spotify.app then
+/// reports the id it was asked for with the substitute's title, album and length, while the Web
+/// API reports the substitute's id; it names the requested id in `linked_from` only when asked
+/// with a market, which spotify_player does not do. So the title, length and album name are what
+/// connect the two. The album name is required: the same recording on another release (a single
+/// and its album, a deluxe edition) has the same title, length and artist, and a view still on
+/// that release after a switch in Spotify.app is behind, not relinked.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct WebItem {
+    uri: Option<String>,
+    linked_from: Option<String>,
+    name: Option<String>,
+    duration_ms: Option<u64>,
+    album: Option<String>,
+}
+
+impl WebItem {
+    /// Reads the item of a `get key playback` answer (empty when it has none).
+    pub(crate) fn from_player_json(value: &Value) -> Self {
+        let Some(item) = value.get("item").filter(|i| i.is_object()) else {
+            return Self::default();
+        };
+        let text = |value: Option<&Value>| {
+            value
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        let linked_from = item
+            .get("linked_from")
+            .filter(|l| l.is_object())
+            .and_then(|link| {
+                text(link.get("uri"))
+                    .filter(|uri| uri.starts_with("spotify:"))
+                    .or_else(|| {
+                        let kind = text(link.get("type")).unwrap_or_else(|| "track".into());
+                        text(link.get("id")).map(|id| format!("spotify:{kind}:{id}"))
+                    })
+            });
+        // The Web API's `duration_ms`, or spotify_player's own `{secs, nanos}`.
+        let duration_ms = item.get("duration_ms").and_then(Value::as_u64).or_else(|| {
+            let duration = item.get("duration")?;
+            let secs = duration.get("secs")?.as_u64()?;
+            let nanos = duration.get("nanos").and_then(Value::as_u64).unwrap_or(0);
+            Some(secs * 1000 + nanos / 1_000_000)
+        });
+        Self {
+            uri: playing_item_uri(value),
+            linked_from,
+            name: text(item.get("name")),
+            duration_ms,
+            album: text(item.get("album").and_then(|a| a.get("name"))),
+        }
+    }
+
+    /// Whether this item is `track` (the song Spotify.app plays), and how that shows. Only songs
+    /// are relinked: another episode, ad or local file under a different id is another item.
+    pub(crate) fn same_song(&self, track: &Track) -> Option<SameSong> {
+        let uri = self.uri.as_deref()?;
+        if uri == track.uri {
+            return Some(SameSong::Id);
+        }
+        if track.kind != "track" || !uri.starts_with("spotify:track:") {
+            return None;
+        }
+        if self.linked_from.as_deref() == Some(track.uri.as_str()) {
+            return Some(SameSong::LinkedFrom);
+        }
+        let name = self
+            .name
+            .as_deref()
+            .is_some_and(|name| same_text(name, &track.name));
+        let length = self.duration_ms.is_some_and(|ms| {
+            track.duration_ms > 0 && ms.abs_diff(track.duration_ms) <= SAME_LENGTH_MS
+        });
+        // Spotify.app shows the substitute's album, so a relinked song has the same one.
+        let album = self
+            .album
+            .as_deref()
+            .is_some_and(|album| same_text(album, &track.album));
+        (name && length && album).then_some(SameSong::Metadata)
+    }
+}
+
+/// Equal ignoring case and surrounding space; empty never matches.
+fn same_text(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    !a.is_empty() && a.to_lowercase() == b.to_lowercase()
 }
 
 /// The item of `spotify_player get key playback` JSON as a URI. The Web API's item objects carry
@@ -570,6 +698,130 @@ mod tests {
         assert!(WebPlayback::from_player_json(&Value::Null).is_none());
         let json = serde_json::to_value(&web).expect("json");
         assert!(json.get("stale").is_none(), "only present when true");
+        assert!(json.get("relinked").is_none(), "only present when true");
+    }
+
+    fn app_track(uri: &str, name: &str, artist: &str, album: &str, duration_ms: u64) -> Track {
+        let mut track = Track {
+            uri: uri.into(),
+            name: name.into(),
+            artist: artist.into(),
+            album: album.into(),
+            duration_ms,
+            ..Track::default()
+        };
+        track.finish();
+        track
+    }
+
+    #[test]
+    fn recognises_a_relinked_song_under_another_id() {
+        // The QA case (spotify_player 0.25.1, no market): Spotify.app reports the liked id
+        // 45bE4… with the substitute's album and length; the Web API reports the substitute 4l0Rm….
+        let app = app_track(
+            "spotify:track:45bE4HXI0AwGZXfZtMp8JR",
+            "you broke me first",
+            "Tate McRae",
+            "TOO YOUNG TO BE SAD",
+            170_234,
+        );
+        let web = json!({"is_playing":true,"currently_playing_type":"track","item":{
+            "id":"4l0RmWt52FxpVxMNni6i63","name":"you broke me first","type":"track",
+            "duration_ms":170_234,"album":{"id":"1BaHo66NCQNx6ku0hPn9bR","name":"TOO YOUNG TO BE SAD"},
+            "artists":[{"id":"45dkTj5sMRSjrmBSBeiHym","name":"Tate McRae"}]}});
+        let item = WebItem::from_player_json(&web);
+        assert_eq!(item.same_song(&app), Some(SameSong::Metadata));
+        // Asked with a market, the Web API names the requested id.
+        let mut linked = web.clone();
+        linked["item"]["linked_from"] = json!({"id":"45bE4HXI0AwGZXfZtMp8JR","type":"track",
+            "uri":"spotify:track:45bE4HXI0AwGZXfZtMp8JR"});
+        linked["item"]["name"] = json!("another title");
+        assert_eq!(
+            WebItem::from_player_json(&linked).same_song(&app),
+            Some(SameSong::LinkedFrom)
+        );
+        let mut by_id = linked.clone();
+        by_id["item"]["linked_from"] = json!({"id":"45bE4HXI0AwGZXfZtMp8JR"});
+        assert_eq!(
+            WebItem::from_player_json(&by_id).same_song(&app),
+            Some(SameSong::LinkedFrom)
+        );
+        // The same id needs nothing else.
+        let same = json!({"item":{"id":"45bE4HXI0AwGZXfZtMp8JR","type":"track"}});
+        assert_eq!(
+            WebItem::from_player_json(&same).same_song(&app),
+            Some(SameSong::Id)
+        );
+        // Case and surrounding space aside, and a length within a second.
+        let close = app_track(
+            "spotify:track:45bE4HXI0AwGZXfZtMp8JR",
+            "You Broke Me First ",
+            "Tate McRae",
+            " too young to be sad",
+            169_265,
+        );
+        assert_eq!(item.same_song(&close), Some(SameSong::Metadata));
+        // The original single (45bE4's own release): same title, artist and nearly the length,
+        // another album. A view still on 4l0Rm after switching to it is behind, not relinked.
+        let single = app_track(
+            "spotify:track:45bE4HXI0AwGZXfZtMp8JR",
+            "you broke me first",
+            "Tate McRae",
+            "you broke me first",
+            169_265,
+        );
+        assert_eq!(item.same_song(&single), None);
+    }
+
+    #[test]
+    fn another_song_is_never_taken_for_a_relinked_one() {
+        let web = json!({"item":{"id":"other","name":"Intro","type":"track","duration_ms":90_000,
+            "album":{"name":"Album A"},"artists":[{"name":"Band"}]}});
+        let item = WebItem::from_player_json(&web);
+        let app = |name: &str, artist: &str, album: &str, ms: u64| {
+            app_track("spotify:track:mine", name, artist, album, ms)
+        };
+        // Same title and album, over a second longer.
+        assert_eq!(
+            item.same_song(&app("Intro", "Band", "Album A", 91_500)),
+            None
+        );
+        // Same title and length, another album and artist.
+        assert_eq!(
+            item.same_song(&app("Intro", "Other", "Album B", 90_000)),
+            None
+        );
+        // Another title.
+        assert_eq!(
+            item.same_song(&app("Outro", "Band", "Album A", 90_000)),
+            None
+        );
+        // Unknown length.
+        assert_eq!(item.same_song(&app("Intro", "Band", "Album A", 0)), None);
+        // Episodes are never relinked.
+        let episode = app_track("spotify:episode:e1", "Intro", "Band", "Album A", 90_000);
+        assert_eq!(item.same_song(&episode), None);
+        // The same recording on another release (a deluxe edition): same title, length and
+        // artist. Spotify.app would show the substitute's album if it were relinked.
+        let deluxe = json!({"item":{"id":"x","name":"Intro","type":"track","duration_ms":90_000,
+            "album":{"name":"Album A (Deluxe)"},"artists":[{"name":"Band"}]}});
+        assert_eq!(
+            WebItem::from_player_json(&deluxe).same_song(&app("Intro", "Band", "Album A", 90_000)),
+            None
+        );
+        // spotify_player's own length shape.
+        let own = json!({"item":{"id":"x","name":"Intro","type":"track",
+            "duration":{"secs":90,"nanos":400_000_000},"album":{"name":"Album A"}}});
+        assert_eq!(
+            WebItem::from_player_json(&own).same_song(&app("Intro", "", "Album A", 90_000)),
+            Some(SameSong::Metadata)
+        );
+        // Nothing playing on the Web API side.
+        assert_eq!(
+            WebItem::from_player_json(&Value::Null)
+                .same_song(&app("Intro", "Band", "Album A", 90_000)),
+            None
+        );
     }
 
     #[test]

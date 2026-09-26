@@ -12,7 +12,7 @@ What it does:
 | Fire triggers | the pure trigger engine; firings go to a durable outbox |
 | Deliver Tings | opens the creating Silicon's session under its lock, refreshes if needed, sends through the backend; retries with backoff for an hour |
 | Managed queue | hands over to the next queued item at the end of each song, resumes the interrupted context; `next`, `play <item>`, `previous` and hand-offs reach Spotify one at a time, never interleaved |
-| Warm spotify_player | keeps one headless instance on a pseudo-terminal so Web API calls take ~20 ms, with its view of playback refreshed every 3 s ([below](#the-warm-spotify-player)) |
+| Warm spotify_player | keeps one headless instance on a pseudo-terminal so Web API calls take ~20 ms, with its view of playback refreshed every 20 s ([below](#the-warm-spotify-player)) |
 | Library reads | retries a library or playlist read once after a network blip, and makes reads right after a change wait until they can see it ([below](#library-and-playlist-reads)) |
 | Telemetry relay | relays CLI and daemon events to the backend every minute, draining the whole backlog (when enabled) |
 | Updates | checks GitHub releases hourly and installs verified updates (script installs; Honeycomb updates its own installs) |
@@ -73,15 +73,28 @@ throwaway client (~1.5 s) when none answers. The daemon runs one copy of its own
 pseudo-terminal it owns, with streaming, media keys and notifications off, so it never becomes a
 playback device and only answers Web API commands.
 
-- **Fresh view.** The copy runs with `-o playback_refresh_duration_in_ms=3000` (or the smaller
-  positive value your own `app.toml` sets), so its idea of what plays, the repeat mode and
-  shuffle is at most about 3 s behind Spotify.app (`spotify docs playback`: *Checking
-  spotify_player's view first*). That costs one `GET /v1/me/player` every 3 s, about 20 requests
-  a minute, while the daemon runs.
+- **Fresh view.** The copy runs with `-o playback_refresh_duration_in_ms=20000`: it re-reads
+  playback (`GET /v1/me/player`) every 20 s, and 1 s and 3 s after each command it runs. A
+  positive `playback_refresh_duration_in_ms` in your own `app.toml` is kept when it is slower and
+  raised to 10000 when it is faster; 0 or none gives 20000. `spotify daemon status` shows the
+  interval it runs with ("playback refresh every 20 s", `refresh_ms` in `--json`).
+- **Why not faster.** Spotify rate-limits a client ID over a rolling 30-second window and does
+  not publish the limit. The poll shares that quota with spotify_player's commands, its re-reads
+  after them and the daemon's own lookups. With a development-mode client ID, a 3 s poll (10 GETs
+  per window) drew a 429 about every 30 s even while idle, and each `Retry-After` (6–15 s) froze
+  the view and stalled commands. 20 s is 1–2 GETs per window (the 10 s floor at most 3), which
+  leaves most of the quota to commands.
+- **How far behind.** After a change made in Spotify.app (or by AppleScript), spotify_player's
+  idea of what plays, the repeat mode and shuffle can be up to about 20 s behind. Commands that
+  depend on it compare it with Spotify.app first, and when they disagree AppleScript acts, the
+  view is nudged, or the Web API is read once (`spotify docs playback`: *Checking
+  spotify_player's view first*). The poll keeps its interval while Spotify.app is paused or
+  closed: spotify_player reads the setting only when it starts, and changing it would mean
+  restarting the copy (a new sign-in, and a gap in which commands fall back to one-off clients).
 - **One copy.** Before it starts one, the daemon stops copies left by earlier daemons: the pid
   recorded in `warm-player.json` (while its start time matches) and orphaned processes of your
-  user that carry the daemon's exact `-o` overrides (SIGTERM, then SIGKILL after 2 s). A
-  spotify_player you run yourself is never touched.
+  user that carry the daemon's `-o` overrides (streaming, media keys and notifications off;
+  SIGTERM, then SIGKILL after 2 s). A spotify_player you run yourself is never touched.
 - **Serving.** It counts as `running` only once its copy holds the client port (checked with
   `lsof`, and again every 5 minutes; when `lsof` cannot tell, it is `running` with
   `serves_cli: null` and a note). A copy that does not get the port within 30 s is stopped and

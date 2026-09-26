@@ -16,6 +16,14 @@
 //! disagree, AppleScript acts directly and `fallback` says `state_mismatch`; `like` and `unlike`
 //! refuse with `track_mismatch` instead of guessing which song they would change.
 //!
+//! Spotify sometimes plays a song under another id than the one Spotify.app shows (track
+//! relinking: the same recording from another release). The Web API, and so spotify_player,
+//! then reports the substitute's id. These checks and `status --full` count it as the same item
+//! when the Web API's `linked_from` names Spotify.app's id, or when the title, a length within a
+//! second and the album name agree (`web.relinked`). `like` and `unlike` still refuse it,
+//! without retrying: spotify_player would save or remove the substitute's id, not the one
+//! Spotify.app shows.
+//!
 //! Three actions go to AppleScript first, because spotify_player's way of doing them is worse on
 //! the desktop app: seeking (spotify_player can only seek by an offset, which it adds to a
 //! position it fetches from the Web API when the command runs, seconds later when the Web API is
@@ -33,7 +41,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::applescript::{self, Runner};
-use crate::model::{Playback, PlayerState, Track, WebPlayback, playing_item_uri};
+use crate::model::{
+    Playback, PlayerState, SameSong, Track, WebItem, WebPlayback, playing_item_uri,
+};
 use crate::player::SpotifyPlayer;
 use crate::timing::SeekTarget;
 use crate::uri::{Kind, SpotifyUri};
@@ -139,7 +149,8 @@ pub enum PlayTarget {
         /// Maximum tracks to enqueue when spotify_player starts them; AppleScript plays the whole
         /// Liked Songs list.
         limit: u32,
-        /// Random order.
+        /// Shuffled, from a random song (a new shuffle order each time). Otherwise in list
+        /// order from the first song: a shuffle Spotify kept for Liked Songs is turned off.
         random: bool,
     },
     /// A radio (recommendations) seeded from an item.
@@ -235,6 +246,8 @@ struct PlayerView {
     context_uri: Option<String>,
     /// Actions the Web API disallows for its current item (`skipping_prev`, `pausing`, …).
     disallows: Vec<String>,
+    /// Its item's title, length and album, to recognise a relinked song.
+    item: WebItem,
 }
 
 impl PlayerView {
@@ -243,6 +256,7 @@ impl PlayerView {
             return None;
         }
         Some(Self {
+            item: WebItem::from_player_json(value),
             item_uri: playing_item_uri(value),
             is_playing: value
                 .get("is_playing")
@@ -272,12 +286,12 @@ impl PlayerView {
         self.disallows.iter().any(|a| a == action)
     }
 
-    /// Whether its item is the one Spotify.app has loaded.
+    /// Whether its item is the one Spotify.app has loaded (by id, or relinked).
     fn is_on(&self, playback: &Playback) -> bool {
         playback
             .track
             .as_ref()
-            .is_some_and(|t| self.item_uri.as_deref() == Some(t.uri.as_str()))
+            .is_some_and(|t| self.item.same_song(t).is_some())
     }
 }
 
@@ -371,7 +385,8 @@ impl Controller<'_> {
     /// Spotify.app (same item, repeat and shuffle; `web.source` is `spotify_player`; a play state
     /// that disagrees is left out).
     /// Otherwise they come from a one-shot Web API read (`web_api`, 1–4 s). When even that does
-    /// not match Spotify.app, `web.stale` is true and a warning says why.
+    /// not match Spotify.app, `web.stale` is true and a warning says why. A song the Web API
+    /// plays under another id (relinked) is the same item; `web.relinked` says so.
     ///
     /// # Errors
     /// AppleScript failures.
@@ -386,17 +401,14 @@ impl Controller<'_> {
             }
         };
         let cached = match player.json(&["get", "key", "playback"]) {
-            Ok(value) => WebPlayback::from_player_json(&value).map(|mut web| {
-                web.source = Some("spotify_player".into());
-                web
-            }),
+            Ok(value) => web_facts(&value, "spotify_player", &playback),
             Err(error) => {
                 warnings.push(error);
                 return Ok((playback, warnings));
             }
         };
         if web_agrees(cached.as_ref(), &playback) {
-            playback.web = cached.map(|mut web| {
+            playback.web = cached.map(|(mut web, _)| {
                 // Its play state is its own working state, which Spotify.app's pause or play
                 // does not update; Spotify.app's `state` is the answer, so leave it out.
                 if web.is_playing != Some(playback.state == PlayerState::Playing) {
@@ -408,11 +420,9 @@ impl Controller<'_> {
         }
         // The instance's memory describes an earlier moment: ask the Web API itself.
         match player.fresh_json(&["get", "key", "playback"], FRESH_READ_TIMEOUT) {
-            Ok(value) => match WebPlayback::from_player_json(&value) {
-                Some(mut fresh) => {
-                    fresh.source = Some("web_api".into());
-                    let current = playback.track.as_ref().map(|t| t.uri.as_str());
-                    if fresh.item_uri.as_deref() != current {
+            Ok(value) => match web_facts(&value, "web_api", &playback) {
+                Some((mut fresh, on_item)) => {
+                    if !on_item {
                         warnings.push(web_behind(&fresh, &playback));
                         mark_stale(&mut fresh, &playback);
                     }
@@ -425,7 +435,7 @@ impl Controller<'_> {
                 )),
             },
             Err(error) => {
-                if let Some(mut stale) = cached {
+                if let Some((mut stale, _)) = cached {
                     warnings.push(web_behind(&stale, &playback));
                     mark_stale(&mut stale, &playback);
                     playback.web = Some(stale);
@@ -642,15 +652,7 @@ impl Controller<'_> {
                 playback,
             }));
         }
-        Ok(Err(
-            Error::new(
-                "verification_failed",
-                format!("`{}` was sent but Spotify.app never reflected it.", plan.action),
-                "Spotify may be showing an ad, a dialog, or be offline. Check Spotify.app, then retry. `spotify status` shows what it is doing now.",
-            )
-            .retryable()
-            .with_details(json!({"observed": playback})),
-        ))
+        Ok(Err(never_reflected(plan.action, &playback)))
     }
 
     /// Checks that spotify_player believes playback is `playing`, as Spotify.app says: its
@@ -852,6 +854,13 @@ impl Controller<'_> {
     /// Liked Songs. AppleScript plays the Liked Songs list itself (`spotify:user:<id>:collection`,
     /// the id spotify_player is signed in as), so it keeps going and `next` works; spotify_player
     /// can only start a list of track ids, which the desktop app answers by stopping.
+    ///
+    /// Spotify keeps a shuffle setting per list and switches to Liked Songs' own when it starts.
+    /// Shuffled, the list starts at the song its kept order starts with, the same one every time;
+    /// in order, at its first song. So without `random` a kept shuffle is turned off and the list
+    /// started again, and with `random` shuffle is switched off and on (Spotify then draws a new
+    /// order) before one skip. Each step is checked in Spotify.app, and none is taken before
+    /// Liked Songs plays: shuffle and the skip would otherwise land on what was playing.
     fn play_liked(
         &self,
         limit: u32,
@@ -871,19 +880,17 @@ impl Controller<'_> {
             let start = applescript::play_uri(collection, None);
             let issued = Instant::now();
             applescript::expect_ok(&self.script.run(&start)?)?;
-            if random {
-                // Spotify keeps a shuffle setting per list and switches to Liked Songs' own when
-                // it starts. When that is off, the first song plays in order: turn shuffle on
-                // and move on to a random one. Only once Liked Songs plays: before that, shuffle
-                // and the skip would land on what was playing (the check then reports the start
-                // that did not happen).
-                let (started, now) = self.wait_for(APPLESCRIPT_VERIFY, issued, check)?;
-                if started && now.shuffling == Some(false) {
-                    applescript::expect_ok(&self.script.run(&applescript::shuffle(true))?)?;
-                    applescript::expect_ok(&self.script.run(&applescript::next())?)?;
-                }
+            let (started, now) = self.wait_for(APPLESCRIPT_VERIFY, issued, check)?;
+            if !started {
+                // Said now: the check after this would wait as long again, and a start that
+                // shows only then would count without its shuffle step.
+                return Err(never_reflected("play_liked", &now));
             }
-            Ok(())
+            match now.shuffling {
+                Some(_) if random => self.liked_at_random(&now),
+                Some(true) => self.liked_in_order(collection, &now),
+                _ => Ok(()),
+            }
         };
         let limit = limit.to_string();
         let primary = |p: &SpotifyPlayer| {
@@ -915,6 +922,76 @@ impl Controller<'_> {
             },
             check,
         })
+    }
+
+    /// Liked Songs started shuffled, from a shuffle Spotify kept for it: turns that off and
+    /// starts the list again, which then begins at its first song.
+    fn liked_in_order(&self, collection: &str, started: &Playback) -> Result<()> {
+        let shuffled = started.track.as_ref().map(|t| t.uri.clone());
+        self.liked_shuffle(false)?;
+        applescript::expect_ok(&self.script.run(&applescript::play_uri(collection, None))?)?;
+        // The first song replaces the shuffled one, unless they are the same song (then nothing
+        // shows, and in order is what counts).
+        let (_, now) = self.wait_for(APPLESCRIPT_VERIFY, Instant::now(), &|pb, _| {
+            pb.state == PlayerState::Playing
+                && pb.track.is_some()
+                && pb.track.as_ref().map(|t| t.uri.clone()) != shuffled
+        })?;
+        if now.state == PlayerState::Playing && now.shuffling == Some(false) {
+            return Ok(());
+        }
+        Err(Error::new(
+            "verification_failed",
+            "Liked Songs' shuffle was turned off, but Spotify.app did not start the list again from its first song.",
+            "Check Spotify.app, then retry `spotify play --liked`.",
+        )
+        .retryable()
+        .with_details(json!({"observed": now})))
+    }
+
+    /// Moves Liked Songs, just started, to a random song: switching shuffle off and on makes
+    /// Spotify draw a new order (a shuffled list otherwise starts where its kept order does), and
+    /// one skip leaves the song that started.
+    fn liked_at_random(&self, started: &Playback) -> Result<()> {
+        let first = started.track.as_ref().map(|t| t.uri.clone());
+        self.liked_shuffle(false)?;
+        self.liked_shuffle(true)?;
+        applescript::expect_ok(&self.script.run(&applescript::next())?)?;
+        let (moved, now) = self.wait_for(APPLESCRIPT_VERIFY, Instant::now(), &|pb, _| {
+            pb.track.is_some() && pb.track.as_ref().map(|t| t.uri.clone()) != first
+        })?;
+        if moved {
+            return Ok(());
+        }
+        Err(Error::new(
+            "verification_failed",
+            "Liked Songs is playing shuffled, but the skip to a random song did not show in Spotify.app.",
+            "Run `spotify next`, or retry `spotify play --liked --random`.",
+        )
+        .retryable()
+        .with_details(json!({"observed": now})))
+    }
+
+    /// Sets shuffle for the list Spotify.app plays (Liked Songs, just started) and waits until
+    /// Spotify.app shows it.
+    fn liked_shuffle(&self, on: bool) -> Result<()> {
+        applescript::expect_ok(&self.script.run(&applescript::shuffle(on))?)?;
+        let (ok, now) = self.wait_for(APPLESCRIPT_VERIFY, Instant::now(), &|pb, _| {
+            pb.shuffling == Some(on)
+        })?;
+        if ok {
+            return Ok(());
+        }
+        Err(Error::new(
+            "verification_failed",
+            format!(
+                "Liked Songs is playing, but Spotify.app did not turn its shuffle {}.",
+                if on { "on" } else { "off" }
+            ),
+            "Check Spotify.app, then retry.",
+        )
+        .retryable()
+        .with_details(json!({"observed": now})))
     }
 
     /// When `error` left Spotify.app with nothing loaded although `before` had an item, plays
@@ -1420,8 +1497,10 @@ impl Controller<'_> {
     /// Likes (saves) or unlikes the current track. spotify_player only.
     ///
     /// spotify_player's `like` has no id option: it saves or removes the track its instance
-    /// believes is playing. So it runs only when that is provably the song Spotify.app plays;
-    /// otherwise nothing changes and the error is `track_mismatch`.
+    /// believes is playing. So it runs only when that is provably the song Spotify.app plays, by
+    /// the same id; otherwise nothing changes and the error is `track_mismatch`. A relinked song
+    /// (the same recording under another id) is refused too, and not as retryable: spotify_player
+    /// would save or remove its other id, not the one Spotify.app shows.
     ///
     /// # Errors
     /// `nothing_playing`, `unsupported` (not a song), `track_mismatch`, spotify_player errors.
@@ -1481,9 +1560,10 @@ impl Controller<'_> {
         })
     }
 
-    /// Makes sure spotify_player's current track is `track`, letting it catch up once: the
-    /// instance re-reads the Web API 1 s and 3 s after each command it runs, and setting the
-    /// volume to its current level is a command that changes nothing audible.
+    /// Makes sure spotify_player's current track is `track` by id, letting it catch up once:
+    /// the instance re-reads the Web API 1 s and 3 s after each command it runs, and setting the
+    /// volume to its current level is a command that changes nothing audible. On the same song
+    /// under another id (relinked), it refuses at once: catching up cannot change the id.
     fn confirm_track(
         &self,
         player: &SpotifyPlayer,
@@ -1491,13 +1571,25 @@ impl Controller<'_> {
         before: &Playback,
         track: &Track,
     ) -> Result<()> {
-        let current = |view: Option<PlayerView>| view.and_then(|v| v.item_uri);
+        // `Ok(true)`: on `track` by id. `Err`: on it under another id.
+        let on_track = |view: Option<&PlayerView>| -> Result<bool> {
+            match view.and_then(|v| v.item.same_song(track).map(|how| (v, how))) {
+                Some((_, SameSong::Id)) => Ok(true),
+                Some((view, how)) => Err(relinked_refusal(
+                    action,
+                    track,
+                    view.item_uri.as_deref(),
+                    how,
+                )),
+                None => Ok(false),
+            }
+        };
         let view = self.view(player)?;
-        let has_playback = view.is_some();
-        let mut seen = current(view);
-        if seen.as_deref() == Some(track.uri.as_str()) {
+        if on_track(view.as_ref())? {
             return Ok(());
         }
+        let has_playback = view.is_some();
+        let mut seen = view.and_then(|v| v.item_uri);
         // Why catching up did not happen, when known.
         let mut stuck: Option<Error> = None;
         let log = player.log_cursor();
@@ -1507,10 +1599,11 @@ impl Controller<'_> {
                     let deadline = Instant::now() + self.verify_timeout + CATCH_UP_EXTRA;
                     while Instant::now() < deadline {
                         sleep(VIEW_POLL * 2);
-                        seen = current(self.view(player)?);
-                        if seen.as_deref() == Some(track.uri.as_str()) {
+                        let view = self.view(player)?;
+                        if on_track(view.as_ref())? {
                             return Ok(());
                         }
+                        seen = view.and_then(|v| v.item_uri);
                         // A refused command (rate limited) triggers no re-read.
                         stuck = crate::player::logged_failure(&log, "Volume");
                         if stuck.is_some() {
@@ -1533,6 +1626,44 @@ impl Controller<'_> {
         .retryable()
         .with_details(json!({"spotify_app": track.uri, "spotify_player": seen, "catch_up_failed": stuck})))
     }
+}
+
+/// `track_mismatch` for a song spotify_player knows under another id than Spotify.app (track
+/// relinking). Not retryable: that stays so while the song plays.
+fn relinked_refusal(action: &str, track: &Track, seen: Option<&str>, how: SameSong) -> Error {
+    let seen = seen.unwrap_or("another id");
+    let app = track.uri.as_str();
+    let why = match how {
+        SameSong::LinkedFrom => format!("the Web API names {app} as the song it links from"),
+        _ => "same title, length and album".to_owned(),
+    };
+    Error::new(
+        "track_mismatch",
+        format!(
+            "Refused to {action}: Spotify.app shows this song as {app} but Spotify plays it as {seen} (track relinking: the same recording from another release; {why}). spotify_player can only {action} the id it plays, so it would change {seen}, not {app}. Nothing was changed."
+        ),
+        format!(
+            "Retrying will not help while this song plays (it is relinked). Use the heart in Spotify.app for \"{}\"; other songs are not affected.",
+            track.name
+        ),
+    )
+    .with_details(json!({
+        "spotify_app": track.uri,
+        "spotify_player": seen,
+        "relinked": true,
+        "matched_by": how.as_str(),
+    }))
+}
+
+/// `verification_failed`: AppleScript sent `action` but Spotify.app never showed its effect.
+fn never_reflected(action: &str, observed: &Playback) -> Error {
+    Error::new(
+        "verification_failed",
+        format!("`{action}` was sent but Spotify.app never reflected it."),
+        "Spotify may be showing an ad, a dialog, or be offline. Check Spotify.app, then retry. `spotify status` shows what it is doing now.",
+    )
+    .retryable()
+    .with_details(json!({"observed": observed}))
 }
 
 /// `state_mismatch`: spotify_player's working state disagrees with Spotify.app, so the command it
@@ -1577,15 +1708,31 @@ fn repeat_name(mode: RepeatMode) -> &'static str {
     }
 }
 
-/// Whether the instance's cached Web API facts describe what Spotify.app shows now.
-fn web_agrees(web: Option<&WebPlayback>, playback: &Playback) -> bool {
-    let current = playback.track.as_ref().map(|t| t.uri.as_str());
-    let Some(web) = web else {
-        return current.is_none();
+/// The Web API facts in a `get key playback` answer, marked with their `source`, and whether
+/// their item is the one Spotify.app has loaded (by id, or relinked: then `relinked` is set).
+fn web_facts(value: &Value, source: &str, playback: &Playback) -> Option<(WebPlayback, bool)> {
+    let mut web = WebPlayback::from_player_json(value)?;
+    web.source = Some(source.to_owned());
+    let on_item = match &playback.track {
+        None => web.item_uri.is_none(),
+        Some(track) => match WebItem::from_player_json(value).same_song(track) {
+            Some(SameSong::Id) => true,
+            Some(SameSong::LinkedFrom | SameSong::Metadata) => {
+                web.relinked = true;
+                true
+            }
+            None => false,
+        },
     };
-    web.item_uri.as_deref() == current
-        && repeat_agrees(web, playback)
-        && shuffle_agrees(web, playback)
+    Some((web, on_item))
+}
+
+/// Whether the instance's cached Web API facts describe what Spotify.app shows now.
+fn web_agrees(web: Option<&(WebPlayback, bool)>, playback: &Playback) -> bool {
+    let Some((web, on_item)) = web else {
+        return playback.track.is_none();
+    };
+    *on_item && repeat_agrees(web, playback) && shuffle_agrees(web, playback)
 }
 
 /// Spotify.app's `repeating` is on for both `context` and `track`.
@@ -1617,27 +1764,35 @@ fn mark_stale(web: &mut WebPlayback, playback: &Playback) {
 fn web_behind(web: &WebPlayback, playback: &Playback) -> Error {
     let current = playback.track.as_ref().map(|t| t.uri.as_str());
     let flag = |value: Option<bool>| value.map_or("unknown", |on| if on { "on" } else { "off" });
-    let what = if web.item_uri.as_deref() == current {
+    let (what, hint) = if web.relinked || web.item_uri.as_deref() == current {
         // Same item: its repeat or shuffle is what disagrees.
-        format!(
-            "The Spotify Web API's repeat ({}) or shuffle ({}) for {} contradicts Spotify.app (repeat {}, shuffle {})",
-            web.repeat_state.as_deref().unwrap_or("unknown"),
-            flag(web.shuffle_state),
-            current.unwrap_or("nothing"),
-            flag(playback.repeating),
-            flag(playback.shuffling)
+        (
+            format!(
+                "The Spotify Web API's repeat ({}) or shuffle ({}) for {} contradicts Spotify.app (repeat {}, shuffle {})",
+                web.repeat_state.as_deref().unwrap_or("unknown"),
+                flag(web.shuffle_state),
+                current.unwrap_or("nothing"),
+                flag(playback.repeating),
+                flag(playback.shuffling)
+            ),
+            "Retry in a few seconds; the Web API catches up with Spotify.app.",
         )
     } else {
-        format!(
-            "The Spotify Web API's playback ({}) does not match Spotify.app ({})",
-            web.item_uri.as_deref().unwrap_or("nothing"),
-            current.unwrap_or("nothing")
+        (
+            format!(
+                "The Spotify Web API's playback ({}) does not match Spotify.app ({})",
+                web.item_uri.as_deref().unwrap_or("nothing"),
+                current.unwrap_or("nothing")
+            ),
+            // A song it plays under another id (relinked) is recognised before this, so what is
+            // left is almost always the Web API lagging behind a change.
+            "Retry in a few seconds; the Web API usually catches up within seconds of a change in Spotify.app. If it keeps reporting another item, `web` describes that item, not the one Spotify.app plays.",
         )
     };
     Error::new(
         "web_state_stale",
         format!("{what}, so context, device and repeat mode may be out of date (`web.stale`)."),
-        "Retry in a few seconds; the Web API catches up with Spotify.app.",
+        hint,
     )
     .retryable()
 }
@@ -1718,6 +1873,8 @@ mod tests {
         shared: Option<PathBuf>,
         /// Takes commands without acting on them (a dialog or an offline app).
         frozen: bool,
+        /// Commands (by prefix) it takes without acting on them.
+        ignores: &'static [&'static str],
     }
 
     /// Spotify.app keeps 16-bit volume and reads it back rounded down.
@@ -1800,11 +1957,19 @@ mod tests {
                     continue;
                 }
                 self.log.lock().expect("lock").push(line.to_owned());
-                if self.frozen {
+                if self.frozen || self.ignores.iter().any(|i| line.starts_with(i)) {
                     continue;
                 }
                 if let Some(rest) = line.strip_prefix("play track \"") {
-                    app.uri = Some(rest.split('"').next().unwrap_or_default().to_owned());
+                    let uri = rest.split('"').next().unwrap_or_default();
+                    // Liked Songs starts at the song its kept shuffle order starts with (the same
+                    // one every time), or in order at its first song.
+                    let uri = match (uri.ends_with(":collection"), app.shuffling) {
+                        (true, true) => "spotify:track:kept-shuffle-start",
+                        (true, false) => "spotify:track:first-liked",
+                        (false, _) => uri,
+                    };
+                    app.uri = Some(uri.to_owned());
                     app.state = "playing".into();
                     app.position = 0;
                 } else if line == "pause" {
@@ -1858,6 +2023,7 @@ mod tests {
             log: Mutex::new(Vec::new()),
             shared: None,
             frozen: false,
+            ignores: &[],
         }
     }
 
@@ -1888,6 +2054,7 @@ if [ -n "$fresh" ] && [ -f "$d/fresh_fail" ]; then echo "http error: status code
 case "$*" in
   "get key playback")
     if [ -n "$fresh" ] && [ -f "$d/fresh" ]; then cat "$d/fresh"; exit 0; fi
+    if [ -z "$fresh" ] && [ -f "$d/view" ]; then cat "$d/view"; exit 0; fi
     item=$(cat "$d/item")
     if [ -z "$item" ]; then echo null; exit 0; fi
     rest=${item#spotify:}; kind=${rest%%:*}; id=${item##*:}
@@ -2110,6 +2277,139 @@ exit 0
         assert_eq!(error.code, "unsupported");
     }
 
+    /// `get key playback` for the song [`FakeApp`] shows (Song — Artist, Album, 200 000 ms)
+    /// under the id `substitute`, with `extra` merged into the item.
+    fn relinked_view(extra: &Value) -> String {
+        let mut view = json!({"is_playing":true,"repeat_state":"off","shuffle_state":false,
+            "context":{"uri":"spotify:album:substitute-album","type":"album"},
+            "item":{"id":"substitute","type":"track","name":"Song","duration_ms":200_400,
+                "album":{"id":"substitute-album","name":"Album"},"artists":[{"name":"Artist"}]}});
+        if let (Some(item), Some(extra)) = (view["item"].as_object_mut(), extra.as_object()) {
+            item.extend(extra.clone());
+        }
+        view.to_string()
+    }
+
+    #[test]
+    fn like_refuses_a_relinked_song_at_once_and_says_why() {
+        // The QA case: Spotify.app shows the liked id, the Web API plays a substitute's id.
+        // spotify_player would like or unlike the substitute, so it must not run.
+        let fake = FakePlayer::new("spotify:track:substitute", true, "off");
+        fake.set("view", &relinked_view(&json!({})));
+        let app = fake.app("playing", "spotify:track:library");
+        let started = Instant::now();
+        for like in [true, false] {
+            let error = with_player(&app, &fake.player)
+                .like(like)
+                .expect_err("refuses");
+            assert_eq!(error.code, "track_mismatch");
+            assert!(!error.retryable, "retrying cannot change the id");
+            assert!(error.message.contains("relinking"), "{}", error.message);
+            assert!(error.hint.contains("relinked"), "{}", error.hint);
+            assert!(!error.hint.contains("few seconds"), "{}", error.hint);
+            let details = error.details.expect("details");
+            assert_eq!(details["relinked"], true);
+            assert_eq!(details["spotify_app"], "spotify:track:library");
+            assert_eq!(details["spotify_player"], "spotify:track:substitute");
+            assert_eq!(details["matched_by"], "title_length_album");
+        }
+        // No catch-up nudge and no like.
+        assert!(fake.commands().is_empty(), "{:?}", fake.commands());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // Named by linked_from: the same refusal.
+        fake.set(
+            "view",
+            &relinked_view(
+                &json!({"name":"Other title","linked_from":{"id":"library","type":"track"}}),
+            ),
+        );
+        let error = with_player(&app, &fake.player)
+            .like(false)
+            .expect_err("refuses");
+        assert!(!error.retryable);
+        assert_eq!(error.details.expect("details")["matched_by"], "linked_from");
+        assert!(fake.commands().is_empty(), "{:?}", fake.commands());
+    }
+
+    #[test]
+    fn like_still_waits_when_the_view_is_on_another_song() {
+        // Same length and album, another title: not the same song, so the usual catch-up.
+        let fake = FakePlayer::new("spotify:track:substitute", true, "off");
+        fake.set("view", &relinked_view(&json!({"name":"Another Song"})));
+        let app = fake.app("playing", "spotify:track:library");
+        let error = with_player(&app, &fake.player)
+            .like(true)
+            .expect_err("refuses");
+        assert_eq!(error.code, "track_mismatch");
+        assert!(error.retryable);
+        assert_eq!(fake.commands(), vec!["playback volume 50".to_owned()]);
+        // The same recording on another release (the view is behind after a switch between a
+        // single and its album): not relinked, so it waits for the view to catch up.
+        let fake = FakePlayer::new("spotify:track:substitute", true, "off");
+        fake.set(
+            "view",
+            &relinked_view(&json!({"album":{"id":"single","name":"Song (Single)"}})),
+        );
+        let app = fake.app("playing", "spotify:track:library");
+        let error = with_player(&app, &fake.player)
+            .like(true)
+            .expect_err("refuses");
+        assert!(error.retryable, "{error:?}");
+        assert!(error.details.expect("details").get("relinked").is_none());
+        assert_eq!(fake.commands(), vec!["playback volume 50".to_owned()]);
+    }
+
+    #[test]
+    fn status_full_counts_a_relinked_song_as_current() {
+        // From the instance's memory: no Web API read, not stale.
+        let fake = FakePlayer::new("spotify:track:substitute", true, "off");
+        fake.set("view", &relinked_view(&json!({})));
+        let app = fake.app("playing", "spotify:track:library");
+        let (playback, warnings) = with_player(&app, &fake.player)
+            .status_full()
+            .expect("status");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let web = playback.web.expect("web");
+        assert_eq!(web.source.as_deref(), Some("spotify_player"));
+        assert!(web.relinked && !web.stale);
+        assert_eq!(web.item_uri.as_deref(), Some("spotify:track:substitute"));
+        assert_eq!(
+            web.context_uri.as_deref(),
+            Some("spotify:album:substitute-album")
+        );
+        assert_eq!(fake.get("log").lines().count(), 1, "one read, from memory");
+        // From a fresh read, when the memory is on an earlier song.
+        std::fs::remove_file(fake.state().join("view")).expect("view");
+        fake.set("item", "spotify:track:earlier");
+        std::fs::write(fake.state().join("fresh"), relinked_view(&json!({}))).expect("fresh");
+        let (playback, warnings) = with_player(&app, &fake.player)
+            .status_full()
+            .expect("status");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let web = playback.web.expect("web");
+        assert_eq!(web.source.as_deref(), Some("web_api"));
+        assert!(web.relinked && !web.stale);
+        let json = serde_json::to_value(&web).expect("json");
+        assert_eq!(json["relinked"], true);
+    }
+
+    #[test]
+    fn a_relinked_view_counts_as_on_spotify_apps_song() {
+        // Seek offsets, skip permissions and the context to restore apply to it.
+        let fake = app();
+        let playback = controller(&fake).status().expect("status");
+        let relinked: Value = serde_json::from_str(&relinked_view(&json!({}))).expect("json");
+        let view = PlayerView::from_json(&relinked).expect("view");
+        assert!(view.is_on(&playback));
+        let mut other = relinked;
+        other["item"]["duration_ms"] = json!(215_000);
+        assert!(
+            !PlayerView::from_json(&other)
+                .expect("view")
+                .is_on(&playback)
+        );
+    }
+
     #[test]
     fn repeat_steps_from_spotify_players_mode_and_verifies() {
         let fake = FakePlayer::new("spotify:track:a", false, "context");
@@ -2311,13 +2611,19 @@ exit 0
         assert_eq!(outcome.via, Via::Applescript);
         assert_eq!(
             outcome.playback.track.map(|t| t.uri),
-            Some("spotify:user:user1:collection".to_owned())
+            Some("spotify:track:first-liked".to_owned())
         );
         assert!(fake.commands().is_empty(), "{:?}", fake.commands());
+        // Liked Songs' shuffle is off: nothing else is sent.
+        assert_eq!(
+            app.commands(),
+            vec!["play track \"spotify:user:user1:collection\"".to_owned()]
+        );
     }
 
-    #[test]
-    fn random_liked_songs_turn_shuffle_on_and_skip_the_in_order_first_song() {
+    /// A fake spotify_player signed in as `user1`, and Spotify.app paused on another song with
+    /// Liked Songs' kept shuffle on or off.
+    fn liked_setup(shuffled: bool) -> (FakePlayer, FakeApp) {
         let fake = FakePlayer::new("spotify:track:a", false, "off");
         std::fs::write(
             cache_dir(&fake.player).join("credentials.json"),
@@ -2325,21 +2631,105 @@ exit 0
         )
         .expect("credentials");
         let app = fake.app("paused", "spotify:track:a");
+        app.app.lock().expect("lock").shuffling = shuffled;
+        (fake, app)
+    }
+
+    fn liked(random: bool) -> PlayTarget {
+        PlayTarget::Liked { limit: 50, random }
+    }
+
+    #[test]
+    fn plain_liked_songs_turn_a_kept_shuffle_off_and_start_in_order() {
+        // The QA case: after an earlier --random, Liked Songs kept its shuffle, and a plain
+        // --liked started at the same shuffled song every time.
+        let (fake, app) = liked_setup(true);
         let outcome = with_player(&app, &fake.player)
-            .play(&PlayTarget::Liked {
-                limit: 50,
-                random: true,
-            })
+            .play(&liked(false))
             .expect("plays liked");
-        assert_eq!(outcome.playback.shuffling, Some(true));
+        assert_eq!(outcome.via, Via::Applescript);
+        assert_eq!(outcome.playback.shuffling, Some(false));
+        assert_eq!(
+            outcome.playback.track.map(|t| t.uri),
+            Some("spotify:track:first-liked".to_owned())
+        );
         assert_eq!(
             app.commands(),
             vec![
                 "play track \"spotify:user:user1:collection\"".to_owned(),
-                "set shuffling to true".to_owned(),
-                "next track".to_owned(),
+                "set shuffling to false".to_owned(),
+                "play track \"spotify:user:user1:collection\"".to_owned(),
             ]
         );
+        assert!(fake.commands().is_empty(), "{:?}", fake.commands());
+    }
+
+    #[test]
+    fn random_liked_songs_draw_a_new_order_and_skip_whatever_shuffle_was_kept() {
+        for kept in [false, true] {
+            let (fake, app) = liked_setup(kept);
+            let outcome = with_player(&app, &fake.player)
+                .play(&liked(true))
+                .expect("plays liked");
+            assert_eq!(outcome.playback.shuffling, Some(true), "kept {kept}");
+            // Neither the in-order first song nor the kept shuffle's start.
+            assert_eq!(
+                outcome.playback.track.map(|t| t.uri),
+                Some("spotify:track:next".to_owned()),
+                "kept {kept}"
+            );
+            assert_eq!(
+                app.commands(),
+                vec![
+                    "play track \"spotify:user:user1:collection\"".to_owned(),
+                    "set shuffling to false".to_owned(),
+                    "set shuffling to true".to_owned(),
+                    "next track".to_owned(),
+                ],
+                "kept {kept}"
+            );
+            assert!(fake.commands().is_empty(), "{:?}", fake.commands());
+        }
+    }
+
+    #[test]
+    fn liked_songs_steps_spotify_app_ignored_are_reported_not_claimed() {
+        // The skip never shows: Liked Songs plays, but not from a random song.
+        let (fake, app) = liked_setup(true);
+        let app = FakeApp {
+            ignores: &["next track"],
+            ..app
+        };
+        let error = with_player(&app, &fake.player)
+            .play(&liked(true))
+            .expect_err("the skip did not show");
+        assert_eq!(error.code, "verification_failed");
+        assert!(error.message.contains("random song"), "{}", error.message);
+        assert!(error.retryable);
+        // Shuffle cannot be turned off: plain --liked says so instead of playing shuffled.
+        let (fake, app) = liked_setup(true);
+        let app = FakeApp {
+            ignores: &["set shuffling"],
+            ..app
+        };
+        let error = with_player(&app, &fake.player)
+            .play(&liked(false))
+            .expect_err("shuffle stayed on");
+        assert_eq!(error.code, "verification_failed");
+        assert!(error.message.contains("shuffle off"), "{}", error.message);
+        assert_eq!(
+            app.commands(),
+            vec![
+                "play track \"spotify:user:user1:collection\"".to_owned(),
+                "set shuffling to false".to_owned(),
+            ]
+        );
+        // Spotify.app keeps playing Liked Songs either way; nothing went to spotify_player.
+        assert_eq!(
+            app.app.lock().expect("lock").uri.as_deref(),
+            Some("spotify:track:kept-shuffle-start")
+        );
+        assert!(fake.commands().is_empty(), "{:?}", fake.commands());
     }
 
     #[test]
@@ -2478,6 +2868,7 @@ exit 0
             frozen: true,
             ..fake.app("paused", "spotify:track:a")
         };
+        let started = Instant::now();
         let error = with_player(&app, &fake.player)
             .play(&PlayTarget::Liked {
                 limit: 50,
@@ -2485,6 +2876,8 @@ exit 0
             })
             .expect_err("Spotify.app did not start it");
         assert_eq!(error.code, "verification_failed");
+        // Said after one wait, not two.
+        assert!(started.elapsed() < Duration::from_millis(4000));
         assert!(fake.commands().is_empty(), "{:?}", fake.commands());
         // Nor shuffle and skip what was playing while Liked Songs never started.
         assert_eq!(
@@ -2497,6 +2890,68 @@ exit 0
         );
     }
 
+    /// Spotify.app that takes commands at once but shows their effect only `delay` after the
+    /// first one: status reads until then return what it showed before it.
+    struct LateApp {
+        inner: FakeApp,
+        delay: Duration,
+        before: Mutex<Option<String>>,
+        commanded: Mutex<Option<Instant>>,
+    }
+
+    impl Runner for LateApp {
+        fn run(&self, source: &str) -> Result<String> {
+            if !source.contains("character id 31") {
+                self.commanded
+                    .lock()
+                    .expect("lock")
+                    .get_or_insert_with(Instant::now);
+                return self.inner.run(source);
+            }
+            let shows = self
+                .commanded
+                .lock()
+                .expect("lock")
+                .is_some_and(|at| at.elapsed() >= self.delay);
+            let mut before = self.before.lock().expect("lock");
+            if shows {
+                return self.inner.run(source);
+            }
+            if before.is_none() {
+                *before = Some(self.inner.run(source)?);
+            }
+            Ok(before.clone().unwrap_or_default())
+        }
+    }
+
+    #[test]
+    fn a_liked_songs_start_that_shows_late_is_not_claimed_without_its_shuffle_step() {
+        // Liked Songs keeps a shuffle, and the start shows only after the start check gave up
+        // (2.5 s). Counting it then would report plain --liked as done while it plays shuffled.
+        let (fake, app) = liked_setup(true);
+        let late = LateApp {
+            inner: app,
+            delay: Duration::from_millis(3200),
+            before: Mutex::new(None),
+            commanded: Mutex::new(None),
+        };
+        let c = Controller {
+            script: &late,
+            ..with_player(&late.inner, &fake.player)
+        };
+        let error = c.play(&liked(false)).expect_err("not seen in time");
+        assert_eq!(error.code, "verification_failed");
+        assert!(error.retryable);
+        let commanded = late.commanded.lock().expect("lock").expect("sent");
+        assert!(commanded.elapsed() < late.delay, "said after one wait");
+        // Nothing was sent after the start it could not see.
+        assert_eq!(
+            late.inner.commands(),
+            vec!["play track \"spotify:user:user1:collection\"".to_owned()]
+        );
+        assert!(fake.commands().is_empty(), "{:?}", fake.commands());
+    }
+
     #[test]
     fn liked_songs_count_a_restart_of_the_song_already_loaded() {
         // Liked Songs starts with the song that is loaded (paused at 3 s): it restarted.
@@ -2506,7 +2961,7 @@ exit 0
             r#"{"username":"user1"}"#,
         )
         .expect("credentials");
-        let app = fake.app("paused", "spotify:user:user1:collection");
+        let app = fake.app("paused", "spotify:track:first-liked");
         app.app.lock().expect("lock").position = 3000;
         let outcome = with_player(&app, &fake.player)
             .play(&PlayTarget::Liked {

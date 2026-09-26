@@ -307,15 +307,48 @@ fn send_hand_off(daemon: &Arc<Daemon>, claim: &Pending, why: &str) {
     daemon.nudge.notify_one();
 }
 
+/// Longest wait for a one-shot Web API read of playback in [`capture_resume`] (usually 1–2 s).
+const FRESH_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Whether spotify_player's memory of playback (`get key playback`) names another item than the
+/// Web API's queue, read just after it (`get key queue`, which spotify_player asks the Web API
+/// for): the memory then describes an earlier moment, and its context may be an earlier one too.
+fn memory_behind(playback: &Value, queue: &Value) -> bool {
+    let Some(now) = queue
+        .get("currently_playing")
+        .filter(|item| !item.is_null())
+        .and_then(item_uri)
+    else {
+        return false;
+    };
+    playback
+        .get("item")
+        .filter(|item| !item.is_null())
+        .and_then(item_uri)
+        != Some(now)
+}
+
 /// Remembers the playing context and what is up next in it (Web API through spotify_player).
+///
+/// The running spotify_player answers playback from its memory, which re-reads the Web API only
+/// every refresh interval ([`crate::warm::REFRESH_MS`]) and after its own commands, so a context
+/// switched in Spotify.app (or by AppleScript) moments ago is not in it yet. When that memory is
+/// behind the queue ([`memory_behind`]), the context comes from a one-shot Web API read instead
+/// (the memory's, when that read fails).
 pub fn capture_resume(daemon: &Arc<Daemon>, settings: &Settings) {
     let Ok(player) = settings.authed_player() else {
         return;
     };
-    let playback = player
+    let mut playback = player
         .json(&["get", "key", "playback"])
         .unwrap_or(Value::Null);
     let queue = player.json(&["get", "key", "queue"]).unwrap_or(Value::Null);
+    if memory_behind(&playback, &queue)
+        && let Ok(fresh) = player.fresh_json(&["get", "key", "playback"], FRESH_READ_TIMEOUT)
+        && !fresh.is_null()
+    {
+        playback = fresh;
+    }
     let context = playback
         .pointer("/context/uri")
         .and_then(Value::as_str)
@@ -484,4 +517,36 @@ fn resume_context(daemon: &Arc<Daemon>, resume: &Resume, decided_ms: u64) {
     live.queue.hold(now_ms());
     daemon.save_queue(&live);
     daemon.nudge.notify_one();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(id: &str, kind: &str) -> Value {
+        json!({"id": id, "type": kind, "name": id})
+    }
+
+    #[test]
+    fn the_resume_context_is_read_afresh_only_when_spotify_players_memory_is_behind() {
+        let a = item("1PVeB2mHmWwdB9YHm0yeIZ", "track");
+        let b = item("43Xb3G04Pgp63fNhQW4T6W", "track");
+        let memory = |item: &Value| json!({"item": item, "context": {"uri": "spotify:album:37fimO5ahI9qtvEN7OqlME", "type": "album"}});
+        let queue = |item: &Value| json!({"currently_playing": item, "queue": [item]});
+        // The memory names what the Web API plays now: its context is used as is.
+        assert!(!memory_behind(&memory(&a), &queue(&a)));
+        // Spotify.app moved on (another list, a skip) since the last refresh.
+        assert!(memory_behind(&memory(&a), &queue(&b)));
+        assert!(memory_behind(&json!({"item": null}), &queue(&b)));
+        assert!(memory_behind(&Value::Null, &queue(&b)));
+        // An episode and a track with the same id are different items.
+        let episode = item("1PVeB2mHmWwdB9YHm0yeIZ", "episode");
+        assert!(memory_behind(&memory(&a), &queue(&episode)));
+        // Without the Web API's answer there is nothing to compare with.
+        assert!(!memory_behind(&memory(&a), &Value::Null));
+        assert!(!memory_behind(
+            &memory(&a),
+            &json!({"currently_playing": null})
+        ));
+    }
 }

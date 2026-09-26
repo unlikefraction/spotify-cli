@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use silicon_spotify_client::applescript::{self, Runner};
 use silicon_spotify_client::control::{Controller, PlayTarget, RepeatMode, Strategy, VolumeTarget};
 use silicon_spotify_client::ipc::Request;
-use silicon_spotify_client::model::{Item, Playback, PlayerState, Track, now_rfc3339};
+use silicon_spotify_client::model::{Item, Playback, PlayerState, Track, WebPlayback, now_rfc3339};
 use silicon_spotify_client::player::{Output, SpotifyPlayer};
 use silicon_spotify_client::timing::SeekTarget;
 use silicon_spotify_client::trigger::Tracker;
@@ -99,6 +99,11 @@ pub struct Live {
     pub notifications: u64,
     /// Readings taken.
     pub readings: u64,
+    /// Lookups of a managed item's missing facts so far, by item id (in memory; see
+    /// [`fill_facts_later`]).
+    pub fact_tries: std::collections::HashMap<String, u32>,
+    /// Whether a background lookup of missing queue-item facts runs.
+    pub facts_backfill: bool,
 }
 
 /// Shared daemon state.
@@ -854,7 +859,8 @@ async fn is_liked(settings: &Settings, id: Option<String>) -> Option<bool> {
         ),
     )
     .await
-    .ok()??;
+    .ok()?
+    .found()?;
     liked_from_web(&answer)
 }
 
@@ -1406,7 +1412,24 @@ fn spotify_auth_status(settings: &Settings) -> Result<Value> {
     Ok(out)
 }
 
+/// How long `spotify queue` may spend looking up facts still missing from queued episodes.
+const LIST_LOOKUP_BUDGET: Duration = Duration::from_millis(2_500);
+
 async fn queue_list(daemon: &Arc<Daemon>, settings: Settings) -> Result<Value> {
+    // Facts a rate limit kept out of `queue add`: look them up now when the Web API is free
+    // (briefly, and not while a background lookup runs), else leave them to the background.
+    let look_now = web_api_pause_left().is_zero() && {
+        let live = daemon.live();
+        !live.facts_backfill && !facts_wanted(&live).is_empty()
+    };
+    if look_now {
+        let tokens = access_tokens(&settings).await;
+        if !tokens.is_empty() {
+            let deadline = tokio::time::Instant::now() + LIST_LOOKUP_BUDGET;
+            backfill_round(daemon, &tokens, deadline).await;
+        }
+    }
+    fill_facts_later(daemon, &settings);
     let (managed, managed_now, resume) = {
         let live = daemon.live();
         (
@@ -1415,18 +1438,32 @@ async fn queue_list(daemon: &Arc<Daemon>, settings: Settings) -> Result<Value> {
             live.queue.resume.clone(),
         )
     };
+    let d = Arc::clone(daemon);
     let upcoming = blocking(move || -> Result<Value> {
-        match settings
-            .authed_player()
-            .and_then(|p| p.json(&["get", "key", "queue"]))
-        {
-            Ok(value) => {
+        let queue = settings.authed_player().and_then(|player| {
+            let value = player.json(&["get", "key", "queue"])?;
+            Ok((player, value))
+        });
+        match queue {
+            Ok((player, value)) => {
                 let (items, repeats) = spotify_upcoming(&value);
+                let more = !items.is_empty();
                 let mut upcoming = json!({"items": items});
                 if repeats > 0 {
+                    // Why, as far as spotify_player's view of playback (its memory) shows it,
+                    // checked against whether Spotify.app repeats now.
+                    let playback = player
+                        .json(&["get", "key", "playback"])
+                        .ok()
+                        .and_then(|p| WebPlayback::from_player_json(&p));
+                    let repeating = d.read().ok().and_then(|app| app.repeating);
                     upcoming["current_repeats_left_out"] = json!(repeats);
-                    upcoming["note"] = json!(format!(
-                        "Spotify listed the item playing now {repeats} more time(s) as upcoming (it does that for an episode played without a context, and with repeat-one); those are left out."
+                    upcoming["note"] = json!(repeats_note(
+                        repeats,
+                        &value,
+                        playback.as_ref(),
+                        repeating,
+                        more
                     ));
                 }
                 Ok(upcoming)
@@ -1444,9 +1481,60 @@ async fn queue_list(daemon: &Arc<Daemon>, settings: Settings) -> Result<Value> {
     }))
 }
 
+/// The note on the copies of the item playing now that [`spotify_upcoming`] left out. Spotify
+/// lists the current item again when nothing else follows it: with repeat-one, when it was played
+/// without a context, or at the end of its context with repeat off. The note names one of those
+/// causes only when `playback` (spotify_player's view) shows it for that same item, and none
+/// otherwise; `more` says whether other items follow the repeats.
+///
+/// The view is spotify_player's memory, up to one refresh interval (see
+/// [`crate::warm::REFRESH_MS`]) behind. `repeating` is whether Spotify.app repeats now (it cannot
+/// tell repeat-one from repeating the context): a view it contradicts names no cause.
+fn repeats_note(
+    repeats: usize,
+    queue: &Value,
+    playback: Option<&WebPlayback>,
+    repeating: Option<bool>,
+    more: bool,
+) -> String {
+    let current = queue.get("currently_playing").filter(|c| !c.is_null());
+    let kind = current
+        .and_then(|c| c.get("type"))
+        .and_then(Value::as_str)
+        .filter(|kind| matches!(*kind, "track" | "episode"))
+        .unwrap_or("item");
+    let current = current.and_then(crate::watcher::item_uri);
+    let cause = playback
+        .filter(|p| current.is_some() && p.item_uri == current)
+        .filter(|p| {
+            let view = p.repeat_state.as_deref().map(|mode| mode != "off");
+            !matches!((repeating, view), (Some(app), Some(view)) if app != view)
+        })
+        .and_then(|p| {
+            if p.repeat_state.as_deref() == Some("track") {
+                Some("repeat-one is on".to_owned())
+            } else if p.context_uri.is_none() {
+                Some(format!("the {kind} was played without a context"))
+            } else if p.repeat_state.as_deref() == Some("off") && !more {
+                Some(match p.context_type.as_deref() {
+                    Some("collection") => "nothing else is up next in Liked Songs".to_owned(),
+                    Some(context) => format!("nothing else is up next in its {context}"),
+                    None => "nothing else is up next in its context".to_owned(),
+                })
+            } else {
+                None
+            }
+        })
+        .map(|cause| format!(" ({cause})"))
+        .unwrap_or_default();
+    format!(
+        "Spotify listed the {kind} playing now {repeats} more time(s) as upcoming{cause}; those are left out."
+    )
+}
+
 /// Spotify's upcoming items from `get key queue`, without the leading run of the item playing
-/// now (Spotify repeats an episode played without a context ten times there, and a track on
-/// repeat-one), and how many such repeats were left out.
+/// now (Spotify lists it again when nothing else follows it; see [`repeats_note`]), and how many
+/// such repeats were left out.
 fn spotify_upcoming(value: &Value) -> (Vec<Item>, usize) {
     let current = value
         .get("currently_playing")
@@ -1472,6 +1560,20 @@ fn spotify_upcoming(value: &Value) -> (Vec<Item>, usize) {
 /// (name, artists or show, duration) looked up for a queued item.
 type TrackFacts = (Option<String>, Option<String>, Option<u64>);
 
+/// Whether none of the facts is missing.
+fn complete(facts: &TrackFacts) -> bool {
+    facts.0.is_some() && facts.1.is_some() && facts.2.is_some()
+}
+
+/// `facts` with what it lacks taken from `found`, field by field (what `facts` has is kept).
+fn merge(facts: TrackFacts, found: TrackFacts) -> TrackFacts {
+    (
+        facts.0.or(found.0),
+        facts.1.or(found.1),
+        facts.2.or(found.2),
+    )
+}
+
 /// What a caller already knows about an item it queues (e.g. from the search hit it picked).
 #[derive(Clone, Debug, Default, Deserialize)]
 struct Known {
@@ -1482,6 +1584,23 @@ struct Known {
     by: Option<String>,
     #[serde(default)]
     duration_ms: Option<u64>,
+}
+
+impl Known {
+    /// Its facts; an empty name or `by` counts as missing.
+    fn facts(&self) -> TrackFacts {
+        (
+            text(self.name.clone()),
+            text(self.by.clone()),
+            self.duration_ms,
+        )
+    }
+}
+
+/// A name or `by` worth recording: an empty one counts as missing, so a later lookup can still
+/// fill it in ([`merge`] keeps what is there).
+fn text(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
 }
 
 /// Why `uri` cannot be queued, with a hint that fits its kind.
@@ -1520,15 +1639,201 @@ fn not_queueable(uri: &SpotifyUri) -> Error {
 const EPISODE_LOOKUP_BUDGET: Duration = Duration::from_secs(8);
 
 /// Name, show and length of an episode, which spotify_player cannot look up by id: the Web API
-/// (`GET /v1/episodes/{id}`, see [`web_api_get`]). Any failure leaves the facts out.
-async fn episode_facts(tokens: &[String], id: &str) -> Option<TrackFacts> {
+/// (`GET /v1/episodes/{id}`, see [`web_api_get`]). What a rate limit keeps out is looked up again
+/// later ([`fill_facts_later`]).
+async fn episode_facts(tokens: &[String], id: &str) -> Fetched<TrackFacts> {
     let url = format!("https://api.spotify.com/v1/episodes/{id}");
-    let value = web_api_get(tokens, &url, &[], Duration::from_secs(4)).await?;
-    Some(episode_from_web(&value))
+    web_api_get(tokens, &url, &[], Duration::from_secs(4))
+        .await
+        .map(|value| episode_from_web(&value))
+}
+
+/// Lookups per queued episode before its missing facts are left out for good (a rate limit's
+/// refusal does not count).
+const FACT_TRIES: u32 = 3;
+/// Longest a background lookup of missing facts keeps waiting out rate limits.
+const BACKFILL_FOR: Duration = Duration::from_secs(600);
+/// Between background passes after a lookup failed for a reason other than a rate limit.
+const BACKFILL_RETRY: Duration = Duration::from_secs(20);
+
+/// The Spotify id of a queued episode that still lacks its name, show or length.
+fn episode_missing_facts(item: &QueueItem) -> Option<&str> {
+    let id = item.uri.strip_prefix("spotify:episode:")?;
+    (item.name.is_none() || item.by.is_none() || item.duration_ms.is_none()).then_some(id)
+}
+
+/// Managed items worth looking up again: (item id, episode id) of each queued episode that
+/// lacks facts and has had fewer than [`FACT_TRIES`] lookups.
+fn facts_wanted(live: &Live) -> Vec<(String, String)> {
+    live.queue
+        .items
+        .iter()
+        .filter(|item| live.fact_tries.get(&item.id).copied().unwrap_or(0) < FACT_TRIES)
+        .filter_map(|item| Some((item.id.clone(), episode_missing_facts(item)?.to_owned())))
+        .collect()
+}
+
+/// Adds `found` to what managed item `item_id` lacks, field by field, and saves the queue.
+fn fill_item(daemon: &Daemon, item_id: &str, found: TrackFacts) {
+    let mut live = daemon.live();
+    let Some(item) = live.queue.items.iter_mut().find(|item| item.id == item_id) else {
+        return;
+    };
+    let before = (item.name.clone(), item.by.clone(), item.duration_ms);
+    let merged = merge(before.clone(), found);
+    if merged == before {
+        return;
+    }
+    (item.name, item.by, item.duration_ms) = merged;
+    daemon.save_queue(&live);
+}
+
+/// spotify_player's cached Web API access tokens (none when it is not signed in).
+async fn access_tokens(settings: &Settings) -> Vec<String> {
+    let settings = settings.clone();
+    blocking(move || {
+        Ok(settings
+            .authed_player()
+            .map(|player| cached_access_tokens(&player))
+            .unwrap_or_default())
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// One pass over [`facts_wanted`] until `deadline`. Each lookup counts as a try, except one a
+/// rate limit refused, which ends the pass (true then), and one `deadline` cut short (the pass's
+/// own budget, shorter than a request's timeout in `spotify queue`), which is left for a later
+/// pass.
+async fn backfill_round(
+    daemon: &Daemon,
+    tokens: &[String],
+    deadline: tokio::time::Instant,
+) -> bool {
+    let wanted = facts_wanted(&daemon.live());
+    for (item_id, episode_id) in wanted {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let Ok(fetched) =
+            tokio::time::timeout_at(deadline, episode_facts(tokens, &episode_id)).await
+        else {
+            break;
+        };
+        if matches!(fetched, Fetched::Limited) {
+            return true;
+        }
+        *daemon.live().fact_tries.entry(item_id.clone()).or_default() += 1;
+        if let Fetched::Found(found) = fetched {
+            fill_item(daemon, &item_id, found);
+        }
+    }
+    false
+}
+
+/// Looks up, in the background, the facts queued episodes still lack. `queue add` gets none
+/// while Spotify rate-limits the client it shares with spotify_player (or when the lookup is
+/// slow), and would otherwise keep the item nameless for good. After a rate limit this waits
+/// until its `Retry-After` has passed, then asks again; other failures get [`FACT_TRIES`]
+/// lookups in all. At most one runs at a time. True when one runs to look for them.
+fn fill_facts_later(daemon: &Arc<Daemon>, settings: &Settings) -> bool {
+    {
+        let mut live = daemon.live();
+        let Live {
+            queue, fact_tries, ..
+        } = &mut *live;
+        fact_tries.retain(|id, _| queue.items.iter().any(|item| &item.id == id));
+        if facts_wanted(&live).is_empty() {
+            return false;
+        }
+        if live.facts_backfill {
+            return true;
+        }
+        live.facts_backfill = true;
+    }
+    let daemon = Arc::clone(daemon);
+    let settings = settings.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            () = backfill_facts(&daemon, &settings) => {}
+            () = daemon.shutdown.notified() => daemon.live().facts_backfill = false,
+        }
+    });
+    true
+}
+
+/// The loop behind [`fill_facts_later`]; it clears `facts_backfill` when it ends.
+async fn backfill_facts(daemon: &Daemon, settings: &Settings) {
+    let give_up = tokio::time::Instant::now() + BACKFILL_FOR;
+    let mut wait = Duration::ZERO;
+    loop {
+        let at = tokio::time::Instant::now() + wait.max(web_api_pause_left());
+        let tokens = if at > give_up {
+            Vec::new()
+        } else {
+            tokio::time::sleep_until(at).await;
+            access_tokens(settings).await
+        };
+        let limited = !tokens.is_empty()
+            && backfill_round(
+                daemon,
+                &tokens,
+                tokio::time::Instant::now() + EPISODE_LOOKUP_BUDGET,
+            )
+            .await;
+        {
+            // Checked and cleared together, so an item queued after this starts a new lookup.
+            let mut live = daemon.live();
+            if tokens.is_empty() || facts_wanted(&live).is_empty() {
+                live.facts_backfill = false;
+                return;
+            }
+        }
+        wait = if limited {
+            Duration::from_secs(1)
+        } else {
+            BACKFILL_RETRY
+        };
+    }
+}
+
+/// What a Web API lookup came back with.
+#[derive(Debug, PartialEq)]
+enum Fetched<T> {
+    /// The answer.
+    Found(T),
+    /// Refused by a rate limit (now, or the pause after an earlier one): worth asking again once
+    /// the `Retry-After` has passed ([`web_api_pause_left`]).
+    Limited,
+    /// Anything else: refused tokens, another status, the network, the timeout.
+    Failed,
+}
+
+impl<T> Fetched<T> {
+    fn found(self) -> Option<T> {
+        match self {
+            Self::Found(value) => Some(value),
+            Self::Limited | Self::Failed => None,
+        }
+    }
+
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Fetched<U> {
+        match self {
+            Self::Found(value) => Fetched::Found(f(value)),
+            Self::Limited => Fetched::Limited,
+            Self::Failed => Fetched::Failed,
+        }
+    }
 }
 
 /// Until when (unix ms) [`web_api_get`] stays away from the Web API after a rate limit.
 static WEB_API_PAUSED_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long [`web_api_get`] still stays away after a rate limit (zero when it does not).
+fn web_api_pause_left() -> Duration {
+    let until = WEB_API_PAUSED_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed);
+    Duration::from_millis(until.saturating_sub(silicon_spotify_client::model::now_ms()))
+}
 
 /// How long to stay away after a 429: its `Retry-After` in seconds, 30 s without a usable one,
 /// at most 10 minutes (these lookups are niceties; a bogus header must not disable them for long).
@@ -1541,36 +1846,46 @@ fn rate_limit_pause(retry_after: Option<&str>) -> Duration {
 
 /// `GET` a Spotify Web API `url` with the access tokens spotify_player keeps in its cache folder
 /// (the warm copy keeps them fresh; see [`cached_access_tokens`]), trying the next token when one
-/// is refused (401/403). `None` on any other status (a rate limit, say), a network error or
-/// after `timeout` per request; nothing is logged or shown. After a rate limit (429) it sends
-/// nothing until the `Retry-After` has passed, so these lookups do not prolong it for
-/// spotify_player, which shares the token's client.
+/// is refused (401/403). [`Fetched::Limited`] on a rate limit (429), [`Fetched::Failed`] on any
+/// other status, a network error or after `timeout` per request; nothing is logged or shown.
+/// After a rate limit it sends nothing until the `Retry-After` has passed (answering `Limited`
+/// meanwhile), so these lookups do not prolong it for spotify_player, which shares the token's
+/// client.
 async fn web_api_get(
     tokens: &[String],
     url: &str,
     query: &[(&str, &str)],
     timeout: Duration,
-) -> Option<Value> {
+) -> Fetched<Value> {
     use std::sync::atomic::Ordering;
-    if silicon_spotify_client::model::now_ms() < WEB_API_PAUSED_UNTIL_MS.load(Ordering::Relaxed) {
-        return None;
+    if !web_api_pause_left().is_zero() {
+        return Fetched::Limited;
     }
     silicon_spotify_client::api::ensure_crypto();
     // The token goes to api.spotify.com only: never follow a redirect with it.
-    let client = reqwest::Client::builder()
+    let Ok(client) = reqwest::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .https_only(true)
         .build()
-        .ok()?;
+    else {
+        return Fetched::Failed;
+    };
     for token in tokens.iter().take(2) {
         let mut request = client.get(url).bearer_auth(token);
         if !query.is_empty() {
             request = request.query(query);
         }
-        let response = request.send().await.ok()?;
+        let Ok(response) = request.send().await else {
+            return Fetched::Failed;
+        };
         match response.status().as_u16() {
-            200 => return response.json::<Value>().await.ok(),
+            200 => {
+                return response
+                    .json::<Value>()
+                    .await
+                    .map_or(Fetched::Failed, Fetched::Found);
+            }
             // That token is stale or for a client without the scope: try the next.
             401 | 403 => {}
             429 => {
@@ -1583,22 +1898,24 @@ async fn web_api_get(
                 let until = silicon_spotify_client::model::now_ms()
                     .saturating_add(u64::try_from(pause.as_millis()).unwrap_or(u64::MAX));
                 WEB_API_PAUSED_UNTIL_MS.fetch_max(until, Ordering::Relaxed);
-                return None;
+                return Fetched::Limited;
             }
-            _ => return None,
+            _ => return Fetched::Failed,
         }
     }
-    None
+    Fetched::Failed
 }
 
 /// (name, show, duration) of a Web API episode object.
 fn episode_from_web(value: &Value) -> TrackFacts {
     (
-        value.get("name").and_then(Value::as_str).map(str::to_owned),
-        value
-            .pointer("/show/name")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        text(value.get("name").and_then(Value::as_str).map(str::to_owned)),
+        text(
+            value
+                .pointer("/show/name")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        ),
         value.get("duration_ms").and_then(Value::as_u64),
     )
 }
@@ -1660,53 +1977,64 @@ async fn queue_add(daemon: &Arc<Daemon>, request: &Request, settings: Settings) 
     let who = request.isi.clone().or_else(|| request.home.clone());
     let uris = a.uris.clone();
     let known = a.known.clone();
-    let player = settings.authed_player().ok();
-    let lookup = player.clone();
+    let lookup = settings.authed_player().ok();
+    let signed_in = lookup.is_some();
     let mut details = blocking(move || -> Result<Vec<TrackFacts>> {
         Ok(uris
             .iter()
             .map(|uri| {
-                if let Some(k) = known.iter().find(|k| k.uri == uri.uri())
-                    && k.name.is_some()
-                {
-                    return (k.name.clone(), k.by.clone(), k.duration_ms);
+                let known = known
+                    .iter()
+                    .find(|k| k.uri == uri.uri())
+                    .map_or_else(TrackFacts::default, Known::facts);
+                // Episodes are looked up below (the Web API); tracks through spotify_player.
+                if complete(&known) || uri.kind != Kind::Track {
+                    return known;
                 }
-                if uri.kind != Kind::Track {
-                    return (None, None, None);
-                }
-                lookup
+                let found = lookup
                     .as_ref()
                     .and_then(|p| p.json(&["get", "item", "--id", &uri.id, "track"]).ok())
                     .and_then(|v| Item::from_player_json("track", &v))
-                    .map_or((None, None, None), |item| {
-                        (Some(item.name), Some(item.by.join(", ")), item.duration_ms)
-                    })
+                    .map_or_else(TrackFacts::default, |item| {
+                        (
+                            text(Some(item.name)),
+                            text(Some(item.by.join(", "))),
+                            item.duration_ms,
+                        )
+                    });
+                merge(known, found)
             })
             .collect())
     })
     .await?;
-    if let Some(player) = player
+    let episode_lacks =
+        |uri: &SpotifyUri, facts: &TrackFacts| uri.kind == Kind::Episode && !complete(facts);
+    // Whether missing facts can be looked up later, and whether a rate limit refused them now.
+    let (mut can_look, mut limited) = (false, false);
+    if signed_in
         && a.uris
             .iter()
             .zip(&details)
-            .any(|(uri, facts)| uri.kind == Kind::Episode && facts.0.is_none())
+            .any(|(uri, facts)| episode_lacks(uri, facts))
     {
-        let tokens = blocking(move || Ok(cached_access_tokens(&player)))
-            .await
-            .unwrap_or_default();
+        let tokens = access_tokens(&settings).await;
+        can_look = !tokens.is_empty();
         // Names are a nicety: on a slow network, stop looking them up rather than hold the
-        // `queue add` (many episodes at 4 s each) near the caller's timeout.
+        // `queue add` (many episodes at 4 s each) near the caller's timeout. What is still
+        // missing then (or refused by a rate limit) is looked up in the background.
         let deadline = tokio::time::Instant::now() + EPISODE_LOOKUP_BUDGET;
         for (uri, facts) in a.uris.iter().zip(details.iter_mut()) {
             if tokens.is_empty() || tokio::time::Instant::now() >= deadline {
                 break;
             }
-            if uri.kind == Kind::Episode
-                && facts.0.is_none()
-                && let Ok(Some(found)) =
-                    tokio::time::timeout_at(deadline, episode_facts(&tokens, &uri.id)).await
-            {
-                *facts = found;
+            // A search hit may name the episode but not its show: fill in what is missing.
+            if !episode_lacks(uri, facts) {
+                continue;
+            }
+            match tokio::time::timeout_at(deadline, episode_facts(&tokens, &uri.id)).await {
+                Ok(Fetched::Found(found)) => *facts = merge(std::mem::take(facts), found),
+                Ok(Fetched::Limited) => limited = true,
+                Ok(Fetched::Failed) | Err(_) => {}
             }
         }
     }
@@ -1752,7 +2080,35 @@ async fn queue_add(daemon: &Arc<Daemon>, request: &Request, settings: Settings) 
         .await;
     }
     daemon.nudge.notify_one();
-    Ok(json!({"added": added, "queue": queue}))
+    let mut out = json!({"added": added, "queue": queue});
+    let pending: Vec<&str> = added
+        .iter()
+        .filter(|item| episode_missing_facts(item).is_some())
+        .map(|item| item.id.as_str())
+        .collect();
+    if can_look && !pending.is_empty() && fill_facts_later(daemon, &settings) {
+        out["note"] = json!(pending_note(pending.len(), limited));
+        out["metadata_pending"] = json!(pending);
+    }
+    Ok(out)
+}
+
+/// The note on `queue add` when the Web API has not described some of the episodes yet;
+/// `limited` when a rate limit refused a lookup.
+fn pending_note(episodes: usize, limited: bool) -> String {
+    let what = if episodes == 1 {
+        "1 queued episode".to_owned()
+    } else {
+        format!("{episodes} queued episodes")
+    };
+    let why = if limited {
+        " (Spotify is rate-limiting this client right now)"
+    } else {
+        ""
+    };
+    format!(
+        "Spotify's Web API has not given the name, show or length of {what} yet{why}. The daemon asks again in the background; `spotify queue` shows what it finds."
+    )
 }
 
 fn queue_edit(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
@@ -1930,6 +2286,264 @@ mod tests {
             vec!["Next", "Now"]
         );
         assert_eq!(items[0].kind, "track");
+    }
+
+    /// spotify_player's view of playback: `item` (`spotify:<kind>:<id>`) in `context`
+    /// (`(uri, type)`) with `repeat`.
+    fn view(item: &str, context: Option<(&str, &str)>, repeat: &str) -> WebPlayback {
+        let mut parts = item.split(':').skip(1);
+        let (kind, id) = (parts.next().unwrap_or("track"), parts.next().unwrap_or(ID));
+        let context = context.map_or(Value::Null, |(uri, kind)| json!({"uri": uri, "type": kind}));
+        WebPlayback::from_player_json(&json!({
+            "item": {"id": id, "type": kind},
+            "context": context,
+            "repeat_state": repeat,
+            "is_playing": false,
+        }))
+        .expect("playback")
+    }
+
+    #[test]
+    fn the_repeats_note_names_only_a_cause_the_view_shows() {
+        let track = format!("spotify:track:{ID}");
+        let queue = json!({"currently_playing": track_json(ID, "Chandni Raat", 191)});
+        let album = Some(("spotify:album:37fimO5ahI9qtvEN7OqlME", "album"));
+        // The end of a one-track album with repeat off: not an episode, not repeat-one.
+        let off = view(&track, album, "off");
+        let end = repeats_note(10, &queue, Some(&off), Some(false), false);
+        assert_eq!(
+            end,
+            "Spotify listed the track playing now 10 more time(s) as upcoming (nothing else is up next in its album); those are left out."
+        );
+        // Without Spotify.app's answer the view alone decides.
+        assert_eq!(repeats_note(10, &queue, Some(&off), None, false), end);
+        // A track played on its own.
+        let alone = repeats_note(10, &queue, Some(&view(&track, None, "off")), None, false);
+        assert!(
+            alone.contains("(the track was played without a context)"),
+            "{alone}"
+        );
+        // Repeat-one, whatever the context.
+        let repeat_one = view(&track, album, "track");
+        let one = repeats_note(3, &queue, Some(&repeat_one), Some(true), true);
+        assert!(one.contains("(repeat-one is on)"), "{one}");
+        // An episode played on its own.
+        let episode = "4IzpgR6RCEkRqMHbJF38Wp";
+        let queue_episode = json!({"currently_playing": {"id": episode, "type": "episode"}});
+        let view_episode = view(&format!("spotify:episode:{episode}"), None, "off");
+        assert_eq!(
+            repeats_note(10, &queue_episode, Some(&view_episode), Some(false), false),
+            "Spotify listed the episode playing now 10 more time(s) as upcoming (the episode was played without a context); those are left out."
+        );
+        // No cause is claimed without a view of this item, or when none of the causes shows.
+        let bare =
+            "Spotify listed the track playing now 10 more time(s) as upcoming; those are left out.";
+        assert_eq!(repeats_note(10, &queue, None, Some(false), false), bare);
+        let other = view("spotify:track:4uLU6hMCjMI75M1A2tKUQC", None, "track");
+        assert_eq!(
+            repeats_note(10, &queue, Some(&other), Some(true), false),
+            bare
+        );
+        assert_eq!(
+            repeats_note(10, &queue, Some(&off), Some(false), true),
+            bare
+        );
+        let context_repeat = view(&track, album, "context");
+        assert_eq!(
+            repeats_note(10, &queue, Some(&context_repeat), Some(true), false),
+            bare
+        );
+        // The view lags Spotify.app by up to a refresh: a repeat setting Spotify.app contradicts
+        // (repeat-one switched on or off in the app since) names no cause.
+        assert_eq!(
+            repeats_note(10, &queue, Some(&off), Some(true), false),
+            bare
+        );
+        assert_eq!(
+            repeats_note(10, &queue, Some(&repeat_one), Some(false), false),
+            bare
+        );
+        for note in [end, alone, bare.to_owned()] {
+            assert!(
+                !note.contains("episode") && !note.contains("repeat-one"),
+                "{note}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_facts_are_completed_field_by_field() {
+        // A search hit that names the episode but not its show (spotify_player's hits carry none).
+        let known = Known {
+            uri: format!("spotify:episode:{ID}"),
+            name: Some("How to Speak Clearly".into()),
+            by: Some("  ".into()),
+            duration_ms: Some(8_780_886),
+        };
+        let facts = known.facts();
+        assert_eq!(
+            facts,
+            (Some("How to Speak Clearly".into()), None, Some(8_780_886))
+        );
+        assert!(!complete(&facts));
+        let found = (
+            Some("How to Speak Clearly & With Confidence | Matt Abrahams".into()),
+            Some("Huberman Lab".into()),
+            Some(8_780_000),
+        );
+        // What the caller knew wins; only the gap is filled.
+        let merged = merge(facts, found);
+        assert_eq!(
+            merged,
+            (
+                Some("How to Speak Clearly".into()),
+                Some("Huberman Lab".into()),
+                Some(8_780_886)
+            )
+        );
+        assert!(complete(&merged));
+        assert_eq!(
+            merge(TrackFacts::default(), (None, Some("Show".into()), None)),
+            (None, Some("Show".into()), None)
+        );
+    }
+
+    fn queued(id: &str, uri: &str, facts: TrackFacts) -> QueueItem {
+        QueueItem {
+            id: id.into(),
+            uri: uri.into(),
+            name: facts.0,
+            by: facts.1,
+            duration_ms: facts.2,
+            added_at: String::new(),
+            added_by: None,
+            attempts: 0,
+        }
+    }
+
+    #[test]
+    fn queued_episodes_missing_facts_are_looked_up_again_a_few_times() {
+        let episode = |id: &str| format!("spotify:episode:{id}");
+        let full = (Some("Ep".into()), Some("Show".into()), Some(60_000));
+        let mut live = Live::default();
+        live.queue.items = vec![
+            queued(
+                "q_1",
+                &episode("4IzpgR6RCEkRqMHbJF38Wp"),
+                TrackFacts::default(),
+            ),
+            queued(
+                "q_2",
+                &episode("5IzpgR6RCEkRqMHbJF38Wp"),
+                (Some("Ep".into()), None, Some(60_000)),
+            ),
+            queued("q_3", &episode("6IzpgR6RCEkRqMHbJF38Wp"), full),
+            // Tracks come from spotify_player, not this lookup.
+            queued("q_4", &format!("spotify:track:{ID}"), TrackFacts::default()),
+            queued(
+                "q_5",
+                &episode("7IzpgR6RCEkRqMHbJF38Wp"),
+                TrackFacts::default(),
+            ),
+        ];
+        live.fact_tries.insert("q_5".into(), FACT_TRIES);
+        live.fact_tries.insert("q_2".into(), FACT_TRIES - 1);
+        assert_eq!(
+            facts_wanted(&live),
+            vec![
+                ("q_1".to_owned(), "4IzpgR6RCEkRqMHbJF38Wp".to_owned()),
+                ("q_2".to_owned(), "5IzpgR6RCEkRqMHbJF38Wp".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn found_facts_fill_only_what_the_queued_item_lacks() {
+        let daemon = daemon_playing(&format!("spotify:track:{ID}"));
+        daemon.live().queue.items = vec![queued(
+            "q_1",
+            "spotify:episode:4IzpgR6RCEkRqMHbJF38Wp",
+            (Some("Known name".into()), None, None),
+        )];
+        fill_item(
+            &daemon,
+            "q_1",
+            (
+                Some("Web name".into()),
+                Some("Huberman Lab".into()),
+                Some(8_780_886),
+            ),
+        );
+        // An item no longer queued is left alone.
+        fill_item(&daemon, "q_gone", (Some("x".into()), None, None));
+        let live = daemon.live();
+        let item = &live.queue.items[0];
+        assert_eq!(item.name.as_deref(), Some("Known name"));
+        assert_eq!(item.by.as_deref(), Some("Huberman Lab"));
+        assert_eq!(item.duration_ms, Some(8_780_886));
+        assert_eq!(live.queue.items.len(), 1);
+        assert_eq!(episode_missing_facts(item), None);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_lookup_is_not_a_try_and_nothing_is_sent_meanwhile() {
+        use std::sync::atomic::Ordering;
+        let daemon = daemon_playing(&format!("spotify:track:{ID}"));
+        daemon.live().queue.items = vec![queued(
+            "q_1",
+            "spotify:episode:4IzpgR6RCEkRqMHbJF38Wp",
+            TrackFacts::default(),
+        )];
+        // While an earlier 429's Retry-After runs, lookups answer `Limited` without a request
+        // (the token here is fake: a request would fail, not be limited).
+        let before = WEB_API_PAUSED_UNTIL_MS.load(Ordering::Relaxed);
+        WEB_API_PAUSED_UNTIL_MS.store(
+            silicon_spotify_client::model::now_ms() + 60_000,
+            Ordering::Relaxed,
+        );
+        assert!(web_api_pause_left() > Duration::from_secs(50));
+        let tokens = ["not-a-token".to_owned()];
+        assert_eq!(
+            episode_facts(&tokens, "4IzpgR6RCEkRqMHbJF38Wp").await,
+            Fetched::Limited
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert!(backfill_round(&daemon, &tokens, deadline).await);
+        WEB_API_PAUSED_UNTIL_MS.store(before, Ordering::Relaxed);
+        // The item stays wanted, with no try used up.
+        let live = daemon.live();
+        assert_eq!(live.fact_tries.get("q_1"), None);
+        assert_eq!(facts_wanted(&live).len(), 1);
+    }
+
+    #[test]
+    fn nothing_is_looked_up_later_when_no_queued_episode_lacks_facts() {
+        let daemon = Arc::new(daemon_playing(&format!("spotify:track:{ID}")));
+        daemon.live().queue.items = vec![
+            queued(
+                "q_1",
+                "spotify:episode:4IzpgR6RCEkRqMHbJF38Wp",
+                (Some("Ep".into()), Some("Show".into()), Some(1)),
+            ),
+            queued("q_2", &format!("spotify:track:{ID}"), TrackFacts::default()),
+        ];
+        daemon.live().fact_tries.insert("q_gone".into(), 1);
+        assert!(!fill_facts_later(&daemon, &Settings::default()));
+        let live = daemon.live();
+        assert!(!live.facts_backfill);
+        // Tries of items no longer queued are forgotten.
+        assert!(live.fact_tries.is_empty());
+    }
+
+    #[test]
+    fn the_pending_note_counts_the_episodes_and_names_only_a_seen_rate_limit() {
+        assert_eq!(
+            pending_note(1, true),
+            "Spotify's Web API has not given the name, show or length of 1 queued episode yet (Spotify is rate-limiting this client right now). The daemon asks again in the background; `spotify queue` shows what it finds."
+        );
+        let slow = pending_note(2, false);
+        assert!(slow.contains("of 2 queued episodes yet. "), "{slow}");
+        assert!(!slow.contains("rate-limiting"), "{slow}");
     }
 
     #[test]
@@ -2120,6 +2734,9 @@ mod tests {
             )
         );
         assert_eq!(episode_from_web(&json!({})), (None, None, None));
+        // A blank show is missing, so it stays wanted rather than recorded as known.
+        let blank = json!({"name": "Ep", "duration_ms": 1, "show": {"name": " "}});
+        assert_eq!(episode_from_web(&blank), (Some("Ep".into()), None, Some(1)));
     }
 
     #[test]
