@@ -1,0 +1,53 @@
+{
+  "framework": null,
+  "trailingSlash": true,
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Content-Security-Policy",
+          "value": "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src https://backend.spotify.unlikefraction.com; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+        },
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "Referrer-Policy",
+          "value": "strict-origin-when-cross-origin"
+        },
+        {
+          "key": "Strict-Transport-Security",
+          "value": "max-age=31536000"
+        }
+      ]
+    },
+    {
+      "source": "/install.sh",
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "text/x-shellscript; charset=utf-8"
+        },
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300"
+        }
+      ]
+    }
+  ],
+  "redirects": [
+    {
+      "source": "/docs",
+      "destination": "/docs/usage/",
+      "permanent": false
+    },
+    {
+      "source": "/docs/",
+      "destination": "/docs/usage/",
+      "permanent": false
+    }
+  ],
+  "cleanUrls": false
+}

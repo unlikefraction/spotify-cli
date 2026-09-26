@@ -1,0 +1,14 @@
+target/
+node_modules/
+docs-site/dist/
+dist/
+.env
+.DS_Store
+*.sqlite
+*.sqlite-*
+.vercel
+/telemetry/
+*.local.json
+# the owner's private spec notes (design lives in ARCHITECTURE.md)
+/understanding.md
+/iam.md

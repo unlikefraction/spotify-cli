@@ -1,0 +1,107 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: spotify-cli backend (native Rust + Caddy HTTPS, SQLite, SSM-only admin)
+Parameters:
+  Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  Vpc:
+    Type: AWS::EC2::VPC::Id
+  Subnet:
+    Type: AWS::EC2::Subnet::Id
+  AllocateElasticIp:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: Allocate an Elastic IP (needs available EIP quota); without one the public IP changes on stop/start.
+Conditions:
+  WithEip: !Equals [!Ref AllocateElasticIp, 'true']
+Resources:
+  Artifacts:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules:
+          - {Id: ShortLivedBackups, Status: Enabled, Prefix: backups/, ExpirationInDays: 7, NoncurrentVersionExpiration: {NoncurrentDays: 1}}
+  Runtime:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    Properties:
+      Name: unlikefraction-spotify/production/runtime
+      Description: Runtime credentials and configuration for the spotify-cli backend (JSON object of SPOTIFY_* variables)
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]
+      Policies:
+        - PolicyName: SpotifyRuntime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: 's3:GetObject', Resource: !Sub '${Artifacts.Arn}/releases/*'}
+              - {Effect: Allow, Action: 's3:PutObject', Resource: !Sub '${Artifacts.Arn}/backups/*'}
+              - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref Runtime}
+  Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Role]
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: spotify-cli HTTP/HTTPS; admin only through SSM
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}
+  Instance:
+    Type: AWS::EC2::Instance
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ImageId: !Ref Ami
+      InstanceType: t4g.small
+      IamInstanceProfile: !Ref Profile
+      NetworkInterfaces:
+        - {DeviceIndex: '0', SubnetId: !Ref Subnet, AssociatePublicIpAddress: true, GroupSet: [!Ref SecurityGroup]}
+      MetadataOptions: {HttpTokens: required, HttpPutResponseHopLimit: 1}
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {VolumeSize: 20, VolumeType: gp3, Encrypted: true, DeleteOnTermination: false}
+      Tags:
+        - {Key: Name, Value: unlikefraction-spotify-production}
+        - {Key: Service, Value: silicon-spotify}
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euo pipefail
+          dnf install -y python3 sqlite
+          useradd --system --home-dir /var/lib/spotify --shell /sbin/nologin spotify
+          useradd --system --home-dir /var/lib/caddy --shell /sbin/nologin caddy
+          install -d -o spotify -g spotify -m 0700 /var/lib/spotify /var/lib/spotify/telemetry
+          install -d -o caddy -g caddy -m 0700 /var/lib/caddy
+          install -d -m 0700 /etc/spotify
+          install -d -m 0755 /opt/spotify/releases /etc/caddy /etc/systemd/journald.conf.d
+          printf '[Journal]\nStorage=persistent\nSystemMaxUse=256M\n' > /etc/systemd/journald.conf.d/spotify.conf
+          systemctl restart systemd-journald
+          systemctl enable --now amazon-ssm-agent
+  Address:
+    Type: AWS::EC2::EIP
+    Condition: WithEip
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref Instance
+      Tags: [{Key: Service, Value: silicon-spotify}]
+Outputs:
+  InstanceId: {Value: !Ref Instance}
+  PublicIp: {Value: !If [WithEip, !Ref Address, !GetAtt Instance.PublicIp]}
+  ArtifactBucket: {Value: !Ref Artifacts}
+  RuntimeSecret: {Value: !Ref Runtime}

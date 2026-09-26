@@ -1,0 +1,33 @@
+{
+  "org_id": "unlikefraction",
+  "app_id": "spotify",
+  "name": "spotify",
+  "description": "spotify-cli turns the Spotify desktop app on a Mac into a command line application that Carbons and Silicons can drive. The spotify CLI plays, pauses, skips, seeks, searches, shows lyrics and track details, manages playlists, podcasts, devices and a managed play queue that can be reordered and trimmed. Every playback command is attempted through spotify_player, verified against Spotify.app itself, and falls back to AppleScript when it fails or has no effect, and each result reports which path worked and why. Silicons can create playback triggers such as thirty seconds remaining, a percentage remaining, a percentage elapsed, song end or song change. An always on per user daemon watches playback, fires triggers precisely, and delivers each firing as a Ting notification to the Silicon that created it, using that Silicon's own IAM session and a single use OBO proof minted by this backend. The backend keeps the application secret, exchanges IAM short lived tokens for application sessions, registers each Silicon as a Ting recipient at login, relays opt out telemetry to Space Station and accepts bug reports with optional pull request links. Installation is one curl command that installs the CLI, the daemon and spotify_player, starts them, and never logs anyone in.",
+  "visibility": "private",
+  "website_url": "https://spotify.unlikefraction.com",
+  "docs_url": "https://spotify.unlikefraction.com/docs/usage/",
+  "base_url": "https://backend.spotify.unlikefraction.com",
+  "webhook_url": "https://backend.spotify.unlikefraction.com/webhook/",
+  "webhook_secret": "REPLACE ME",
+  "webhook_scope": [
+    "membership"
+  ],
+  "app_scope": {
+    "iam": [
+      "self.identity.read",
+      "self.profile.read"
+    ],
+    "external": [
+      {
+        "app_id": "ting",
+        "endpoint_id": "subscriptions.register"
+      },
+      {
+        "app_id": "ting",
+        "endpoint_id": "tings.send"
+      }
+    ]
+  },
+  "obo_endpoints": [],
+  "testing_idle_days": 30
+}

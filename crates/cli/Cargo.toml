@@ -1,0 +1,36 @@
+[package]
+name = "silicon-spotify-cli"
+description = "The `spotify` command: drive Spotify on macOS from the terminal, with IAM login and Ting playback triggers for Silicons."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
+keywords = ["spotify", "cli", "silicon", "music", "macos"]
+categories = ["command-line-utilities", "multimedia::audio"]
+include = ["src/**", "docs/**", "README.md"]
+
+[[bin]]
+name = "spotify"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+silicon-spotify-client = { workspace = true, features = ["api", "runtime"] }
+time.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+semver.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

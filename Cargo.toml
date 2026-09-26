@@ -1,0 +1,115 @@
+[workspace]
+members = [".", "crates/client", "crates/cli", "crates/daemon"]
+default-members = [".", "crates/client", "crates/cli", "crates/daemon"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/unlikefraction/spotify-cli"
+homepage = "https://spotify.unlikefraction.com"
+documentation = "https://spotify.unlikefraction.com/docs"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "json", "macros", "matched-path", "query", "tokio"] }
+base64 = "0.22"
+blake3 = { version = "1.8.2", features = ["pure"] }
+clap = { version = "4.5.48", features = ["derive", "env", "wrap_help", "string"] }
+libc = "0.2"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "rustls-no-provider", "http2"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
+semver = "1.0.27"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+silicon-iam-client = "4.0.0"
+space-station = "=0.1.1"
+thiserror = "2.0.17"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync", "signal", "process", "fs"] }
+tower-http = { version = "0.7.0", features = ["limit", "timeout", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2.5.7"
+uuid = { version = "1.26.0", features = ["serde", "v4", "v7"] }
+silicon-spotify-client = { path = "crates/client", version = "0.1.0" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+
+[package]
+name = "silicon-spotify"
+description = "Backend for spotify-cli: IAM short-lived-token exchange, Ting recipient registration and trigger delivery, bug reports and telemetry relay."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+publish = false
+default-run = "spotify-api"
+
+[[bin]]
+name = "spotify-api"
+path = "src/bin/spotify_api.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+blake3.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+rustls.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+silicon-iam-client.workspace = true
+silicon-spotify-client.workspace = true
+space-station.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+uuid.workspace = true
+async-trait = "0.1"
+dotenvy = "0.15.7"
+
+[features]
+# In-process IAM/Ting fakes for tests and `cargo run --example dev_backend --features dev`.
+dev = []
+
+[[example]]
+name = "dev_backend"
+required-features = ["dev"]
+
+[dev-dependencies]
+silicon-spotify = { path = ".", features = ["dev"] }
+http-body-util = "0.1"
+tower = { version = "0.5.2", features = ["util"] }
+tempfile = "3"
+
+[lints]
+workspace = true
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"

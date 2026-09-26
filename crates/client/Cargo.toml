@@ -1,0 +1,45 @@
+[package]
+name = "silicon-spotify-client"
+description = "Stateless Rust library for spotify-cli: Spotify control through spotify_player and AppleScript, playback triggers, and the spotify-cli backend API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
+keywords = ["spotify", "silicon", "cli", "applescript", "iam"]
+categories = ["api-bindings", "command-line-utilities", "multimedia::audio"]
+include = ["src/**", "README.md"]
+
+[lib]
+name = "silicon_spotify_client"
+
+[features]
+default = ["api"]
+# HTTP client for the spotify-cli backend (login exchange, refresh, Ting delivery, reports, telemetry).
+api = ["dep:reqwest", "dep:tokio", "dep:rustls"]
+# Stateful helpers shared by the CLI and daemon: the per-home session store, locking and daemon IPC.
+# Library consumers that only need Spotify control or the trigger engine leave this off.
+runtime = ["api", "dep:blake3", "dep:tokio", "tokio/net", "tokio/io-util", "tokio/time", "tokio/fs", "dep:libc"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+url.workspace = true
+uuid.workspace = true
+blake3 = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["time"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

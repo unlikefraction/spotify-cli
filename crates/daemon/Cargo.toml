@@ -1,0 +1,38 @@
+[package]
+name = "silicon-spotify-daemon"
+description = "The always-on spotify-cli daemon: watches Spotify.app, fires playback triggers through Ting, keeps spotify_player warm."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+publish = false
+
+[[bin]]
+name = "spotify-daemon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+silicon-spotify-client = { workspace = true, features = ["api", "runtime"] }
+semver.workspace = true
+sha2.workspace = true
+time.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+libc.workspace = true
+reqwest.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSAppleScript", "NSAppleEventDescriptor", "NSDistributedNotificationCenter", "NSNotification", "NSString", "NSDictionary", "NSValue", "NSDate", "NSRunLoop", "NSObject", "NSError", "NSOperation", "NSObjCRuntime"] }
+block2 = "0.6"
+dispatch2 = "0.3.1"
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+{
+	email silicon@unlikefraction.com
+}
+
+(secure_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		X-Frame-Options DENY
+		-Server
+	}
+}
+
+backend.spotify.unlikefraction.com {
+	import secure_headers
+	encode zstd gzip
+	@public path /healthz /readyz /api/* /webhook /webhook/
+	handle @public {
+		reverse_proxy 127.0.0.1:8787
+	}
+	handle {
+		respond "Not found. API: https://spotify.unlikefraction.com/docs/api/" 404
+	}
+}

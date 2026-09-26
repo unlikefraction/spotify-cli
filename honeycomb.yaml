@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "app_id": "spotify",
+  "version": "0.1.0",
+  "bin": { "spotify": "cli", "spotify-daemon": "daemon" },
+  "targets": {
+    "macos-aarch64": { "root": "targets/macos-aarch64", "executables": { "cli": "bin/spotify", "daemon": "bin/spotify-daemon" }, "install_script": "install.sh" },
+    "macos-x86_64": { "root": "targets/macos-x86_64", "executables": { "cli": "bin/spotify", "daemon": "bin/spotify-daemon" }, "install_script": "install.sh" },
+    "linux-aarch64": { "root": "targets/linux-aarch64", "executables": { "cli": "bin/spotify", "daemon": "bin/spotify-daemon" } },
+    "linux-x86_64": { "root": "targets/linux-x86_64", "executables": { "cli": "bin/spotify", "daemon": "bin/spotify-daemon" } },
+    "windows-aarch64": { "root": "targets/windows-aarch64", "executables": { "cli": "bin/spotify.exe", "daemon": "bin/spotify-daemon.exe" } },
+    "windows-x86_64": { "root": "targets/windows-x86_64", "executables": { "cli": "bin/spotify.exe", "daemon": "bin/spotify-daemon.exe" } }
+  }
+}

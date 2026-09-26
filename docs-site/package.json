@@ -1,0 +1,14 @@
+{
+  "name": "silicon-spotify-docs",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node check.mjs",
+    "serve": "node serve.mjs"
+  },
+  "dependencies": {
+    "marked": "18.0.11"
+  }
+}

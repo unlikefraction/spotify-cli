@@ -1,0 +1,7 @@
+[Unit]
+Description=Snapshot spotify-cli SQLite to encrypted S3
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/spotify/runtime.env
+ExecStart=/usr/bin/python3 /opt/spotify/current/backup.py
+UMask=0077
