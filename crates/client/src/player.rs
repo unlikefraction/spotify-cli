@@ -729,13 +729,8 @@ mod tests {
         let write = |text: &str| {
             std::fs::write(dir.path().join("credentials.json"), text).expect("write");
         };
-        write(
-            r#"{"username":"31ujnsmbxgyrzb4bpbz34j7lejua","auth_type":1,"auth_data":"c2VjcmV0"}"#,
-        );
-        assert_eq!(
-            player.username().as_deref(),
-            Some("31ujnsmbxgyrzb4bpbz34j7lejua")
-        );
+        write(r#"{"username":"test-user","auth_type":1,"auth_data":"c2VjcmV0"}"#);
+        assert_eq!(player.username().as_deref(), Some("test-user"));
         write(r#"{"username":"a\" & quit & \"","auth_type":1}"#);
         assert_eq!(
             player.username(),
