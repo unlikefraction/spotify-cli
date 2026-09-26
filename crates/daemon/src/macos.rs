@@ -7,15 +7,14 @@
 //!   play, pause and track changes (not on seeks). The observer only nudges the watcher, which
 //!   then takes a fresh AppleScript reading.
 //! - macOS asks the user once (per signed binary) whether spotify-daemon may control Spotify.
-//!   While that dialog is open, Spotify answers no Apple Events from anyone, so scripts are only
-//!   sent while the permission is not known to be missing; otherwise commands fail fast with
-//!   `automation_permission_pending` / `automation_permission_denied`. macOS's own check blocks
-//!   too, so only a background thread ([`request_automation`]) runs it; everyone else reads
-//!   [`automation_state`]. That thread also raises the dialog at startup.
+//!   The watcher's first reading raises that dialog. While it is open macOS holds every Apple
+//!   Event to Spotify, from any app, so scripts time out. The permission state is derived from
+//!   what Apple Events actually do ([`automation_state`]): `AEDeterminePermissionToAutomateTarget`
+//!   is not used because it never returns for Spotify on current macOS. After a timeout, scripts
+//!   fail fast for [`BACKOFF`] instead of stacking up behind the main thread.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -43,7 +42,7 @@ pub struct MainThreadScript;
 
 impl Runner for MainThreadScript {
     fn run(&self, source: &str) -> Result<String> {
-        if let Some(error) = automation_state().blocker() {
+        if let Some(error) = backing_off() {
             return Err(error);
         }
         let mut result: Option<Result<String>> = None;
@@ -52,32 +51,27 @@ impl Runner for MainThreadScript {
         DispatchQueue::main().exec_sync(move || {
             *slot = Some(run_on_main(&source));
         });
-        result.unwrap_or_else(|| {
+        let result = result.unwrap_or_else(|| {
             Err(Error::internal(
                 "the main thread did not run the AppleScript",
             ))
-        })
+        });
+        record(&result);
+        result.map_err(explain_timeout)
     }
 }
 
-/// Whether this process may send Apple Events to Spotify, as macOS reports it.
+/// Whether this process may send Apple Events to Spotify, as the last one showed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Automation {
-    /// Allowed.
+    /// The last Apple Event to Spotify succeeded.
     Granted,
-    /// The user turned it off (System Settings → Privacy & Security → Automation).
+    /// macOS refused it (System Settings → Privacy & Security → Automation).
     Denied,
-    /// Never answered: macOS shows (or will show) the consent dialog.
-    NeedsConsent,
-    /// Spotify.app is not running, so macOS cannot say.
-    SpotifyNotRunning,
-    /// Not checked yet, or any other status.
+    /// Spotify did not answer: usually macOS's consent dialog is open, or Spotify is busy.
+    NotAnswering,
+    /// No Apple Event reached Spotify yet (not running, or nothing asked).
     Unknown,
-    /// A check is running.
-    Checking,
-    /// A check has been waiting for over [`STALL_AFTER`]: macOS is holding Apple Events to
-    /// Spotify, which in practice means a consent dialog (ours or another app's) is open.
-    Stalled,
 }
 
 impl Automation {
@@ -87,11 +81,8 @@ impl Automation {
         match self {
             Self::Granted => "granted",
             Self::Denied => "denied",
-            Self::NeedsConsent => "needs_consent",
-            Self::SpotifyNotRunning => "spotify_not_running",
+            Self::NotAnswering => "not_answering",
             Self::Unknown => "unknown",
-            Self::Checking => "checking",
-            Self::Stalled => "stalled",
         }
     }
 
@@ -99,9 +90,7 @@ impl Automation {
         match value {
             1 => Self::Granted,
             2 => Self::Denied,
-            3 => Self::NeedsConsent,
-            4 => Self::SpotifyNotRunning,
-            5 => Self::Checking,
+            3 => Self::NotAnswering,
             _ => Self::Unknown,
         }
     }
@@ -110,164 +99,64 @@ impl Automation {
         match self {
             Self::Granted => 1,
             Self::Denied => 2,
-            Self::NeedsConsent => 3,
-            Self::SpotifyNotRunning => 4,
-            Self::Checking | Self::Stalled => 5,
+            Self::NotAnswering => 3,
             Self::Unknown => 0,
         }
     }
-
-    /// The error a command gets instead of an Apple Event macOS would hold or refuse.
-    #[must_use]
-    pub fn blocker(self) -> Option<Error> {
-        match self {
-            Self::NeedsConsent => Some(automation_pending(
-                "macOS is asking whether spotify-daemon may control Spotify, and nothing can control Spotify through AppleScript until someone answers.",
-            )),
-            Self::Stalled => Some(automation_pending(
-                "Spotify is not answering Apple Events: macOS is holding them, almost always because a dialog asking whether an app (spotify-daemon or another) may control Spotify is open.",
-            )),
-            Self::Denied => Some(classify("", Some(-1743))),
-            _ => None,
-        }
-    }
 }
 
-/// How long a permission check may wait before it counts as [`Automation::Stalled`].
-const STALL_AFTER: Duration = Duration::from_secs(3);
+/// After a timeout, scripts fail fast for this long before Spotify is tried again.
+pub const BACKOFF: Duration = Duration::from_secs(3);
 
-/// Last answer (an [`Automation`] as u8) and, while checking, when the check started.
 static STATE: AtomicU8 = AtomicU8::new(0);
-static CHECK_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
 fn now_ms() -> u64 {
-    u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
+    // +1 so that 0 keeps meaning "never".
+    u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX - 1) + 1
 }
 
-/// The permission state as last seen by the background checker. Never blocks: macOS's own
-/// check waits for Spotify, and Spotify answers nothing while a consent dialog is open.
+/// The permission state as the last Apple Event to Spotify showed it.
 #[must_use]
 pub fn automation_state() -> Automation {
-    match Automation::from_u8(STATE.load(Ordering::Relaxed)) {
-        Automation::Checking => {
-            let waited = now_ms().saturating_sub(CHECK_STARTED_MS.load(Ordering::Relaxed));
-            if u128::from(waited) >= STALL_AFTER.as_millis() {
-                Automation::Stalled
-            } else {
-                Automation::Checking
-            }
+    Automation::from_u8(STATE.load(Ordering::Relaxed))
+}
+
+fn record(result: &Result<String>) {
+    let state = match result {
+        Ok(_) => Automation::Granted,
+        Err(e) if e.code == "automation_permission_denied" => Automation::Denied,
+        Err(e) if e.code == "timeout" => {
+            LAST_TIMEOUT_MS.store(now_ms(), Ordering::Relaxed);
+            Automation::NotAnswering
         }
-        state => state,
-    }
-}
-
-/// Carbon `AEDesc` (declared under `#pragma pack(2)`).
-#[repr(C, packed(2))]
-struct AeDesc {
-    descriptor_type: u32,
-    data_handle: *mut c_void,
-}
-
-#[link(name = "CoreServices", kind = "framework")]
-unsafe extern "C" {
-    fn AECreateDesc(type_code: u32, data: *const c_void, size: isize, result: *mut AeDesc) -> i16;
-    fn AEDisposeDesc(desc: *mut AeDesc) -> i16;
-    fn AEDeterminePermissionToAutomateTarget(
-        target: *const AeDesc,
-        event_class: u32,
-        event_id: u32,
-        ask_user_if_needed: u8,
-    ) -> i32;
-}
-
-const TYPE_APPLICATION_BUNDLE_ID: u32 = u32::from_be_bytes(*b"bund");
-const TYPE_WILD_CARD: u32 = u32::from_be_bytes(*b"****");
-const SPOTIFY_BUNDLE_ID: &str = "com.spotify.client";
-
-/// Asks macOS whether this process may control Spotify and records the answer. Blocks while
-/// Spotify's Apple Events are held; with `ask`, macOS shows its consent dialog when nobody
-/// answered yet and this blocks until someone does. Only [`request_automation`]'s thread
-/// calls it.
-fn automation(ask: bool) -> Automation {
-    CHECK_STARTED_MS.store(now_ms(), Ordering::Relaxed);
-    if !ask {
-        STATE.store(Automation::Checking.to_u8(), Ordering::Relaxed);
-    }
-    let mut desc = AeDesc {
-        descriptor_type: 0,
-        data_handle: std::ptr::null_mut(),
-    };
-    // SAFETY: the bundle id bytes outlive the call (AECreateDesc copies them) and `desc` is a
-    // valid out-parameter; it is disposed below.
-    let created = unsafe {
-        AECreateDesc(
-            TYPE_APPLICATION_BUNDLE_ID,
-            SPOTIFY_BUNDLE_ID.as_ptr().cast(),
-            SPOTIFY_BUNDLE_ID.len().cast_signed(),
-            &mut desc,
-        )
-    };
-    let state = if created == 0 {
-        // SAFETY: `desc` is a valid address descriptor created above.
-        let status = unsafe {
-            AEDeterminePermissionToAutomateTarget(
-                &desc,
-                TYPE_WILD_CARD,
-                TYPE_WILD_CARD,
-                u8::from(ask),
-            )
-        };
-        // SAFETY: disposes the descriptor created above exactly once.
-        unsafe { AEDisposeDesc(&mut desc) };
-        match status {
-            0 => Automation::Granted,
-            -1743 => Automation::Denied,
-            -1744 => Automation::NeedsConsent,
-            -600 => Automation::SpotifyNotRunning,
-            _ => Automation::Unknown,
-        }
-    } else {
-        Automation::Unknown
+        Err(_) => return,
     };
     STATE.store(state.to_u8(), Ordering::Relaxed);
-    state
 }
 
-/// Checks the permission on a background thread and, when nobody answered yet, raises
-/// macOS's consent dialog right away (while someone is installing) instead of on the first
-/// command. Re-checks every 15 s until the answer is final. `report` gets every new state.
-pub fn request_automation(report: impl Fn(Automation) + Send + 'static) {
-    let _ = std::thread::Builder::new()
-        .name("automation".into())
-        .spawn(move || {
-            let mut last = None;
-            loop {
-                let mut state = automation(false);
-                if state == Automation::NeedsConsent {
-                    report(state);
-                    last = Some(state);
-                    state = automation(true);
-                }
-                if last != Some(state) {
-                    report(state);
-                }
-                last = Some(state);
-                if matches!(state, Automation::Granted | Automation::Denied) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_secs(15));
-            }
-        });
+/// Spotify timed out moments ago: fail fast rather than block the main thread again.
+fn backing_off() -> Option<Error> {
+    if automation_state() != Automation::NotAnswering {
+        return None;
+    }
+    let last = LAST_TIMEOUT_MS.load(Ordering::Relaxed);
+    let recent = last != 0 && u128::from(now_ms().saturating_sub(last)) < BACKOFF.as_millis();
+    recent.then(|| explain_timeout(classify("", Some(-1712))))
 }
 
-fn automation_pending(message: &str) -> Error {
-    Error::new(
-        "automation_permission_pending",
-        message,
-        "Click Allow in the macOS dialog \"spotify-daemon\" wants access to control \"Spotify\" (it may be behind other windows). `spotify doctor` re-checks.",
-    )
-    .retryable()
+/// A timeout from Spotify usually means macOS is waiting for someone to answer its Automation
+/// dialog; say so.
+fn explain_timeout(error: Error) -> Error {
+    if error.code != "timeout" {
+        return error;
+    }
+    Error {
+        message: "Spotify.app did not answer the Apple Event in time.".into(),
+        hint: "If macOS shows \"spotify-daemon\" wants access to control \"Spotify\", click Allow: until someone answers, macOS holds every Apple Event to Spotify. Otherwise Spotify is busy; retry in a moment. `spotify doctor` re-checks.".into(),
+        ..error
+    }
 }
 
 fn error_from(info: Option<&NSDictionary<NSString, AnyObject>>) -> Error {
@@ -356,5 +245,33 @@ pub fn run_main_loop() -> ! {
         if !ran {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeouts_name_the_consent_dialog_and_keep_their_code() {
+        let explained = explain_timeout(classify("", Some(-1712)));
+        assert_eq!(explained.code, "timeout");
+        assert!(explained.retryable);
+        assert!(explained.hint.contains("click Allow"));
+        let denied = explain_timeout(classify("", Some(-1743)));
+        assert_eq!(denied.code, "automation_permission_denied");
+    }
+
+    #[test]
+    fn outcomes_set_the_permission_state() {
+        record(&Ok(String::new()));
+        assert_eq!(automation_state(), Automation::Granted);
+        assert!(backing_off().is_none());
+        record(&Err(classify("", Some(-1712))));
+        assert_eq!(automation_state(), Automation::NotAnswering);
+        assert_eq!(backing_off().map(|e| e.code), Some("timeout".to_owned()));
+        record(&Err(classify("", Some(-1743))));
+        assert_eq!(automation_state(), Automation::Denied);
+        assert!(backing_off().is_none());
     }
 }

@@ -22,7 +22,7 @@ spotify auth login      # sign spotify_player in to Spotify (a browser tab; a Ca
 Requirements: macOS, the Spotify desktop app (signed in), Homebrew (for `spotify_player`). While
 installing, macOS asks whether `spotify-daemon` may control Spotify: click **Allow** (System
 Settings → Privacy & Security → Automation if you missed it). Until then commands fail with
-`automation_permission_pending`.
+`timeout`.
 
 ## 2. Play music
 

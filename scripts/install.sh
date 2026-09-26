@@ -170,18 +170,18 @@ install_silicon_spotify() {
       automation=$("$dir/spotify" daemon status --json 2>/dev/null | sed -n 's/.*"automation": *"\([a-z_]*\)".*/\1/p' | head -1)
       case "$automation" in
         granted | denied) break ;;
-        needs_consent | stalled)
+        not_answering)
           [ "$asked" = 1 ] || say "  macOS is asking: \"spotify-daemon\" wants access to control \"Spotify\". Click Allow."
           asked=1 ;;
-        spotify_not_running) [ "$waited" -ge 20 ] && break ;;
+        *) [ "$waited" -ge 20 ] && break ;;
       esac
       sleep 2; waited=$((waited + 2))
     done
     case "$automation" in
       granted) say "  automation: spotify-daemon may control Spotify" ;;
       denied) say "  automation: denied. Enable it in System Settings → Privacy & Security → Automation → spotify-daemon → Spotify" ;;
-      needs_consent | stalled) say "  automation: still waiting for Allow; commands fail with automation_permission_pending until then" ;;
-      *) say "  automation: checked when Spotify runs (spotify doctor)" ;;
+      not_answering) say "  automation: Spotify is still not answering; click Allow if macOS asks (spotify doctor re-checks)" ;;
+      *) say "  automation: checked on first use (spotify doctor)" ;;
     esac
   fi
 

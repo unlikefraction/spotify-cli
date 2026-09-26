@@ -540,8 +540,8 @@ pub fn daemon_status(v: &Value) -> String {
         s(v, "/warm_spotify_player/state")
     );
     match v.get("automation").and_then(Value::as_str) {
-        Some("needs_consent" | "stalled") => out.push_str(
-            "\n  automation: waiting for Allow in the macOS dialog (… wants access to control \"Spotify\")",
+        Some("not_answering") => out.push_str(
+            "\n  automation: Spotify is not answering (click Allow if macOS asks whether spotify-daemon may control Spotify)",
         ),
         Some("denied") => out.push_str(
             "\n  automation: denied (System Settings → Privacy & Security → Automation → spotify-daemon → Spotify)",

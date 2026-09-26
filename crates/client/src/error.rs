@@ -142,7 +142,6 @@ impl Error {
             "not_authenticated" | "spotify_auth_required" | "reconsent_required" => 3,
             "permission_denied"
             | "automation_permission_denied"
-            | "automation_permission_pending"
             | "forbidden"
             | "recipient_not_registered" => 4,
             "daemon_unavailable"

@@ -297,20 +297,28 @@ async fn doctor(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
             .any(|p| std::path::Path::new(p).exists())
             || std::env::var_os("HOME").is_some_and(|h| std::path::Path::new(&h).join("Applications/Spotify.app").exists());
         checks.push(check("spotify_app_installed", installed, json!(installed), "Install Spotify: https://www.spotify.com/download/mac/ or `brew install --cask spotify`."));
-        let automation = crate::macos::automation_state();
-        let permission = automation.blocker();
-        match &permission {
-            Some(error) => checks.push(check("automation_permission", false, json!({"state": automation.as_str(), "error": error}), &error.hint)),
-            None => checks.push(check("automation_permission", true, json!({"state": automation.as_str()}), "")),
-        }
         match d.read() {
             Ok(playback) => {
                 let running = playback.state != PlayerState::NotRunning;
                 checks.push(check("spotify_app_running", running, json!(playback.state), "Run `spotify launch` (starts Spotify hidden)."));
             }
-            // Already reported as the permission problem it is.
-            Err(_) if permission.is_some() => {}
+            // Reported below as the permission question it usually is.
+            Err(error) if matches!(error.code.as_str(), "automation_permission_denied" | "timeout") => {}
             Err(error) => checks.push(check("spotify_app_responding", false, serde_json::to_value(&error)?, &error.hint)),
+        }
+        let automation = crate::macos::automation_state();
+        match automation {
+            crate::macos::Automation::Denied => {
+                let error = silicon_spotify_client::applescript::classify("", Some(-1743));
+                checks.push(check("automation_permission", false, json!({"state": automation.as_str()}), &error.hint));
+            }
+            crate::macos::Automation::NotAnswering => checks.push(check(
+                "automation_permission",
+                false,
+                json!({"state": automation.as_str()}),
+                "Spotify is not answering Apple Events. If macOS shows \"spotify-daemon\" wants access to control \"Spotify\", click Allow (it may be behind other windows); otherwise Spotify is busy, retry.",
+            )),
+            _ => checks.push(check("automation_permission", true, json!({"state": automation.as_str()}), "")),
         }
         match settings.player() {
             Ok(player) => {
