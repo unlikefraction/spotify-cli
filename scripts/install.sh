@@ -153,12 +153,36 @@ install_silicon_spotify() {
   # 4. Running -----------------------------------------------------------------------------------
   step 4/5 "Starting Spotify and spotify-daemon (and at every login)"
   /usr/bin/open -g -j -a Spotify 2>/dev/null || true
+  started=1
   if "$dir/spotify" daemon install >/dev/null 2>"$tmp/daemon.err"; then
     say "  spotify-daemon: running, starts at login (launchd agent com.unlikefraction.spotify.daemon)"
   elif "$dir/spotify" daemon start >/dev/null 2>>"$tmp/daemon.err"; then
     say "  spotify-daemon: running (no launchd GUI session; run \`spotify daemon install\` after you log in)"
   else
+    started=0
     say "  spotify-daemon: could not start:"; sed 's/^/    /' "$tmp/daemon.err"
+  fi
+  # macOS asks once per daemon binary whether it may control Spotify, and holds every Apple
+  # Event to Spotify until someone answers, so wait here while someone is at the keyboard.
+  if [ "$started" = 1 ]; then
+    automation=unknown asked=0 waited=0
+    while [ "$waited" -lt 120 ]; do
+      automation=$("$dir/spotify" daemon status --json 2>/dev/null | sed -n 's/.*"automation": *"\([a-z_]*\)".*/\1/p' | head -1)
+      case "$automation" in
+        granted | denied) break ;;
+        needs_consent | stalled)
+          [ "$asked" = 1 ] || say "  macOS is asking: \"spotify-daemon\" wants access to control \"Spotify\". Click Allow."
+          asked=1 ;;
+        spotify_not_running) [ "$waited" -ge 20 ] && break ;;
+      esac
+      sleep 2; waited=$((waited + 2))
+    done
+    case "$automation" in
+      granted) say "  automation: spotify-daemon may control Spotify" ;;
+      denied) say "  automation: denied. Enable it in System Settings → Privacy & Security → Automation → spotify-daemon → Spotify" ;;
+      needs_consent | stalled) say "  automation: still waiting for Allow; commands fail with automation_permission_pending until then" ;;
+      *) say "  automation: checked when Spotify runs (spotify doctor)" ;;
+    esac
   fi
 
   # 5. Next --------------------------------------------------------------------------------------

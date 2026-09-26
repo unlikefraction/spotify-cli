@@ -48,10 +48,19 @@ Per Silicon home (`$SILICON_HOME/.spotify/`): `config.json`, `session.json`, `se
 
 ## Permissions
 
-macOS asks once whether `spotify-daemon` may control Spotify (Automation). If you clicked Don't
-Allow: System Settings → Privacy & Security → Automation → spotify-daemon → enable Spotify. If no
-prompt ever appears, `tccutil reset AppleEvents` and retry. `spotify doctor` reports
-`automation_permission` either way.
+macOS asks once whether `spotify-daemon` may control Spotify (Automation). The daemon raises the
+question as soon as it starts (the installer waits for it), because while that dialog is open
+macOS holds **every** Apple Event to Spotify, from any app. Until someone clicks Allow, commands
+fail fast with `automation_permission_pending` instead of hanging, and `spotify daemon status`
+shows `automation: waiting for Allow`.
+
+If you clicked Don't Allow: System Settings → Privacy & Security → Automation → spotify-daemon →
+enable Spotify (`automation_permission_denied`). If no prompt ever appears,
+`tccutil reset AppleEvents` and retry. `spotify doctor` reports `automation_permission` either way.
+
+Release binaries are ad-hoc signed, so macOS treats each new version as a new program and asks
+again after an update. A Developer ID signature (`SPOTIFY_CODESIGN_IDENTITY` when packaging)
+keeps the answer across updates.
 
 ## Security
 

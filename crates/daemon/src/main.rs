@@ -223,6 +223,16 @@ fn main() {
             observer.live().notifications += 1;
             observer.nudge.notify_one();
         });
+        let asker = Arc::clone(&daemon);
+        macos::request_automation(move |state| {
+            log!("automation permission for Spotify: {}", state.as_str());
+            if state == macos::Automation::NeedsConsent {
+                log!(
+                    "macOS is asking whether spotify-daemon may control Spotify; waiting for Allow"
+                );
+            }
+            asker.nudge.notify_one();
+        });
     }
 
     let background = Arc::clone(&daemon);

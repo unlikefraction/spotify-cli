@@ -19,9 +19,10 @@ spotify doctor          # every dependency, with the exact fix for anything miss
 spotify auth login      # sign spotify_player in to Spotify (a browser tab; a Carbon clicks Agree once)
 ```
 
-Requirements: macOS, the Spotify desktop app (signed in), Homebrew (for `spotify_player`). On first
-use macOS asks whether `spotify-daemon` may control Spotify: click **OK** (System Settings →
-Privacy & Security → Automation if you missed it).
+Requirements: macOS, the Spotify desktop app (signed in), Homebrew (for `spotify_player`). While
+installing, macOS asks whether `spotify-daemon` may control Spotify: click **Allow** (System
+Settings → Privacy & Security → Automation if you missed it). Until then commands fail with
+`automation_permission_pending`.
 
 ## 2. Play music
 

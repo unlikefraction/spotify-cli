@@ -20,7 +20,7 @@ ids).
 | 1 | the operation failed (see `code`) |
 | 2 | usage: bad arguments or input (`invalid_input`, `usage`, `threshold_passed`) |
 | 3 | not signed in (`not_authenticated`, `spotify_auth_required`, `reconsent_required`) |
-| 4 | refused (`automation_permission_denied`, `permission_denied`, `forbidden`, `recipient_not_registered`) |
+| 4 | refused (`automation_permission_denied`, `automation_permission_pending`, `permission_denied`, `forbidden`, `recipient_not_registered`) |
 | 5 | unavailable: daemon, network, rate limit, timeout |
 
 ## Codes
@@ -40,6 +40,7 @@ ids).
 | `spotify_not_running` | Spotify.app is closed | `spotify launch` |
 | `spotify_not_installed` | macOS cannot find Spotify.app | install Spotify |
 | `automation_permission_denied` | macOS blocks Apple Events to Spotify | enable it in Privacy & Security → Automation |
+| `automation_permission_pending` | macOS is showing (or holding Spotify for) an Automation dialog; retryable | click Allow in the dialog; `spotify doctor` re-checks |
 | `nothing_playing` | Spotify has no current item | start something |
 | `nothing_to_resume` | resume with nothing loaded | `spotify play <something>` |
 | `not_allowed_in_context` | Spotify disallows shuffle/repeat here | play a playlist or album |

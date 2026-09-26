@@ -278,6 +278,7 @@ async fn status(daemon: &Arc<Daemon>) -> Result<Value> {
         "managed_now": managed_now,
         "counts": daemon.db.counts()?,
         "warm_spotify_player": warm,
+        "automation": crate::macos::automation_state().as_str(),
         "update": update,
     }))
 }
@@ -296,15 +297,20 @@ async fn doctor(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
             .any(|p| std::path::Path::new(p).exists())
             || std::env::var_os("HOME").is_some_and(|h| std::path::Path::new(&h).join("Applications/Spotify.app").exists());
         checks.push(check("spotify_app_installed", installed, json!(installed), "Install Spotify: https://www.spotify.com/download/mac/ or `brew install --cask spotify`."));
+        let automation = crate::macos::automation_state();
+        let permission = automation.blocker();
+        match &permission {
+            Some(error) => checks.push(check("automation_permission", false, json!({"state": automation.as_str(), "error": error}), &error.hint)),
+            None => checks.push(check("automation_permission", true, json!({"state": automation.as_str()}), "")),
+        }
         match d.read() {
             Ok(playback) => {
                 let running = playback.state != PlayerState::NotRunning;
                 checks.push(check("spotify_app_running", running, json!(playback.state), "Run `spotify launch` (starts Spotify hidden)."));
-                checks.push(check("automation_permission", true, json!("spotify-daemon may control Spotify"), ""));
             }
-            Err(error) => {
-                checks.push(check("automation_permission", error.code != "automation_permission_denied", serde_json::to_value(&error)?, &error.hint));
-            }
+            // Already reported as the permission problem it is.
+            Err(_) if permission.is_some() => {}
+            Err(error) => checks.push(check("spotify_app_responding", false, serde_json::to_value(&error)?, &error.hint)),
         }
         match settings.player() {
             Ok(player) => {
