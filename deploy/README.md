@@ -56,8 +56,12 @@ honeycomb --json apps get spotify
 ```
 
 The app starts `private` (only `unlikefraction` members can log in); private apps are exempt from Ting's
-critical-scope review. Going public later: `honeycomb publication request spotify …` (Ting
-provider approval + a Honeycomb validator).
+critical-scope review. Going public: `honeycomb publication request spotify --revision <N> --message …`,
+then a Ting provider admin approves the Ting scopes (`honeycomb publication decide <request> ting
+approve --revision <N>`) and a Honeycomb validator approves the listing; once both gates pass,
+Honeycomb activates the publication and every prod archive. `spotify` went public this way on
+2026-09-26 (request `4cc3ef9c-8b6c-49c7-abdf-0a225615775f`), so any organization can install it and
+log in; `honeycomb --json publication get spotify` shows the state.
 
 ## 5. Runtime secret and backend deploy
 
