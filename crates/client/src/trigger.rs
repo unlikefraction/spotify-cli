@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::{PlayerState, Track, now_rfc3339};
-use crate::timing::{Amount, clock};
+use crate::timing::{Amount, clock, clock_rounded};
 use crate::{Error, Result};
 
 /// How close to the end a play must get to count as completed.
@@ -434,7 +434,9 @@ impl Firing {
                 "position_ms": self.position_ms,
                 "position": clock(self.position_ms),
                 "remaining_ms": remaining,
-                "remaining": clock(remaining),
+                // Measured a poll after the threshold, so usually a few hundred ms under it:
+                // rounded, a `--remaining 20s` firing reads 0:20, not 0:19.
+                "remaining": clock_rounded(remaining),
                 "progress": progress,
             },
             "reason": self.reason,
@@ -863,6 +865,29 @@ mod tests {
         let data = w.fired[0].data();
         assert_eq!(data["trigger"]["condition"], "remaining");
         assert_eq!(data["playback"]["remaining"], "0:29");
+    }
+
+    #[test]
+    fn remaining_display_rounds_to_the_threshold_it_crossed() {
+        // Observed live: a `--remaining 20s` trigger fired with 19 782 ms left and printed 0:19.
+        let mut w = World::new();
+        let now = crate::model::now_ms();
+        w.see(obs(now, PlayerState::Playing, Some(A), 170_000));
+        w.add(
+            Condition::Remaining(Amount::Millis(20_000)),
+            ScopeRequest::Current,
+            None,
+        )
+        .expect("add");
+        w.see(obs(now + 10_218, PlayerState::Playing, Some(A), 180_218));
+        assert_eq!(w.fired.len(), 1);
+        let data = w.fired[0].data();
+        assert_eq!(
+            data["playback"]["remaining_ms"], 19_782,
+            "precision unchanged"
+        );
+        assert_eq!(data["playback"]["remaining"], "0:20");
+        assert_eq!(data["trigger"]["threshold"], "0:20");
     }
 
     #[test]

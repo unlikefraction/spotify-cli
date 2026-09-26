@@ -260,6 +260,49 @@ fn reports_validate_before_sending() {
             .expect("gh")
             .starts_with("gh issue create")
     );
+    // Attachments are text files: binaries, directories and this home's credentials are refused
+    // before anything is sent.
+    let binary = env.home.path().join("blob.bin");
+    std::fs::write(&binary, b"\xcf\xfa\xed\xfe\0\0\0\x01text").expect("write");
+    let session = env.home.path().join(".spotify/session.json");
+    std::fs::create_dir_all(session.parent().expect("dir")).expect("mkdir");
+    std::fs::write(&session, "{}").expect("write");
+    let directory = env.home.path().to_path_buf();
+    for (path, says) in [
+        (&binary, "is not a text file"),
+        (&session, "credentials"),
+        (&directory, "is not a file"),
+    ] {
+        let path = path.to_string_lossy();
+        let error = invalid(
+            &env,
+            &[
+                "report",
+                "a long enough description of a bug",
+                "--attach",
+                &path,
+                "--json",
+            ],
+        );
+        assert!(
+            error["message"].as_str().expect("message").contains(says),
+            "{error}"
+        );
+    }
+    let log = env.home.path().join("daemon.log");
+    std::fs::write(&log, "2026-09-26T10:42:57Z stopped\n").expect("write");
+    let out = env.run(&[
+        "report",
+        "a long enough description of a bug",
+        "--attach",
+        &log.to_string_lossy(),
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Runs a command that must fail with `invalid_input` (exit 2) before reaching the daemon; with
@@ -341,13 +384,17 @@ fn malformed_ids_are_rejected_up_front() {
 #[test]
 fn limits_outside_what_can_be_honored_are_rejected() {
     let env = Env::new();
-    for limit in ["0", "11", "50"] {
+    for limit in ["0", "11", "50", "-1"] {
         let error = invalid(&env, &["search", "queen", "--limit", limit, "--json"]);
         assert!(
             error["hint"].as_str().expect("hint").contains("1 to 10"),
             "{error}"
         );
     }
+    // `--limit -1` is the limit's value, not a flag (clap's `-- -1` tip made it a query word).
+    let error = invalid(&env, &["search", "queen", "--limit=-1", "--json"]);
+    assert_eq!(error["details"]["limit"], -1);
+    invalid(&env, &["library", "liked", "--limit", "-5", "--json"]);
     invalid(
         &env,
         &["podcast", "search", "news", "--limit", "20", "--json"],
@@ -436,6 +483,24 @@ fn usage_errors_keep_the_details_in_json() {
             .starts_with("Possible values: track, album"),
         "{error}"
     );
+    // Value errors say which argument and show the command's usage, like every usage error.
+    let out = env.run(&["search", "queen", "--limit", "abc", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let error = stderr_error(&out);
+    assert_eq!(error["details"]["argument"], "--limit <LIMIT>");
+    assert_eq!(
+        error["details"]["usage"],
+        "spotify search [OPTIONS] <QUERY>..."
+    );
+    // `config set key value` points to the JSON form.
+    let out = env.run(&["config", "set", "search_limit", "5", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr_error(&out)["hint"]
+            .as_str()
+            .expect("hint")
+            .contains(r#"spotify config set '{"search_limit": 5}'"#)
+    );
     // queue add --type offers only what the queue accepts.
     let out = env.run(&["queue", "add", "--search", "x", "--type", "album", "--json"]);
     assert_eq!(out.status.code(), Some(2));
@@ -443,6 +508,39 @@ fn usage_errors_keep_the_details_in_json() {
         stderr_error(&out)["details"]["possible_values"],
         serde_json::json!(["track", "episode"])
     );
+    // track --type offers only what can be looked up by id.
+    let out = env.run(&[
+        "track",
+        "4IzpgR6RCEkRqMHbJF38Wp",
+        "--type",
+        "episode",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        stderr_error(&out)["details"]["possible_values"],
+        serde_json::json!(["track", "album", "artist", "playlist"])
+    );
+}
+
+#[test]
+fn config_set_key_equals_value_points_to_the_json_form() {
+    let env = Env::new();
+    let out = env.run(&["config", "set", "search_limit=5", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let error = stderr_error(&out);
+    assert_eq!(error["code"], "invalid_input");
+    assert!(
+        error["hint"]
+            .as_str()
+            .expect("hint")
+            .contains(r#"spotify config set '{"search_limit": 5}'"#),
+        "{error}"
+    );
+    // Nothing was saved.
+    let out = env.run(&["config", "get", "search_limit", "--json"]);
+    assert!(out.status.success());
+    assert_ne!(stdout_json(&out)["value"], 5);
 }
 
 #[test]

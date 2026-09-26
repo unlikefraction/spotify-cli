@@ -166,12 +166,17 @@ fn print_error(json: bool, error: &Error) {
     }
 }
 
-/// A clap parse error as a `usage` error, keeping everything clap says: the missing arguments,
-/// the possible values, its tips and the usage line.
-///
-/// clap renders `error: <what>` with indented continuation lines, then blank-line separated
-/// `tip:` lines, `Usage: …` and a `--help` pointer.
-fn usage_error(rendered: &str) -> Error {
+/// What clap says about a parse error, read from its rendering: `error: <what>` with indented
+/// continuation lines, then blank-line separated `tip:` lines, `Usage: …` and a `--help` pointer.
+#[derive(Debug, Default)]
+struct ClapText {
+    message: String,
+    possible: Vec<String>,
+    tips: Vec<String>,
+    usage: Option<String>,
+}
+
+fn clap_text(rendered: &str) -> ClapText {
     let mut lines = rendered.lines();
     let first = lines
         .next()
@@ -179,10 +184,8 @@ fn usage_error(rendered: &str) -> Error {
         .trim_start_matches("error: ")
         .trim()
         .to_owned();
+    let mut text = ClapText::default();
     let mut listed = Vec::new();
-    let mut possible: Vec<String> = Vec::new();
-    let mut tips = Vec::new();
-    let mut usage = None;
     let mut in_error_block = true;
     for line in lines {
         let trimmed = line.trim();
@@ -192,25 +195,189 @@ fn usage_error(rendered: &str) -> Error {
             .strip_prefix("[possible values: ")
             .and_then(|v| v.strip_suffix(']'))
         {
-            possible = values.split(", ").map(str::to_owned).collect();
+            text.possible = values.split(", ").map(str::to_owned).collect();
         } else if let Some(tip) = trimmed.strip_prefix("tip: ") {
-            tips.push(tip.to_owned());
+            text.tips.push(tip.to_owned());
         } else if trimmed.starts_with("Usage:") {
-            usage = Some(trimmed.to_owned());
+            text.usage = Some(trimmed.to_owned());
         } else if in_error_block {
             listed.push(trimmed.to_owned());
         }
     }
-    let message = if listed.is_empty() {
+    text.message = if listed.is_empty() {
         first
     } else {
         format!("{first} {}", listed.join(", "))
     };
-    let mut hint = Vec::new();
-    if !possible.is_empty() {
-        hint.push(format!("Possible values: {}.", possible.join(", ")));
+    text
+}
+
+/// The command a command line names, and the positional arguments it was given. Follows
+/// subcommand names and aliases, and skips options with the values they take.
+fn invoked<'a>(root: &'a clap::Command, argv: &[String]) -> (&'a clap::Command, Vec<String>) {
+    let mut command = root;
+    let mut positionals = Vec::new();
+    let mut tokens = argv.iter().skip(1);
+    while let Some(token) = tokens.next() {
+        if token == "--" {
+            positionals.extend(tokens.by_ref().cloned());
+        } else if let Some(long) = token.strip_prefix("--") {
+            let takes_value = !long.contains('=')
+                && command
+                    .get_arguments()
+                    .find(|a| a.get_long() == Some(long))
+                    .is_some_and(|a| a.get_action().takes_values());
+            if takes_value {
+                tokens.next();
+            }
+        } else if token.starts_with('-') && token.len() > 1 {
+            // Short flags (-h, -V) take no values.
+        } else if let Some(sub) = command
+            .find_subcommand(token)
+            .filter(|_| positionals.is_empty())
+        {
+            command = sub;
+        } else {
+            positionals.push(token.clone());
+        }
     }
-    for tip in &tips {
+    (command, positionals)
+}
+
+/// For an unexpected `-x` right after an option that takes a value (`--note -x`): clap reads
+/// `-x` as a flag, and its generic tip (`-- -x`) would make it a positional argument instead;
+/// `--note=-x` is what works.
+fn value_advice(unexpected: &str, argv: &[String], command: &clap::Command) -> Option<String> {
+    // `--note --lable x` is a mistyped flag (clap suggests `--label`), not a value.
+    if unexpected.starts_with("--") {
+        return None;
+    }
+    let at = argv.iter().position(|a| a == unexpected)?;
+    let option = argv.get(at.checked_sub(1)?)?;
+    let long = option.strip_prefix("--")?;
+    command
+        .get_arguments()
+        .find(|a| a.get_long() == Some(long))
+        .filter(|a| a.get_action().takes_values())?;
+    Some(format!(
+        "to pass '{unexpected}' as the value of {option}, write {option}={unexpected}"
+    ))
+}
+
+/// clap's generic tip for a hyphenated value: "to pass '-x' as a value, use '-- -x'".
+fn is_dash_dash_tip(tip: &str) -> bool {
+    tip.starts_with("to pass '") && tip.contains("' as a value, use '-- ")
+}
+
+/// Keys look like `search_limit`; `config set '{"a": 1}' extra` is something else.
+fn config_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// The JSON form `config set` takes for settings typed as `key value` or `key=value` words:
+/// values that read as JSON scalars keep their type, anything else becomes a string.
+fn config_json_form(pairs: &[(&str, &str)]) -> String {
+    let pairs: Vec<String> = pairs
+        .iter()
+        .map(|(key, value)| {
+            let value = serde_json::from_str::<Value>(value)
+                .ok()
+                .filter(|v| !v.is_object() && !v.is_array())
+                .unwrap_or_else(|| Value::String((*value).to_owned()));
+            format!("{}: {value}", Value::String((*key).to_owned()))
+        })
+        .collect();
+    // Single-quoted for the shell: a quote inside becomes '\''.
+    let object = format!("{{{}}}", pairs.join(", ")).replace('\'', r"'\''");
+    format!("config set takes one JSON object: spotify config set '{object}'.")
+}
+
+/// `key=value` words (`search_limit=5 telemetry=false`) → the JSON form, when every word is one.
+pub(crate) fn config_key_value_advice<'a>(
+    words: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let pairs: Option<Vec<(&str, &str)>> = words
+        .into_iter()
+        .map(|word| word.split_once('=').filter(|(key, _)| config_key(key)))
+        .collect();
+    pairs
+        .filter(|pairs| !pairs.is_empty())
+        .map(|pairs| config_json_form(&pairs))
+}
+
+/// `config set <key> <value>` (or several `key=value` words) → the JSON form it takes.
+fn config_set_advice(command: &clap::Command, positionals: &[String]) -> Option<String> {
+    if command.get_bin_name() != Some("spotify config set") || positionals.len() < 2 {
+        return None;
+    }
+    if positionals.len().is_multiple_of(2) && positionals.iter().step_by(2).all(|k| config_key(k)) {
+        let pairs: Vec<(&str, &str)> = positionals
+            .chunks(2)
+            .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+            .collect();
+        return Some(config_json_form(&pairs));
+    }
+    config_key_value_advice(positionals.iter().map(String::as_str))
+}
+
+/// What to say instead of or beyond clap for this command line.
+#[derive(Debug, Default)]
+struct Advice {
+    /// A tip that replaces clap's generic `-- -x` tip, or is added when clap has none.
+    value_tip: Option<String>,
+    /// Said before everything else in the hint.
+    first: Option<String>,
+    /// The usage line of the command, for errors whose rendering has none.
+    usage: String,
+}
+
+fn context(error: &clap::Error, kind: clap::error::ContextKind) -> Option<String> {
+    use clap::error::ContextValue;
+    match error.get(kind) {
+        Some(ContextValue::String(value)) if !value.is_empty() => Some(value.clone()),
+        Some(ContextValue::Strings(values)) if !values.is_empty() => Some(values.join(", ")),
+        _ => None,
+    }
+}
+
+fn advice(error: &clap::Error, argv: &[String]) -> Advice {
+    let mut root = Cli::command();
+    root.build();
+    let (command, positionals) = invoked(&root, argv);
+    let value_tip = (error.kind() == clap::error::ErrorKind::UnknownArgument)
+        .then(|| context(error, clap::error::ContextKind::InvalidArg))
+        .flatten()
+        .and_then(|unexpected| value_advice(&unexpected, argv, command));
+    Advice {
+        value_tip,
+        first: config_set_advice(command, &positionals),
+        usage: command.clone().render_usage().to_string().trim().to_owned(),
+    }
+}
+
+/// A clap parse error as a `usage` error, keeping everything clap says (the missing arguments,
+/// the possible values, its tips and the usage line), with the argument it is about and the
+/// command's usage in `details` even when clap's text has no usage line.
+fn usage_error(error: &clap::Error, argv: &[String]) -> Error {
+    use clap::error::ContextKind;
+    let advice = advice(error, argv);
+    let mut text = clap_text(&error.render().to_string());
+    if let Some(better) = &advice.value_tip {
+        text.tips.retain(|tip| !is_dash_dash_tip(tip));
+        text.tips.insert(0, better.clone());
+    }
+    if text.usage.is_none() && advice.usage.starts_with("Usage:") {
+        text.usage = Some(advice.usage.clone());
+    }
+    let mut hint = Vec::new();
+    hint.extend(advice.first.clone());
+    if !text.possible.is_empty() {
+        hint.push(format!("Possible values: {}.", text.possible.join(", ")));
+    }
+    for tip in &text.tips {
         let mut chars = tip.chars();
         let tip: String = chars
             .next()
@@ -218,7 +385,7 @@ fn usage_error(rendered: &str) -> Error {
             .unwrap_or_default();
         hint.push(format!("{}.", tip.trim_end_matches('.')));
     }
-    if let Some(usage) = &usage {
+    if let Some(usage) = &text.usage {
         // `<QUERY>...` already ends in dots.
         hint.push(if usage.ends_with('.') {
             usage.clone()
@@ -228,21 +395,54 @@ fn usage_error(rendered: &str) -> Error {
     }
     hint.push("Run the command with --help for arguments and examples.".into());
     let mut details = serde_json::Map::new();
-    if !possible.is_empty() {
-        details.insert("possible_values".into(), json!(possible));
+    if let Some(argument) = context(error, ContextKind::InvalidArg) {
+        details.insert("argument".into(), json!(argument));
     }
-    if let Some(usage) = usage {
+    if let Some(value) = context(error, ContextKind::InvalidValue) {
+        details.insert("value".into(), json!(value));
+    }
+    if !text.possible.is_empty() {
+        details.insert("possible_values".into(), json!(text.possible));
+    }
+    if let Some(usage) = &text.usage {
         details.insert(
             "usage".into(),
             json!(usage.trim_start_matches("Usage:").trim()),
         );
     }
-    let error = Error::new("usage", message, hint.join(" "));
+    let error = Error::new("usage", text.message, hint.join(" "));
     if details.is_empty() {
         error
     } else {
         error.with_details(Value::Object(details))
     }
+}
+
+/// clap's own rendering of a parse error, corrected where `advice` knows better; `None` when
+/// clap's text stands as it is.
+fn human_usage_error(error: &clap::Error, argv: &[String]) -> Option<String> {
+    let advice = advice(error, argv);
+    if advice.value_tip.is_none() && advice.first.is_none() {
+        return None;
+    }
+    let mut text = error.render().to_string();
+    if let Some(better) = &advice.value_tip {
+        let tips: Vec<String> = clap_text(&text)
+            .tips
+            .into_iter()
+            .filter(|tip| is_dash_dash_tip(tip))
+            .collect();
+        if tips.is_empty() {
+            text = format!("{}\n\nhint: {better}", text.trim_end());
+        }
+        for tip in tips {
+            text = text.replace(&tip, better);
+        }
+    }
+    if let Some(first) = &advice.first {
+        text = format!("{}\n\nhint: {first}", text.trim_end());
+    }
+    Some(text)
 }
 
 fn build_ctx(cli: &Cli) -> Result<Ctx> {
@@ -344,7 +544,12 @@ fn main() {
     let cli = match matches.and_then(|m| <Cli as clap::FromArgMatches>::from_arg_matches(&m)) {
         Ok(cli) => cli,
         Err(error) => {
-            let wants_json = std::env::args().any(|a| a == "--json");
+            // `std::env::args` panics on an argument that is not UTF-8 (clap reports those as
+            // usage errors, which must reach the user as such).
+            let argv: Vec<String> = std::env::args_os()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let wants_json = argv.iter().any(|a| a == "--json");
             match error.kind() {
                 clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
                     let _ = error.print();
@@ -355,11 +560,16 @@ fn main() {
                     std::process::exit(2);
                 }
                 _ if wants_json => {
-                    print_error(true, &usage_error(&error.render().to_string()));
+                    print_error(true, &usage_error(&error, &argv));
                     std::process::exit(2);
                 }
                 _ => {
-                    let _ = error.print();
+                    match human_usage_error(&error, &argv) {
+                        Some(text) => eprintln!("{}", text.trim_end()),
+                        None => {
+                            let _ = error.print();
+                        }
+                    }
                     eprintln!(
                         "\nRun `spotify <command> --help` for arguments and examples, or `spotify commands` to explore."
                     );
@@ -415,7 +625,8 @@ mod tests {
         let error = crate::args::Cli::command()
             .try_get_matches_from(args)
             .expect_err("usage error");
-        super::usage_error(&error.render().to_string())
+        let argv: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        super::usage_error(&error, &argv)
     }
 
     #[test]
@@ -463,6 +674,136 @@ mod tests {
         let error = parse_error(&["spotify", "trigger", "add"]);
         assert!(error.message.contains("--remaining"), "{}", error.message);
         assert!(!error.hint.starts_with('.'), "{}", error.hint);
+    }
+
+    #[test]
+    fn value_errors_carry_the_argument_and_usage() {
+        for args in [
+            &["spotify", "search", "queen", "--limit", "abc", "--json"][..],
+            &["spotify", "search", "queen", "--limit", "--play", "--json"],
+            &["spotify", "trigger", "add", "--end", "--times", "x"],
+        ] {
+            let error = parse_error(args);
+            let details = error.details.clone().unwrap_or_default();
+            assert!(
+                details["argument"]
+                    .as_str()
+                    .is_some_and(|a| a.starts_with("--")),
+                "{args:?}: {details}"
+            );
+            assert!(
+                details["usage"]
+                    .as_str()
+                    .is_some_and(|u| u.starts_with(&format!("spotify {} ", args[1]))),
+                "{args:?}: {details}"
+            );
+            assert!(error.hint.contains("Usage: spotify "), "{}", error.hint);
+        }
+        let error = parse_error(&["spotify", "search", "queen", "--limit", "abc"]);
+        assert_eq!(
+            error.details.map(|d| d["value"].clone()),
+            Some(json!("abc"))
+        );
+    }
+
+    #[test]
+    fn negative_limits_are_values_not_flags() {
+        use clap::Parser as _;
+        for args in [
+            &["spotify", "search", "queen", "--limit", "-1"][..],
+            &["spotify", "search", "queen", "--limit=-1"],
+            &["spotify", "library", "liked", "--limit", "-1"],
+        ] {
+            // Parsed, so the range check (invalid_input, 1 to 10) answers instead of clap's tip
+            // to write `-- -1`, which would add -1 to the query.
+            crate::args::Cli::try_parse_from(args).expect("parses");
+        }
+    }
+
+    #[test]
+    fn hyphenated_option_values_get_the_equals_form() {
+        let error = parse_error(&["spotify", "trigger", "add", "--end", "--note", "-x"]);
+        assert!(
+            error
+                .hint
+                .starts_with("To pass '-x' as the value of --note, write --note=-x."),
+            "{}",
+            error.hint
+        );
+        assert!(!error.hint.contains("'-- "), "{}", error.hint);
+        // A positional keeps clap's tip, which is right there.
+        let error = parse_error(&["spotify", "queue", "move", "3", "-1"]);
+        assert!(error.hint.contains("use '-- -1'"), "{}", error.hint);
+        // A mistyped flag after an option keeps clap's suggestion, without the value advice.
+        let error = parse_error(&["spotify", "trigger", "add", "--end", "--note", "--lable"]);
+        assert!(!error.hint.contains("--note=--lable"), "{}", error.hint);
+        assert!(error.hint.contains("'--label'"), "{}", error.hint);
+    }
+
+    #[test]
+    fn config_set_key_value_points_to_the_json_form() {
+        let error = parse_error(&["spotify", "config", "set", "search_limit", "5"]);
+        assert!(
+            error.hint.starts_with(
+                r#"config set takes one JSON object: spotify config set '{"search_limit": 5}'."#
+            ),
+            "{}",
+            error.hint
+        );
+        let error = parse_error(&["spotify", "config", "set", "a=1", "strategy=applescript"]);
+        assert!(
+            error
+                .hint
+                .contains(r#"'{"a": 1, "strategy": "applescript"}'"#),
+            "{}",
+            error.hint
+        );
+        assert_eq!(
+            super::config_key_value_advice(["search_limit=5"]).as_deref(),
+            Some(r#"config set takes one JSON object: spotify config set '{"search_limit": 5}'."#)
+        );
+        assert_eq!(
+            super::config_key_value_advice([r#"{"search_limit": 5}"#]),
+            None
+        );
+        assert_eq!(
+            super::config_key_value_advice(["search_limit=5", "oops"]),
+            None
+        );
+        let error = parse_error(&["spotify", "config", "set", "strategy", "applescript"]);
+        assert!(
+            error.hint.contains(r#"'{"strategy": "applescript"}'"#),
+            "{}",
+            error.hint
+        );
+        // Only `key value` pairs get the advice; a JSON object plus a stray word does not.
+        let error = parse_error(&["spotify", "config", "set", r#"{"a": 1}"#, "extra"]);
+        assert!(
+            !error.hint.contains("takes one JSON object"),
+            "{}",
+            error.hint
+        );
+        // A quote in a value stays copyable in the single-quoted shell form.
+        let error = parse_error(&["spotify", "config", "set", "label", "it's"]);
+        assert!(
+            error.hint.contains(r#"'{"label": "it'\''s"}'"#),
+            "{}",
+            error.hint
+        );
+        let argv: Vec<String> = ["spotify", "config", "set", "search_limit", "5"]
+            .iter()
+            .map(|a| (*a).to_owned())
+            .collect();
+        let error = crate::args::Cli::command()
+            .try_get_matches_from(&argv)
+            .expect_err("usage error");
+        let text = super::human_usage_error(&error, &argv).expect("advice");
+        assert!(
+            text.ends_with(
+                "hint: config set takes one JSON object: spotify config set '{\"search_limit\": 5}'."
+            ),
+            "{text}"
+        );
     }
 
     /// Help is wrapped at 100 columns (`max_term_width`), so an indented example line longer

@@ -23,13 +23,35 @@ ids).
 | 4 | refused (`automation_permission_denied`, `permission_denied`, `forbidden`, `recipient_not_registered`) |
 | 5 | unavailable (`daemon_unavailable`, `backend_unavailable`, `dependency_unavailable`, `transport`, `rate_limited`, `timeout`) |
 
+## Bad arguments
+
+Bad arguments are caught before anything runs, with exit 2. Parser errors are `usage` and keep
+what the parser knows in `details`: `usage` (the command's usage line, also when the parser's own
+text has none), `argument` (e.g. `"--limit <LIMIT>"`), `value` (the value it refused) and
+`possible_values`, when they apply. The hint always includes the usage line. Values the parser
+accepts but the command cannot use are `invalid_input`. Examples:
+
+- `spotify track <id> --type show` is a `usage` error whose `details.possible_values` is
+  `["track", "album", "artist", "playlist"]`: shows and episodes cannot be looked up by id.
+- `spotify search x --limit -1` (or `--limit=-1`) is `invalid_input`
+  `--limit -1 is out of range: it takes 1 to 10.` with `details` `{limit, min, max}`. The range
+  fits the command: `podcast search` 1 to 10, `library` and `playlist list` 1 or more,
+  `trigger history` 1 to 500. A negative `play --liked --limit`, `trigger add --times` or
+  `daemon logs --lines` is a `usage` error.
+- An option followed by a value that starts with `-` (`--note -x`) gets the tip
+  `to pass '-x' as the value of --note, write --note=-x`.
+- `spotify config set search_limit=5` is `invalid_input`
+  (``Config must be one JSON object, not `search_limit=5`.``, with the object in `details.json`);
+  `spotify config set search_limit 5` is a `usage` error. Both hints show the JSON form:
+  `spotify config set '{"search_limit": 5}'`.
+
 ## Codes
 
 ### Input and sign-in
 
 | Code | Exit | Meaning | Fix |
 | --- | --- | --- | --- |
-| `invalid_input` / `usage` | 2 | arguments or values are wrong: a malformed Spotify id or link, a reference of the wrong kind, a limit out of range, a config value of the wrong type, or Spotify answering 400 Bad Request | the hint shows the accepted forms; `<command> --help` |
+| `invalid_input` / `usage` | 2 | arguments or values are wrong: a malformed Spotify id or link, a reference of the wrong kind, a limit out of range, a config value of the wrong type, a `config set` given `key=value` instead of JSON, a `report --attach` file that is not text, or Spotify answering 400 Bad Request | the hint shows the accepted forms; `<command> --help` |
 | `not_authenticated` | 3 | no IAM session in this home, or it was revoked or expired (the backend's `unauthenticated`) | `spotify login '<SLT>'` |
 | `slt_rejected` | 1 | the SLT expired (~2 min), was used, or is for another app | mint a fresh one for `spotify` and log in right away (`spotify docs auth`) |
 | `reconsent_required` | 3 | the session lacks Ting scopes | log in again approving all scopes |
@@ -45,7 +67,7 @@ ids).
 | `spotify_player_failed` | 1 | spotify_player failed in an unexpected way, printed malformed JSON, or printed text instead of JSON (`details`: command, stdout, parse_error) | retry; `spotify doctor`; report |
 | `spotify_player_busy` | 1 | another spotify_player instance was starting (retryable) | retry in a moment |
 | `transport` | 5 | spotify_player could not reach the Spotify Web API | check the network and retry |
-| `no_active_device` | 1 | the Web API sees no active device | play anything in Spotify.app once |
+| `no_active_device` | 1 | the Web API sees no active device (also a `fallback.reason`, and a `status --full` warning) | play anything in Spotify.app once |
 | `premium_required` | 1 | Web API playback needs Premium | `spotify config set '{"strategy": "applescript"}'` |
 | `spotify_not_running` | 1 | Spotify.app is closed | `spotify launch` |
 | `spotify_not_installed` | 1 | macOS cannot find Spotify.app | install Spotify |
@@ -55,24 +77,30 @@ ids).
 | `nothing_to_resume` | 1 | resume with nothing loaded | `spotify play <something>` |
 | `not_a_podcast` | 1 | `spotify podcast now` while the current item is not an episode | `spotify podcast play spotify:episode:<id>` |
 | `not_allowed_in_context` | 1 | Spotify disallows shuffle/repeat here | play a playlist or album |
-| `no_effect` | — | spotify_player accepted a command that did not happen (appears in `fallback.reason`) | none; AppleScript handled it |
+| `no_effect` | 1 | spotify_player accepted a command that did not happen, or its instance logged a refusal. Usually only a `fallback.reason` (AppleScript made the change); it is the error under strategy `spotify_player`, and for `repeat` when a spotify_player step was not confirmed (retryable; `spotify docs playback`: Repeat) | under `auto`, none; else retry in a minute |
+| `state_mismatch` | 1 | spotify_player's working state (play state, shuffle, current item) disagrees with Spotify.app, so its command would do nothing or the wrong thing. Under strategy `auto` it is normally only a `fallback.reason` and AppleScript made the change; under strategy `spotify_player` it is the error (retryable). `details`: `spotify_player`, `spotify_app` | under `spotify_player`: retry after the next track change, or `spotify daemon restart` |
+| `track_mismatch` | 1 | `like`/`unlike` refused: spotify_player can only change its own current track, and that is not the song Spotify.app plays; it did not catch up after one nudge. Nothing changed (retryable; `details`: `spotify_app`, `spotify_player`, `catch_up_failed`). Not retryable when spotify_player's track changed during the command, so the like may have hit another song | retry in a few seconds; if not retryable, check `spotify library liked` |
+| `web_state_stale` | — | a `spotify status --full` warning: the Web API's playback is for another item than Spotify.app's (or could not be refreshed), so `web.stale` is true and repeat or shuffle that contradict Spotify.app are left out (retryable) | retry in a few seconds |
 | `verification_failed` | 1 | neither path produced the effect | check Spotify.app (ads, dialogs, offline) |
 | `not_found` | 1 | no such item, lyrics, trigger, firing or queue entry (a well-formed id that does not exist) | the hint names the lookup command |
-| `unsupported` | 1 | the underlying tools cannot do this (rename playlists, add episodes to a playlist, repeat-one via AppleScript) | the hint names the alternative |
-| `rate_limited` | 5 | Spotify or the backend is limiting | wait and retry |
+| `unsupported` | 1 | the underlying tools cannot do this (rename playlists, add episodes to a playlist, repeat-one via AppleScript, like an episode, ad or local file, start an episode, a show or a track with `--context` under strategy `spotify_player`) | the hint names the alternative |
+| `rate_limited` | 5 | Spotify or the backend is limiting (also a `fallback.reason` when spotify_player's instance logged a 429, with `details.request` and `details.spotify_player`) | wait and retry |
 | `timeout` | 5 | Spotify, spotify_player or the daemon did not answer in time | retry; if macOS shows "spotify-daemon wants access to control Spotify", click Allow first |
 | `platform_unsupported` | 1 | this needs macOS | run it on the Mac that plays the music |
 
-### Triggers, queue and Ting
+### Triggers and Ting
 
 | Code | Exit | Meaning | Fix |
 | --- | --- | --- | --- |
 | `threshold_passed` | 2 | a `current` trigger's checkpoint is already behind | later checkpoint or `--scope every` |
-| `queue_empty` | 1 | `next` from an empty managed queue | `spotify queue add <uri>` |
 | `recipient_not_registered` | 4 | Ting has no grant for this app to notify you | `spotify ting register` |
 | `recipient_changed` | 1 | the trigger's home now holds another Silicon's session (in `spotify trigger history`) | remove the trigger and create it again as the right Silicon |
 | `testing_selection_changed` | 1 | a trigger's home now selects another plane | re-select it (`spotify testing use`) or recreate the trigger |
 | `testing_selection_missing` | 1 | a trigger made in a testing plane, but the home no longer selects one | `spotify testing use --app-secret-file -`, or remove the trigger |
+
+The managed queue has no codes of its own: items that cannot be queued are `invalid_input`, an
+unknown position, id or URI is `not_found`, and `spotify next` with an empty managed queue is not
+an error (it runs Spotify's own next).
 
 ### Daemon, setup and updates
 

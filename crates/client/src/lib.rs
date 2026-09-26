@@ -10,8 +10,10 @@
 //! - [`model`] holds the playback, track and library shapes every surface prints.
 //! - [`applescript`] builds and parses the AppleScript that talks to Spotify.app.
 //! - [`player`] wraps the `spotify_player` CLI and classifies its failures.
-//! - [`control`] combines both: it tries `spotify_player` first, verifies the effect against
-//!   Spotify.app, and falls back to AppleScript. It never stores anything.
+//! - [`control`] combines both: it tries `spotify_player` first (AppleScript first for seeking and
+//!   for starting a track or Liked Songs), checks spotify_player's view of the player against
+//!   Spotify.app before commands that depend on it, verifies the effect against Spotify.app, and
+//!   falls back to AppleScript. It never stores anything.
 //! - [`trigger`] is the pure trigger engine: given playback observations it decides what fires.
 //! - [`api`] (feature `api`) is the HTTP client for the spotify-cli backend.
 //! - [`store`] and [`ipc`] (feature `runtime`) are the stateful helpers shared by the `spotify`

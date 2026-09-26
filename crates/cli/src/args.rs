@@ -10,12 +10,15 @@ const ROOT_ABOUT: &str = "Control Spotify on this Mac from the terminal, and get
 const ROOT_LONG: &str = "\
 spotify-cli turns the Spotify desktop app into a command-line app for Carbons and Silicons.
 Playback commands go through spotify_player (Spotify Web API) first, are verified against
-Spotify.app, and fall back to AppleScript when they fail or have no effect; every result says which
-path worked. Triggers watch the playing track and notify the Silicon that set them through Ting
+Spotify.app, and fall back to AppleScript when they fail or have no effect; seeks and starting a
+single track, episode, show or Liked Songs go to AppleScript first. Every result says which path
+worked. Triggers watch the playing track and notify the Silicon that set them through Ting
 (\"30 s left\", \"25% left\", \"50% passed\", \"song over\").
 
 An always-on daemon (spotify-daemon) watches Spotify, fires triggers and keeps spotify_player warm.
 The CLI starts it on demand; `spotify daemon install` runs it at login.";
+
+const LIKE_AFTER: &str = "spotify_player can like or unlike only the song it believes is playing, so the command waits (up to verify_timeout_ms + ~1 s) until that is the song Spotify.app plays. If it does not catch up, nothing changes and the error is track_mismatch (retryable). Podcast episodes, ads and local files are unsupported.\n\nNext: spotify library liked";
 
 const ROOT_AFTER: &str = "\
 Start here:
@@ -86,7 +89,7 @@ pub enum Command {
     /// Show what Spotify is playing (track, position, remaining, volume, shuffle, repeat).
     #[command(
         visible_alias = "now",
-        long_about = "Reads Spotify.app directly (AppleScript, ~50 ms). --full adds what only the Web API knows: the playing context (playlist/album), the device and the exact repeat mode.",
+        long_about = "Reads Spotify.app directly (AppleScript, ~50 ms). --full adds what only the Web API knows, under `web`: the playing context (playlist/album), the device and the exact repeat mode, plus item_uri, is_playing, source and stale.\n\nThose facts come from the daemon's spotify_player when its view matches Spotify.app (`source: spotify_player`), otherwise from a fresh Web API read (`source: web_api`, 1-4 s). When even that is for another item, `web.stale` is true, repeat and shuffle that contradict Spotify.app are left out, and the warning `web_state_stale` says so. Other warnings: no_active_device (the Web API sees no playback), timeout, rate_limited. Warnings never fail the command.",
         after_help = "Examples:\n  spotify status\n  spotify now --json | jq .playback.remaining_ms\n  spotify status --full\n\nNext: spotify track (song details) · spotify lyrics · spotify trigger add --remaining 30s"
     )]
     Status {
@@ -96,7 +99,7 @@ pub enum Command {
     },
     /// Play something (a URI, a link, a search, Liked Songs, a radio) or resume.
     #[command(
-        long_about = "Without arguments: resume. With a target: start it. Targets are spotify:<kind>:<id> URIs, open.spotify.com links, or bare ids with --type. --search plays the first match.\n\nHow it plays: spotify_player (Web API) first; if it errors or Spotify.app does not change within verify_timeout_ms (default 2.5 s), AppleScript plays it. Starting a single track by id through spotify_player is known to fail on the desktop app, so tracks usually report `via: applescript` with the reason in `fallback`.",
+        long_about = "Without arguments: resume. With a target: start it. Targets are spotify:<kind>:<id> URIs, open.spotify.com links, or bare ids with --type. --search plays the first match.\n\nHow it plays: a track, episode or show, and --liked, go to AppleScript first (the Web API starts a single track as a list of ids, which leaves the desktop app with nothing loaded), so they normally report `via: applescript` with no fallback. Albums, playlists, artists, radio and resume go through spotify_player (Web API) first; if it errors, is refused, or Spotify.app does not change in time (verify_timeout_ms, default 2.5 s; at most 1.5 s for resume), AppleScript plays it and `fallback.reason` says why. When a failed start leaves Spotify.app with nothing loaded, what was playing is put back (error details.restored).",
         after_help = "Examples:\n  spotify play                                   Resume\n  spotify play spotify:track:0BxE4FqsDD1Ot4YuBXwAPp\n  spotify play https://open.spotify.com/album/78bpIziExqiI9qztvNFlQu --shuffle\n  spotify play --search 'arctic monkeys 505'\n  spotify play --search 'lofi beats' --type playlist\n  spotify play spotify:track:<id> --context spotify:playlist:<id>   Track, then the playlist\n  spotify play --liked --random\n  spotify play --radio spotify:artist:<id>\n\nNext: spotify status · spotify queue add <uri> · spotify trigger add --end"
     )]
     Play(PlayArgs),
@@ -104,19 +107,22 @@ pub enum Command {
     Resume,
     /// Pause playback.
     Pause,
-    /// Toggle between play and pause.
+    /// Toggle between play and pause (an explicit pause or play, from Spotify.app's state).
     Toggle,
     /// Skip to the next track (plays the managed queue first when it has items).
     #[command(
         after_help = "If `spotify queue` has managed items, `next` plays the first of them; otherwise Spotify's own next track.\n\nNext: spotify status"
     )]
     Next,
-    /// Go to the previous track (Spotify restarts the current one when past 3 s).
-    #[command(visible_alias = "prev")]
+    /// Go to the previous item, or back to the start of this one (from 3 s in).
+    #[command(
+        visible_alias = "prev",
+        after_help = "From 3 s into the item, or when there is no item before it, `previous` restarts the current one (seek to 0:00); otherwise it goes to the previous item. The result says which: `result` is `restarted` or `previous_item` in --json.\n\nNext: spotify status"
+    )]
     Previous,
     /// Jump within the current track.
     #[command(
-        after_help = "Positions: 90, 90s, 1:30, 1m30s, 1:02:03, 50%. Offsets: +15s, -10s, +10%.\n\nExamples:\n  spotify seek 1:30\n  spotify seek 50%\n  spotify seek +30s\n  spotify seek -10"
+        after_help = "Positions: 90, 90s, 1:30, 1m30s, 1:02:03, 50%. Offsets: +15s, -10s, +10%.\n\nExamples:\n  spotify seek 1:30\n  spotify seek 50%\n  spotify seek +30s\n  spotify seek -10\n\nUnder strategy auto (the default) seeks are exact: AppleScript sets the position. Under strategy spotify_player a seek is a relative, approximate one, refused with state_mismatch when spotify_player is on another item."
     )]
     Seek {
         /// Position or offset.
@@ -140,7 +146,7 @@ pub enum Command {
     },
     /// Set repeat: off, context (the playlist/album) or track (this song).
     #[command(
-        after_help = "`track` (repeat-one) needs spotify_player; AppleScript can only switch context repeat on and off."
+        after_help = "`track` (repeat-one) needs spotify_player; AppleScript can only switch context repeat on and off (it cannot clear a repeat-one set through the Web API). Every change is checked in Spotify.app. When spotify_player refuses for now, `repeat track` returns its error (e.g. rate_limited, retryable)."
     )]
     Repeat {
         /// off, context or track.
@@ -148,24 +154,26 @@ pub enum Command {
         mode: RepeatArg,
     },
     /// Save the current track to Liked Songs.
+    #[command(after_help = LIKE_AFTER)]
     Like,
     /// Remove the current track from Liked Songs.
+    #[command(after_help = LIKE_AFTER)]
     Unlike,
-    /// Start Spotify.app in the background (hidden, no focus steal).
+    /// Start Spotify.app in the background (hidden, no focus steal) unless it is running.
     Launch,
 
     // ---------------------------------------------------------------- information
     /// Details about the current song, or about any track, album, artist or playlist.
     #[command(
         visible_alias = "song",
-        after_help = "Examples:\n  spotify track                               The current song (+ artists, album, release date)\n  spotify track spotify:album:78bpIziExqiI9qztvNFlQu\n  spotify track https://open.spotify.com/artist/7Ln80lUS6He07XvHI8qqHH\n  spotify track 37i9dQZF1DXcBWIGoYBM5M --type playlist\n\nAlbums show their release date and track list; artists their top tracks, albums and related artists; playlists their tracks. Podcast shows and episodes cannot be looked up by id (use `spotify podcast search`).\n\nNext: spotify lyrics · spotify playlist add <playlist> <uri>"
+        after_help = "Examples:\n  spotify track                               The current song (+ artists, album, release date)\n  spotify track spotify:album:78bpIziExqiI9qztvNFlQu\n  spotify track https://open.spotify.com/artist/7Ln80lUS6He07XvHI8qqHH\n  spotify track 37i9dQZF1DXcBWIGoYBM5M --type playlist\n\nAlbums show their release date and track list; artists their top tracks, albums and related artists; playlists their tracks. Songs show `liked: yes|no` when the daemon knows whether they are in Liked Songs. Podcast shows and episodes cannot be looked up by id (use `spotify podcast search`; `spotify track` with no target describes the episode playing now).\n\nNext: spotify lyrics · spotify playlist add <playlist> <uri>"
     )]
     Track {
         /// URI, link or id (default: the current song).
         target: Option<String>,
-        /// Kind for a bare id.
+        /// Kind for a bare id (default: track). Shows and episodes cannot be looked up by id.
         #[arg(long = "type", value_enum)]
-        kind: Option<KindArg>,
+        kind: Option<TrackKindArg>,
     },
     /// Lyrics of the current song (or of a given track).
     #[command(
@@ -187,8 +195,8 @@ pub enum Command {
         #[arg(long = "type", value_delimiter = ',', value_enum)]
         kinds: Vec<KindArg>,
         /// Results per kind, 1-10 (spotify_player returns at most 10; default: config search_limit, 10).
-        #[arg(long)]
-        limit: Option<usize>,
+        #[arg(long, allow_negative_numbers = true)]
+        limit: Option<i64>,
         /// Play the first result.
         #[arg(long)]
         play: bool,
@@ -202,8 +210,8 @@ pub enum Command {
         #[arg(value_enum)]
         section: LibrarySection,
         /// Show at most this many (1 or more; default: all).
-        #[arg(long)]
-        limit: Option<usize>,
+        #[arg(long, allow_negative_numbers = true)]
+        limit: Option<i64>,
     },
 
     // ---------------------------------------------------------------- collections
@@ -381,14 +389,21 @@ pub struct PlayArgs {
     /// Start a playlist/album/artist shuffled.
     #[arg(long)]
     pub shuffle: bool,
-    /// Play Liked Songs.
+    /// Play the Liked Songs list itself (next and previous stay in it).
     #[arg(long, conflicts_with_all = ["target", "search", "radio"])]
     pub liked: bool,
-    /// With --liked: random order.
+    /// With --liked: turn shuffle on for Liked Songs (Spotify keeps it) and start at a random
+    /// song. Without it, Liked Songs keeps its own shuffle setting.
     #[arg(long, requires = "liked")]
     pub random: bool,
-    /// With --liked: at most this many tracks.
-    #[arg(long, requires = "liked", default_value_t = 200)]
+    /// With --liked: at most this many tracks. Applies only when spotify_player starts the list
+    /// (strategy spotify_player, or its Spotify username is unknown).
+    #[arg(
+        long,
+        requires = "liked",
+        default_value_t = 200,
+        allow_negative_numbers = true
+    )]
     pub limit: u32,
     /// Start a radio seeded from this track/album/artist/playlist.
     #[arg(long, conflicts_with_all = ["target", "search"])]
@@ -417,6 +432,15 @@ pub enum KindArg {
     Playlist,
     Show,
     Episode,
+}
+
+/// What `spotify track --type` can look up by id: podcast shows and episodes cannot be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TrackKindArg {
+    Track,
+    Album,
+    Artist,
+    Playlist,
 }
 
 /// What `queue add --search` can queue: Spotify's queue holds single items only.
@@ -477,8 +501,8 @@ pub enum PlaylistCommand {
     #[command(visible_alias = "ls")]
     List {
         /// Show at most this many (1 or more; default: all).
-        #[arg(long)]
-        limit: Option<usize>,
+        #[arg(long, allow_negative_numbers = true)]
+        limit: Option<i64>,
     },
     /// Tracks of a playlist.
     Show {
@@ -581,8 +605,8 @@ pub enum PodcastCommand {
         #[arg(long)]
         shows: bool,
         /// Results per kind, 1-10 (spotify_player returns at most 10; default 10).
-        #[arg(long)]
-        limit: Option<usize>,
+        #[arg(long, allow_negative_numbers = true)]
+        limit: Option<i64>,
     },
     /// Play an episode or show.
     Play {
@@ -644,8 +668,8 @@ pub enum TriggerCommand {
         /// Only this trigger.
         id: Option<String>,
         /// How many, 1-500 (default 20).
-        #[arg(long)]
-        limit: Option<usize>,
+        #[arg(long, allow_negative_numbers = true)]
+        limit: Option<i64>,
         /// Every home on this machine.
         #[arg(long)]
         everyone: bool,
@@ -695,7 +719,7 @@ pub struct TriggerAdd {
     #[arg(long)]
     pub track: Option<String>,
     /// Fire at most N times (current scope always fires once).
-    #[arg(long, conflicts_with = "once")]
+    #[arg(long, conflicts_with = "once", allow_negative_numbers = true)]
     pub times: Option<u32>,
     /// Fire once, then finish (same as --times 1).
     #[arg(long)]
@@ -758,6 +782,9 @@ pub enum AuthCommand {
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
     /// Set keys from one JSON object; null resets a key. Unknown keys are rejected.
+    #[command(
+        after_help = "Examples:\n  spotify config set '{\"search_limit\": 5}'\n  spotify config set '{\"telemetry\": false, \"strategy\": \"applescript\"}'\n  spotify config set '{\"search_limit\": null}'     null resets a key\n\nKeys, types and defaults: spotify config keys"
+    )]
     Set {
         /// JSON object, e.g. '{"telemetry": false}'.
         #[arg(value_name = "JSON")]
@@ -809,7 +836,7 @@ pub enum DaemonCommand {
     /// Print the end of the daemon log.
     Logs {
         /// Lines (default 60).
-        #[arg(long, default_value_t = 60)]
+        #[arg(long, default_value_t = 60, allow_negative_numbers = true)]
         lines: usize,
     },
 }

@@ -40,4 +40,6 @@ Rules:
 
 Script installs: the daemon checks GitHub releases hourly and installs verified updates
 (`auto_update`, default on). Honeycomb installs: Honeycomb's worker updates them
-(`honeycomb update spotify`). `spotify update --check` reports; `spotify update` installs now.
+(`honeycomb update spotify`). `spotify update --check` reports; for a script install that
+includes your `auto_update` setting (`update` in `spotify daemon status --json` shows the same).
+`spotify update` installs now.

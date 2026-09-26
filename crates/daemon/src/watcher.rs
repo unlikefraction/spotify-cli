@@ -14,14 +14,14 @@ use std::time::{Duration, Instant};
 const FIRST_CONTACT_WINDOW: Duration = Duration::from_secs(120);
 
 use serde_json::{Value, json};
+use silicon_spotify_client::Result;
 use silicon_spotify_client::applescript;
 use silicon_spotify_client::model::{Playback, PlayerState, now_ms, now_rfc3339};
 use silicon_spotify_client::trigger::{self, Observation, Status};
-use silicon_spotify_client::{Error, Result};
 
 use crate::db::FiringRow;
 use crate::log;
-use crate::queue::{Action, Note, Reading, Resume};
+use crate::queue::{Action, Note, Pending, Reading, Resume};
 use crate::service::{Daemon, Settings, blocking};
 
 /// Runs forever.
@@ -160,9 +160,15 @@ fn process(daemon: &Arc<Daemon>, playback: &Playback, at: u64) -> Result<Duratio
                 log!("queue: {uri} did not start (attempt {attempts}); retrying")
             }
             Note::Dropped(uri) => log!("queue: dropped {uri} after repeated failed hand-offs"),
+            Note::Skipped(uri) => log!("queue: skipped {uri} before it started"),
         }
     }
     daemon.save_queue(&live);
+    // The hand-off `decide` just marked pending, exactly (see `send_hand_off`).
+    let claim = match &action {
+        Action::Play(_) => live.queue.pending.clone(),
+        _ => None,
+    };
 
     // Next wake.
     let busy = !live.triggers.is_empty()
@@ -199,12 +205,14 @@ fn process(daemon: &Arc<Daemon>, playback: &Playback, at: u64) -> Result<Duratio
 
     match action {
         Action::None => {}
-        Action::Play(uri) => {
-            send_hand_off(daemon, &uri, "end of track");
+        Action::Play(_) => {
+            if let Some(claim) = claim {
+                send_hand_off(daemon, &claim, "end of track");
+            }
             return Ok(Duration::from_millis(250));
         }
         Action::Resume(resume) => {
-            resume_context(daemon, &resume);
+            resume_context(daemon, &resume, at);
             return Ok(Duration::from_millis(300));
         }
         Action::CaptureResume => capture_resume(daemon, &daemon.settings()),
@@ -266,8 +274,23 @@ fn hostname() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Sends `play track <uri>` for a pending hand-off; a send failure counts as a failed attempt.
-fn send_hand_off(daemon: &Arc<Daemon>, uri: &str, why: &str) {
+/// Sends `play track <uri>` for the hand-off `decide` marked pending (`claim`); a send failure
+/// counts as a failed attempt. Nothing is sent when that exact claim is gone: a `spotify next`
+/// took it over (and sent the item itself, with a claim of its own), or an explicit command or
+/// a queue edit dropped it.
+fn send_hand_off(daemon: &Arc<Daemon>, claim: &Pending, why: &str) {
+    let _serial = daemon
+        .hand_off
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    {
+        let mut live = daemon.live();
+        if !live.queue.send_claimed(claim) {
+            return;
+        }
+        daemon.save_queue(&live);
+    }
+    let uri = claim.uri.as_str();
     let result = daemon
         .script
         .run(&applescript::play_uri(uri, None))
@@ -297,16 +320,7 @@ pub fn capture_resume(daemon: &Arc<Daemon>, settings: &Settings) {
         .pointer("/context/uri")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let uri_of = |item: &Value| {
-        item.get("uri")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                item.get("id")
-                    .and_then(Value::as_str)
-                    .map(|id| format!("spotify:track:{id}"))
-            })
-    };
+    let uri_of = |item: &Value| item_uri(item);
     // The upcoming list can start with the item playing now; the resume point is the one after it.
     let current = queue
         .get("currently_playing")
@@ -331,42 +345,78 @@ pub fn capture_resume(daemon: &Arc<Daemon>, settings: &Settings) {
     daemon.save_queue(&live);
 }
 
-/// `spotify next` with managed items: hand over to the head now.
+/// A Web API item's URI: its `uri`, else `spotify:<type>:<id>` (episodes in the queue come
+/// without a `uri`).
+#[must_use]
+pub fn item_uri(item: &Value) -> Option<String> {
+    item.get("uri")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            let id = item.get("id").and_then(Value::as_str)?;
+            let kind = item.get("type").and_then(Value::as_str).unwrap_or("track");
+            Some(format!("spotify:{kind}:{id}"))
+        })
+}
+
+/// What `spotify next` did with the managed queue.
+pub enum Advance {
+    /// Handed over to a managed item; the reply.
+    Played(Value),
+    /// Nothing managed to play. `skipped` is a hand-off still in flight that this `next`
+    /// skipped (it was sent, so Spotify is switching to it).
+    Nothing {
+        /// The skipped item's URI.
+        skipped: Option<String>,
+    },
+}
+
+/// `spotify next`: hands over to the managed queue's next item now. The caller holds
+/// [`Daemon::hand_off`], so concurrent `next`s claim different items (see
+/// [`crate::queue::QueueState::claim_next`]).
 ///
 /// # Errors
-/// `queue_empty` or AppleScript errors.
-pub fn advance_queue(daemon: &Arc<Daemon>, settings: &Settings) -> Result<Value> {
+/// AppleScript errors.
+pub fn advance_queue(daemon: &Arc<Daemon>, settings: &Settings) -> Result<Advance> {
     let needs_resume = {
         let live = daemon.live();
         if live.queue.items.is_empty() {
-            return Err(Error::new(
-                "queue_empty",
-                "The managed queue is empty.",
-                "Add items with `spotify queue add <uri>`.",
-            ));
+            return Ok(Advance::Nothing { skipped: None });
         }
-        live.queue.managed_now.is_none() && live.queue.resume.is_none()
+        live.queue.pending.is_none()
+            && live.queue.managed_now.is_none()
+            && live.queue.resume.is_none()
     };
     if needs_resume {
         capture_resume(daemon, settings);
     }
-    let (uri, item) = {
+    let (item, notes, remaining) = {
         let mut live = daemon.live();
-        let item = live.queue.items.first().cloned();
-        let uri = live.queue.begin_hand_off(now_ms());
+        let mut notes = Vec::new();
+        let item = live.queue.claim_next(now_ms(), &mut notes);
         daemon.save_queue(&live);
-        (uri, item)
+        (item, notes, live.queue.items.len().saturating_sub(1))
     };
-    let uri = uri.ok_or_else(|| {
-        Error::new(
-            "queue_empty",
-            "The managed queue is empty.",
-            "Add items with `spotify queue add <uri>`.",
-        )
-    })?;
+    let mut skipped = None;
+    for note in notes {
+        match note {
+            Note::Skipped(uri) => {
+                log!("queue: skipped {uri} before it started (next)");
+                skipped = Some(uri);
+            }
+            Note::Failed { uri, attempts } => {
+                log!("queue: {uri} did not start (attempt {attempts}); retrying");
+            }
+            Note::Dropped(uri) => log!("queue: dropped {uri} after repeated failed hand-offs"),
+            Note::Started(_) => {}
+        }
+    }
+    let Some(item) = item else {
+        return Ok(Advance::Nothing { skipped });
+    };
     if let Err(error) = daemon
         .script
-        .run(&applescript::play_uri(&uri, None))
+        .run(&applescript::play_uri(&item.uri, None))
         .and_then(|o| applescript::expect_ok(&o))
     {
         let mut live = daemon.live();
@@ -375,14 +425,42 @@ pub fn advance_queue(daemon: &Arc<Daemon>, settings: &Settings) -> Result<Value>
         return Err(error);
     }
     daemon.nudge.notify_one();
-    log!("queue: playing {uri} (next)");
-    let remaining = daemon.live().queue.items.len().saturating_sub(1);
-    Ok(
-        json!({"action": "next", "via": "applescript", "source": "managed_queue", "playing": item, "queue_remaining": remaining}),
-    )
+    log!("queue: playing {} (next)", item.uri);
+    Ok(Advance::Played(
+        json!({"action": "next", "via": "applescript", "source": "managed_queue", "playing": item, "queue_remaining": remaining, "skipped": skipped}),
+    ))
 }
 
-fn resume_context(daemon: &Arc<Daemon>, resume: &Resume) {
+/// Waits (up to `within`) until Spotify.app shows `uri` as the current item.
+pub fn wait_until_current(daemon: &Daemon, uri: &str, within: Duration) {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        let current = daemon
+            .read()
+            .ok()
+            .and_then(|p| p.track)
+            .is_some_and(|t| t.uri == uri);
+        if current {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Plays the resume point `decide` chose from the reading taken at `decided_ms`, unless an
+/// explicit command (`play`, `previous`, `next`) ran since: that one is the user's and wins.
+fn resume_context(daemon: &Arc<Daemon>, resume: &Resume, decided_ms: u64) {
+    // Serialized with `spotify next` and hand-offs, so a resume never lands after (and over)
+    // one of them.
+    let _serial = daemon
+        .hand_off
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // `decide` resumes only while no hold is open, so a hold that is open now began after it.
+    if daemon.live().queue.hold_until_ms > decided_ms {
+        log!("queue: drained, but an explicit command ran meanwhile; not resuming");
+        return;
+    }
     let script = match (&resume.next_uri, &resume.context_uri) {
         (Some(next), Some(context)) => applescript::play_uri(next, Some(context)),
         (Some(next), None) => applescript::play_uri(next, None),

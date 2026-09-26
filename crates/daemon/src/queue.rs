@@ -8,6 +8,12 @@
 //!   item or resume over it.
 //! - The head plays when the current item is within [`ADVANCE_MS`] of its end, when the current
 //!   item ends on its own (Spotify moved on first, crossfade, stop), or on `spotify next`.
+//! - `spotify next` while a hand-off is still in flight skips that item (it counts as played),
+//!   so two quick `next`s never hand off the same item ([`QueueState::claim_next`]). A hand-off
+//!   the watcher decided on but has not sent yet is not skipped: that `next` plays the item
+//!   itself, and the watcher then sends nothing ([`QueueState::send_claimed`]).
+//! - Handing off the item that is already playing restarts it; Spotify reports no new play for
+//!   that, so a reading that shows it again from (near) its start counts as the start.
 //! - When the last managed item nears its end or ends, the interrupted context resumes.
 //! - Explicit commands (`play`, `previous`, `next` without a queue) open a short hold during which
 //!   item changes are the user's, not something to override.
@@ -25,6 +31,9 @@ pub const GRACE_MS: u64 = 5_000;
 pub const HOLD_MS: u64 = 5_000;
 /// Drop an item after this many failed hand-offs.
 pub const MAX_ATTEMPTS: u32 = 3;
+/// A pending item seen at most this far past the time since its hand-off was sent has started
+/// (from the beginning) rather than kept playing.
+pub const RESTART_SLACK_MS: u64 = 1_500;
 
 /// A managed-queue entry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -73,6 +82,17 @@ pub struct Pending {
     pub uri: String,
     /// When it was sent (unix ms).
     pub since_ms: u64,
+    /// Whether the play command has gone out. The watcher marks its hand-off pending when it
+    /// decides on it and sends it right after, under [`crate::service::Daemon::hand_off`]; a
+    /// `spotify next` that gets that lock first takes the hand-off over instead of skipping an
+    /// item Spotify never saw (see [`QueueState::claim_next`]).
+    #[serde(default = "sent_by_default")]
+    pub sent: bool,
+}
+
+/// Hand-offs persisted by earlier versions were sent right after they were marked.
+fn sent_by_default() -> bool {
+    true
 }
 
 /// Persisted queue state.
@@ -136,17 +156,77 @@ pub enum Note {
     Failed { uri: String, attempts: u32 },
     /// An item was dropped after repeated failures.
     Dropped(String),
+    /// `spotify next` skipped an item whose hand-off was still in flight.
+    Skipped(String),
 }
 
 impl QueueState {
-    /// Marks a hand-off of the head and returns its URI.
+    /// Marks a hand-off of the head (not sent yet: the watcher sends it next) and returns its
+    /// URI.
     pub fn begin_hand_off(&mut self, now_ms: u64) -> Option<String> {
         let head = self.items.first()?.uri.clone();
         self.pending = Some(Pending {
             uri: head.clone(),
             since_ms: now_ms,
+            sent: false,
         });
         Some(head)
+    }
+
+    /// `spotify next` with managed items: claims the item to hand off now and marks it pending
+    /// (the caller sends it before releasing [`crate::service::Daemon::hand_off`]).
+    ///
+    /// A hand-off still in flight (sent, not yet seen playing) is what the previous `next` (or
+    /// the end of the track) moved to, so this `next` skips it: it leaves the queue and the one
+    /// after it is claimed. `None` when nothing is left, in which case the caller moves on the
+    /// way Spotify would. A pending hand-off older than [`GRACE_MS`] is counted as failed first.
+    /// One the watcher decided on but has not sent yet is taken over: its item is claimed again
+    /// (the watcher then finds its claim gone and sends nothing).
+    pub fn claim_next(&mut self, now_ms: u64, notes: &mut Vec<Note>) -> Option<QueueItem> {
+        if let Some(pending) = self.pending.take() {
+            if !pending.sent {
+                // Spotify never got it: nothing to skip.
+            } else if now_ms.saturating_sub(pending.since_ms) <= GRACE_MS {
+                if let Some(index) = self.items.iter().position(|h| h.uri == pending.uri) {
+                    self.items.remove(index);
+                }
+                notes.push(Note::Skipped(pending.uri));
+            } else if let Some(note) = self.fail(&pending.uri) {
+                notes.push(note);
+            }
+        }
+        let head = self.items.first()?.clone();
+        self.pending = Some(Pending {
+            uri: head.uri.clone(),
+            since_ms: now_ms,
+            sent: true,
+        });
+        Some(head)
+    }
+
+    /// The watcher is about to send the hand-off it decided on (`claim`, as [`Self::decide`]
+    /// left it): marks it sent and returns true, or false when a `spotify next`, an explicit
+    /// command or a queue edit replaced or dropped it meanwhile (then nothing may be sent).
+    pub fn send_claimed(&mut self, claim: &Pending) -> bool {
+        match self.pending.as_mut() {
+            Some(pending) if pending == claim && !pending.sent => {
+                pending.sent = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The pending item started: it leaves the queue and is the managed item playing now.
+    fn started(&mut self, uri: &str, notes: &mut Vec<Note>) {
+        self.pending = None;
+        // Remove that item (not blindly the head: `queue add --next` may have inserted another
+        // item in front while the hand-off was in flight).
+        if let Some(index) = self.items.iter().position(|h| h.uri == uri) {
+            self.items.remove(index);
+        }
+        self.managed_now = Some(uri.to_owned());
+        notes.push(Note::Started(uri.to_owned()));
     }
 
     /// Records a hand-off that failed to send.
@@ -207,18 +287,15 @@ impl QueueState {
             match event {
                 PlayEvent::Started(play) => {
                     if self.pending.as_ref().is_some_and(|p| p.uri == play.uri) {
-                        self.pending = None;
-                        // Remove that item (not blindly the head: `queue add --next` may have
-                        // inserted another item in front while the hand-off was in flight).
-                        if let Some(index) = self.items.iter().position(|h| h.uri == play.uri) {
-                            self.items.remove(index);
-                        }
-                        self.managed_now = Some(play.uri.clone());
-                        notes.push(Note::Started(play.uri.clone()));
+                        self.started(&play.uri, notes);
                         want = None;
                         continue;
                     }
                     if self.pending.is_some() {
+                        continue;
+                    }
+                    if self.managed_now.as_deref() == Some(play.uri.as_str()) {
+                        // The managed item playing now started over: it did not end.
                         continue;
                     }
                     if held {
@@ -251,6 +328,17 @@ impl QueueState {
                     }
                 }
             }
+        }
+        // Handing off the item that was already playing restarts it without a new play: seeing
+        // it from (near) its start after the hand-off was sent is its start.
+        if let Some(pending) = self.pending.clone()
+            && reading.uri.as_deref() == Some(pending.uri.as_str())
+            && reading.state == PlayerState::Playing
+            && now_ms >= pending.since_ms
+            && reading.position_ms <= now_ms - pending.since_ms + RESTART_SLACK_MS
+        {
+            self.started(&pending.uri, notes);
+            return Action::None;
         }
         // A hand-off still in flight: wait for it, or count it failed after the grace period.
         if let Some(pending) = self.pending.clone() {
@@ -542,6 +630,135 @@ mod tests {
         };
         assert_eq!(q.decide(&[], &r, 1, &mut notes), Action::None);
         assert_eq!(q.next_deadline_ms(&r), None);
+    }
+
+    #[test]
+    fn a_second_next_skips_the_item_still_being_handed_over() {
+        let mut q = queue(&[X, Y]);
+        let mut notes = Vec::new();
+        let first = q.claim_next(1_000, &mut notes).map(|i| i.uri);
+        assert_eq!(first.as_deref(), Some(X));
+        // A second `next` before X is seen playing: X counts as played, Y is next.
+        let second = q.claim_next(1_060, &mut notes).map(|i| i.uri);
+        assert_eq!(second.as_deref(), Some(Y));
+        assert_eq!(notes, vec![Note::Skipped(X.into())]);
+        assert_eq!(
+            q.items.iter().map(|i| i.uri.as_str()).collect::<Vec<_>>(),
+            vec![Y]
+        );
+        // A third one has nothing left: the caller falls back to Spotify's own next.
+        assert_eq!(q.claim_next(1_100, &mut notes), None);
+        assert!(q.items.is_empty());
+        assert_eq!(q.pending, None);
+        // X starting late (its play command landed) is ignored; Y starting is not needed.
+        let mut q = queue(&[X]);
+        q.claim_next(1_000, &mut notes);
+        assert_eq!(q.claim_next(1_050, &mut notes), None);
+        assert_eq!(
+            q.decide(&[started(X)], &reading(X, 100), 1_300, &mut notes),
+            Action::None
+        );
+        assert!(q.items.is_empty());
+    }
+
+    #[test]
+    fn a_next_before_the_watcher_sends_its_hand_off_takes_it_over() {
+        // The track nears its end: the watcher decides to hand over to X (not sent yet).
+        let near_end = reading(T, 199_500);
+        let mut q = queue(&[X, Y]);
+        let mut notes = Vec::new();
+        assert_eq!(
+            q.decide(&[], &near_end, 1_000, &mut notes),
+            Action::Play(X.into())
+        );
+        let claim = q.pending.clone().expect("pending");
+        assert!(!claim.sent);
+        // A `spotify next` gets the hand-off lock first: Spotify never saw X, so X is not skipped
+        // but claimed (and sent) by that `next`.
+        let next = q.claim_next(1_300, &mut notes).map(|i| i.uri);
+        assert_eq!(next.as_deref(), Some(X));
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(q.items.len(), 2);
+        // The watcher then finds its claim gone and sends nothing (X is not sent twice).
+        assert!(!q.send_claimed(&claim));
+        assert_eq!(q.pending.as_ref().map(|p| p.since_ms), Some(1_300));
+
+        // Without that `next` the watcher sends it, once.
+        let mut q = queue(&[X, Y]);
+        q.decide(&[], &near_end, 1_000, &mut notes);
+        let claim = q.pending.clone().expect("pending");
+        assert!(q.send_claimed(&claim));
+        assert!(!q.send_claimed(&claim));
+        // A `next` after the send skips X, which Spotify is switching to.
+        let next = q.claim_next(1_300, &mut notes).map(|i| i.uri);
+        assert_eq!(next.as_deref(), Some(Y));
+        assert_eq!(notes, vec![Note::Skipped(X.into())]);
+
+        // An explicit command in between drops the claim: nothing is sent.
+        let mut q = queue(&[X]);
+        q.decide(&[], &near_end, 1_000, &mut notes);
+        let claim = q.pending.clone().expect("pending");
+        q.hold(1_100);
+        assert!(!q.send_claimed(&claim));
+        assert_eq!(q.items.len(), 1);
+    }
+
+    #[test]
+    fn hand_offs_persisted_by_earlier_versions_count_as_sent() {
+        let old: Pending =
+            serde_json::from_str(r#"{"uri":"spotify:track:x","since_ms":5}"#).expect("parse");
+        assert!(old.sent);
+    }
+
+    #[test]
+    fn a_next_after_a_failed_hand_off_retries_the_item() {
+        let mut q = queue(&[X]);
+        let mut notes = Vec::new();
+        q.claim_next(1_000, &mut notes);
+        let again = q.claim_next(1_000 + GRACE_MS + 1, &mut notes);
+        assert_eq!(again.map(|i| i.uri).as_deref(), Some(X));
+        assert_eq!(
+            notes,
+            vec![Note::Failed {
+                uri: X.into(),
+                attempts: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn handing_off_the_playing_item_restarts_it() {
+        // T is playing mid-track and is also queued: `next` restarts it.
+        let mut q = queue(&[T, X]);
+        let mut notes = Vec::new();
+        assert_eq!(
+            q.claim_next(1_000, &mut notes).map(|i| i.uri).as_deref(),
+            Some(T)
+        );
+        // Spotify has not restarted it yet: still pending.
+        assert_eq!(
+            q.decide(&[], &reading(T, 60_120), 1_100, &mut notes),
+            Action::None
+        );
+        assert_eq!(q.items.len(), 2);
+        // Seen again from its start: that is the start, although no new play was reported.
+        assert_eq!(
+            q.decide(&[], &reading(T, 250), 1_300, &mut notes),
+            Action::None
+        );
+        assert_eq!(q.pending, None);
+        assert_eq!(q.managed_now.as_deref(), Some(T));
+        assert_eq!(
+            q.items.iter().map(|i| i.uri.as_str()).collect::<Vec<_>>(),
+            vec![X]
+        );
+        assert!(notes.contains(&Note::Started(T.into())));
+        // Its restart is not Spotify moving on: X is not played over it.
+        assert_eq!(
+            q.decide(&[started(T)], &reading(T, 400), 1_500, &mut notes),
+            Action::None
+        );
+        assert_eq!(q.items.len(), 1);
     }
 
     #[test]

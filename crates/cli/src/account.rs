@@ -325,7 +325,16 @@ pub async fn ting(ctx: &Ctx, action: TingCommand) -> Result<()> {
 pub async fn config(ctx: &Ctx, action: ConfigCommand) -> Result<()> {
     match action {
         ConfigCommand::Set { settings: text } => {
-            let (config, changed) = ctx.home.config()?.apply_json(&text)?;
+            let (config, changed) = match ctx.home.config()?.apply_json(&text) {
+                // `search_limit=5` (one word, so clap took it): show the JSON form it meant.
+                Err(mut error) if error.code == "invalid_input" => {
+                    if let Some(advice) = crate::config_key_value_advice(text.split_whitespace()) {
+                        error.hint = advice;
+                    }
+                    return Err(error);
+                }
+                other => other?,
+            };
             ctx.home.save_config(&config)?;
             let value = json!({"updated": store::describe_changes(&changed, &config), "path": ctx.home.config_path()});
             if changed.iter().any(|k| k == "telemetry") && config.telemetry == Some(false) {
@@ -467,14 +476,7 @@ pub async fn report(ctx: &Ctx, message: &str, pr: Option<&str>, attach: &[PathBu
     }
     let mut attachments = Vec::new();
     for path in attach {
-        let bytes = std::fs::read(path).map_err(|e| {
-            Error::invalid(
-                format!("Cannot read {}: {e}.", path.display()),
-                "Check the path.",
-            )
-        })?;
-        let tail = &bytes[bytes.len().saturating_sub(64 * 1024)..];
-        attachments.push(json!({"name": path.file_name().map(|n| n.to_string_lossy().into_owned()), "content": String::from_utf8_lossy(tail), "truncated": bytes.len() > 64 * 1024}));
+        attachments.push(attachment(ctx, path)?);
     }
     let daemon_version = silicon_spotify_client::ipc::socket_path()
         .ok()
@@ -527,6 +529,98 @@ pub async fn report(ctx: &Ctx, message: &str, pr: Option<&str>, attach: &[PathBu
             Ok(())
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Most of a file `spotify report --attach` sends: its end, where the latest log lines are.
+const ATTACHMENT_MAX: usize = 64 * 1024;
+
+/// One `--attach` file, checked before anything is sent: a text file (UTF-8, no NUL bytes) that
+/// is not one of this home's credential files. Longer files keep their last 64 KiB.
+fn attachment(ctx: &Ctx, path: &Path) -> Result<Value> {
+    let unreadable = |e: std::io::Error| {
+        Error::invalid(
+            format!("Cannot read {}: {e}.", path.display()),
+            "Check the path.",
+        )
+    };
+    let canonical = std::fs::canonicalize(path).map_err(unreadable)?;
+    // This home's session and testing files, and those of any other home (`<home>/.spotify/`).
+    let secret = [ctx.home.session_path(), ctx.home.testing_path()]
+        .iter()
+        .any(|p| std::fs::canonicalize(p).is_ok_and(|p| p == canonical))
+        || [path, canonical.as_path()].iter().any(|p| {
+            p.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new(".spotify"))
+                && p.file_name()
+                    .is_some_and(|name| name == "session.json" || name == "testing.json")
+        });
+    if secret {
+        return Err(Error::invalid(
+            format!(
+                "{} holds spotify-cli credentials and is never attached.",
+                path.display()
+            ),
+            "Attach logs or command output instead; reports never need tokens.",
+        ));
+    }
+    if !canonical.is_file() {
+        return Err(Error::invalid(
+            format!("{} is not a file.", path.display()),
+            "Attach a text file, such as ~/.silicon-spotify/daemon.log or saved command output.",
+        ));
+    }
+    let (head, tail, size) = file_ends(&canonical).map_err(unreadable)?;
+    let cut = size > ATTACHMENT_MAX as u64;
+    let content = attachment_text(&head, &tail, cut).ok_or_else(|| {
+        Error::invalid(
+            format!("{} is not a text file.", path.display()),
+            "Attach text (logs, command output as UTF-8); describe binary files in the message instead.",
+        )
+        .with_details(json!({"path": path, "bytes": size}))
+    })?;
+    Ok(json!({
+        "name": path.file_name().map(|n| n.to_string_lossy().into_owned()),
+        "content": content,
+        "truncated": cut,
+    }))
+}
+
+/// A file's first 8 KiB, its last [`ATTACHMENT_MAX`] bytes and its size, without reading the rest.
+fn file_ends(path: &Path) -> std::io::Result<(Vec<u8>, Vec<u8>, u64)> {
+    use std::io::{Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut head = Vec::new();
+    file.by_ref().take(8 * 1024).read_to_end(&mut head)?;
+    file.seek(SeekFrom::Start(size.saturating_sub(ATTACHMENT_MAX as u64)))?;
+    let mut tail = Vec::new();
+    file.take(ATTACHMENT_MAX as u64).read_to_end(&mut tail)?;
+    Ok((head, tail, size))
+}
+
+/// The text of a file's end, starting at a whole character when the limit `cut` one; `None` for
+/// binary content (a NUL byte at its start or end, or invalid UTF-8).
+fn attachment_text<'a>(head: &[u8], tail: &'a [u8], cut: bool) -> Option<&'a str> {
+    if head.contains(&0) || tail.contains(&0) {
+        return None;
+    }
+    // Skip the continuation bytes (at most 3) of a character cut by the limit.
+    let start = if cut {
+        tail.iter()
+            .take(3)
+            .take_while(|b| *b & 0xC0 == 0x80)
+            .count()
+    } else {
+        0
+    };
+    let text = &tail[start..];
+    match std::str::from_utf8(text) {
+        Ok(text) => Some(text),
+        // Only the last character is incomplete (a log being written as it is read): drop it.
+        Err(error) if error.error_len().is_none() && text.len() - error.valid_up_to() < 4 => {
+            std::str::from_utf8(&text[..error.valid_up_to()]).ok()
+        }
+        Err(_) => None,
     }
 }
 
@@ -630,6 +724,12 @@ pub async fn doctor(ctx: &Ctx) -> Result<()> {
                 "✗"
             };
             out.push_str(&format!("{mark} {}", c["check"].as_str().unwrap_or("")));
+            if c["check"] == json!("spotify_player_warm_instance") && c["ok"] != Value::Bool(true) {
+                out.push_str(&format!(
+                    "\n    state: {}",
+                    warm_check_state(&c["detail"]).replace('\n', "\n    ")
+                ));
+            }
             if let Some(fix) = c.get("fix").and_then(Value::as_str) {
                 out.push_str(&format!("\n    fix: {fix}"));
             }
@@ -646,6 +746,23 @@ pub async fn doctor(ctx: &Ctx) -> Result<()> {
         return Err(Error::new("doctor_failed", "One or more required checks failed.", "Run the listed fixes, or `spotify setup`.").with_details(json!({"failed": value["checks"].as_array().map(|c| c.iter().filter(|x| x["ok"] == Value::Bool(false) && x.get("optional") != Some(&Value::Bool(true))).map(|x| x["check"].clone()).collect::<Vec<_>>())})));
     }
     Ok(())
+}
+
+/// The failing `spotify_player_warm_instance` check's detail (the daemon's warm state) in words,
+/// plus who holds the client port now when that is not the daemon's copy.
+fn warm_check_state(detail: &Value) -> String {
+    let mut state = crate::render::warm_player(detail);
+    // The daemon runs a copy, but another process answers spotify_player commands.
+    let own = detail.get("pid").and_then(Value::as_u64);
+    if let Some(owner) = detail
+        .get("port_owner_pid_now")
+        .and_then(Value::as_u64)
+        .filter(|owner| own.is_some_and(|own| own != *owner))
+    {
+        let at = state.find('\n').unwrap_or(state.len());
+        state.insert_str(at, &format!("; the port is held by pid {owner} now"));
+    }
+    state
 }
 
 /// `cli_version_supported` from the backend's `GET /api/v1/version`: fails when this CLI is older
@@ -865,6 +982,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn doctor_says_who_holds_the_warm_port() {
+        let detail = json!({"state": "running", "pid": 812, "port": 8080, "refresh_ms": 3000,
+            "serves_cli": true, "port_owner_pid_now": 999});
+        assert_eq!(
+            warm_check_state(&detail),
+            "running (pid 812, 127.0.0.1:8080, playback refresh every 3 s, serves spotify-cli); the port is held by pid 999 now"
+        );
+        // Before the note line, which stays on its own line.
+        let detail = json!({"state": "running", "pid": 812, "port": 8080, "serves_cli": null,
+            "note": "lsof could not confirm that this copy holds the client port.", "port_owner_pid_now": 7});
+        assert!(
+            warm_check_state(&detail).starts_with(
+                "running (pid 812, 127.0.0.1:8080); the port is held by pid 7 now\n    lsof"
+            ),
+            "{}",
+            warm_check_state(&detail)
+        );
+        // Its own copy, or no copy of its own (deferred): nothing to add.
+        let detail =
+            json!({"state": "starting", "pid": 812, "port": 8080, "port_owner_pid_now": 812});
+        assert!(!warm_check_state(&detail).contains("held by pid"));
+        let detail = json!({"state": "deferred", "port": 8080, "port_owner": {"pid": 5, "kind": "your_spotify_player"},
+            "port_owner_pid_now": 5});
+        assert!(
+            !warm_check_state(&detail).contains("now"),
+            "{}",
+            warm_check_state(&detail)
+        );
+    }
+
+    #[test]
     fn doctor_flags_a_cli_older_than_min_cli() {
         let version = json!({"version": "0.2.0", "api_versions": ["v1"], "min_cli": "0.1.0"});
         let check = cli_version_check(&version, "0.1.1").expect("check");
@@ -882,5 +1030,34 @@ mod tests {
         // An older backend without min_cli (or an unreachable one) adds no check.
         assert!(cli_version_check(&json!({"error": {"code": "not_found"}}), "0.1.1").is_none());
         assert!(cli_version_check(&json!({"min_cli": "soon"}), "0.1.1").is_none());
+    }
+
+    #[test]
+    fn attachments_are_text_only() {
+        assert_eq!(
+            attachment_text(b"line 1\nline 2\n", b"line 1\nline 2\n", false),
+            Some("line 1\nline 2\n")
+        );
+        // Binary: a NUL byte at the start (Mach-O, sqlite) or the end, or invalid UTF-8.
+        assert_eq!(
+            attachment_text(b"\xcf\xfa\xed\xfe\0\0", b"text", true),
+            None
+        );
+        assert_eq!(attachment_text(b"text", b"te\0xt", true), None);
+        assert_eq!(attachment_text(b"\xff\xfe", b"\xff\xfe", false), None);
+        // A character cut by the 64 KiB limit is dropped, not turned into U+FFFD or a refusal.
+        let tail = "é log line".as_bytes();
+        assert_eq!(
+            attachment_text(b"head", &tail[1..], true),
+            Some(" log line")
+        );
+        assert_eq!(attachment_text(b"head", &tail[1..], false), None);
+        // A last character still being written is dropped too; invalid bytes are not.
+        let text = "log line é".as_bytes();
+        assert_eq!(
+            attachment_text(b"log", &text[..text.len() - 1], false),
+            Some("log line ")
+        );
+        assert_eq!(attachment_text(b"log", b"log \xe9 line", false), None);
     }
 }

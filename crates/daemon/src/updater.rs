@@ -16,7 +16,7 @@ use silicon_spotify_client::model::now_rfc3339;
 use silicon_spotify_client::{Error, REPOSITORY, Result, VERSION};
 
 use crate::log;
-use crate::service::Daemon;
+use crate::service::{Daemon, Settings};
 
 fn set(daemon: &Daemon, value: Value) {
     *daemon
@@ -51,8 +51,8 @@ pub async fn run(daemon: Arc<Daemon>) {
         () = daemon.shutdown.notified() => return,
     }
     loop {
-        let apply = daemon.settings().auto_update.unwrap_or(true);
-        match check(&daemon, apply).await {
+        let auto_update = daemon.settings().auto_update.unwrap_or(true);
+        match check(&daemon, auto_update, auto_update).await {
             Ok(status) => {
                 if status.get("restarting").and_then(Value::as_bool) == Some(true) {
                     log!("updated to {}; restarting", status["latest"]);
@@ -68,13 +68,24 @@ pub async fn run(daemon: Arc<Daemon>) {
     }
 }
 
-/// Checks now; installs when `apply` and this is a script install.
+/// The `auto_update` setting: the caller's, else the one the daemon last saw, else on.
+#[must_use]
+pub fn auto_update(caller: &Settings, remembered: &Settings) -> bool {
+    caller
+        .auto_update
+        .or(remembered.auto_update)
+        .unwrap_or(true)
+}
+
+/// Checks now; installs when `apply` and this is a script install. `auto_update` is the user's
+/// setting, reported as is (a manual `spotify update --check` does not install, but that does
+/// not turn automatic updates off).
 ///
 /// # Errors
 /// Network or verification failures.
-pub async fn check(daemon: &Daemon, apply: bool) -> Result<Value> {
+pub async fn check(daemon: &Daemon, apply: bool, auto_update: bool) -> Result<Value> {
     let (method, exe) = install_method();
-    let base = json!({"current": VERSION, "method": method, "checked_at": now_rfc3339(), "auto_update": apply});
+    let base = json!({"current": VERSION, "method": method, "checked_at": now_rfc3339(), "auto_update": auto_update});
     if method == "honeycomb" {
         let status = json!({"current": VERSION, "method": method, "checked_at": now_rfc3339(), "manager": "honeycomb",
             "note": "Honeycomb's shared worker installs updates for Honeycomb installs; run `honeycomb update spotify` to update now."});
@@ -262,4 +273,30 @@ async fn install(version: &str, bin_dir: &Path) -> Result<()> {
     }
     let _ = std::fs::remove_dir_all(&staging);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_manual_check_reports_the_setting_not_whether_it_installs() {
+        let unset = Settings::default();
+        let on = Settings {
+            auto_update: Some(true),
+            ..Settings::default()
+        };
+        let off = Settings {
+            auto_update: Some(false),
+            ..Settings::default()
+        };
+        // `spotify update --check` from a CLI whose config says auto_update true (or nothing).
+        assert!(auto_update(&on, &unset));
+        assert!(auto_update(&unset, &unset));
+        // The caller's own setting wins over what the daemon saw last.
+        assert!(!auto_update(&off, &on));
+        assert!(auto_update(&on, &off));
+        // Callers that send no settings get the daemon's.
+        assert!(!auto_update(&unset, &off));
+    }
 }

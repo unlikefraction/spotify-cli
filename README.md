@@ -17,8 +17,9 @@ Installer options, where state lives and how to uninstall:
 - **Every control:** play (URIs, links, search, Liked Songs, radio), pause, next/previous, seek,
   volume, shuffle, repeat, like, track details, lyrics, search, library, devices, playlists
   (create/delete/add/remove/import/fork/sync), podcasts, and a managed queue you can reorder.
-- **Verified, not assumed:** spotify_player first, checked against Spotify.app, AppleScript
-  fallback; every result says which path worked and why.
+- **Verified, not assumed:** spotify_player first with AppleScript as the fallback (AppleScript
+  first for seeks, and alone for starting a track, episode, show or Liked Songs), every effect
+  checked against Spotify.app; every result says which path worked and why.
 - **Triggers:** `--remaining 30s` or `25%`, `--elapsed 50%` or `1:30`, `--end`, `--change`, for
   the current song, every song or one track; durable, retried, idempotent Ting delivery with your
   note and ISI.

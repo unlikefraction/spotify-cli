@@ -56,9 +56,13 @@ spotify podcast search 'tim ferriss'
 spotify podcast play spotify:episode:<id>
 ```
 
-Every command prints human text by default and exactly one JSON value with `--json`. Every
-playback result says which path worked (`via: spotify_player` or `via: applescript`) and, when the
-first path failed, why (`fallback.reason`). See `spotify docs playback`.
+Every command prints human text by default and exactly one JSON value with `--json`. Human text
+keeps each Spotify name on one line (line breaks and tabs inside names become spaces); `--json`
+keeps the names as Spotify sends them. Every playback result says which path worked
+(`via: spotify_player` or `via: applescript`) and, when the first path failed, why
+(`fallback.reason`). Seeks, and starting a single track, episode, show or Liked Songs, go to
+AppleScript first; `previous` restarts the item from 3 s in (`result: restarted`). See
+`spotify docs playback`.
 
 **Spotify references.** Anything that takes an item accepts `spotify:<kind>:<id>`, a link
 `https://open.spotify.com/<kind>/<id>`, or a bare id (add `--type` where the kind is not implied).
@@ -69,11 +73,25 @@ tracks and albums; episodes are `unsupported` (edit those in the Spotify app).
 
 **Search, details and library.** `spotify search --limit` takes 1 to 10 results per kind
 (default: the `search_limit` setting, else 10), because spotify_player returns at most 10;
-`spotify podcast search --limit` too (default 10). `spotify track <album>` shows the release
-date, track count, length and track list; `spotify track <artist>` its top tracks, albums,
-singles and related artists (`--json` adds `kind`, `item` and those lists next to `raw`).
+`spotify podcast search --limit` too (default 10). The search footer suggests what fits the
+results: `queue it: spotify queue add <uri>` for tracks and episodes,
+`look inside: spotify track <uri>` for albums, artists and playlists.
+
+`spotify track` describes the song playing now (for a podcast episode: `show:` instead of
+`album:`). For a song, now or by `spotify:track:` URI, it adds `liked: yes|no`: whether the song is
+in Liked Songs (`liked` in `--json`, left out when that check fails or takes over 2.5 s).
+`spotify track <album>` shows the release date, track count, length and track list;
+`spotify track <artist>` its top tracks, albums, singles and related artists;
+`spotify track <playlist>` what `spotify playlist show` shows. With a URI, `--json` has one shape
+for every kind: `kind`, `item`, the per-kind fields and `raw` (for a playlist: `playlist`,
+`owner`, `collaborative`, `track_count`, `duration_ms`, `duration`, `tracks`). A bare id is looked
+up as a track unless `--type album|artist|playlist` says otherwise; podcast shows and episodes
+cannot be looked up by id (`--type show` is a usage error).
+
 `spotify library <section>` and `spotify playlist list` show everything unless `--limit N`
-(1 or more) says otherwise.
+(1 or more) says otherwise. Library and playlist reads are repeated once after a network blip,
+and a read right after a playlist change or like/unlike waits until it can see the change
+(`spotify docs daemon`).
 
 **Playlists.** `spotify playlist create 'Focus' --json` returns the new playlist's bare `id` and
 its `uri`. `spotify playlist fork <playlist>` copies a playlist into a new one you own and returns
@@ -133,7 +151,13 @@ https://github.com/unlikefraction/spotify-cli, and report it:
 
 ```sh
 spotify report 'what I ran, what happened, what I expected' --pr https://github.com/unlikefraction/spotify-cli/pull/<n>
+spotify report 'daemon crash' --attach ~/.silicon-spotify/daemon.log
 ```
+
+`--attach` takes text files only, at most 5. A binary file (a NUL byte in its first 8 KiB or last
+64 KiB, or text that is not UTF-8), a directory, and any home's `.spotify/session.json` or
+`.spotify/testing.json` are refused with `invalid_input` (exit 2) before anything is sent. Of a
+longer file only its last 64 KiB are read and sent, starting at a whole character.
 
 ## Install options
 

@@ -83,6 +83,14 @@ A Carbon clicks **Agree** once; spotify_player caches and refreshes the tokens. 
 with `spotify_auth_required`, run it again. Bring your own Spotify client id: see
 `spotify docs config`.
 
+spotify-cli also reads two things from that cache. The Spotify user id in `credentials.json` names
+your Liked Songs list, so `spotify play --liked` can play it through AppleScript. The cached
+access tokens serve two read-only Web API lookups spotify_player has no command for: whether a
+song is in Liked Songs (`liked` in `spotify track`) and an episode's name, show and length
+(`spotify queue add`). Those requests go only to `https://api.spotify.com` (HTTPS, no
+redirects); tokens are never logged or stored anywhere else, and after a 429 no lookup is sent
+until Spotify's `Retry-After` has passed (30 s when it gives none, at most 10 minutes).
+
 ## Testing planes
 
 IAM testing environments are isolated planes that use the same code paths as production. Select

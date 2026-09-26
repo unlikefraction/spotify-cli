@@ -81,35 +81,16 @@ fn fail(error: &Error) -> ! {
     std::process::exit(error.exit_code().max(1));
 }
 
-/// Stops background work, kills the warm spotify_player, removes the socket and exits.
+/// Stops background work, stops the warm spotify_player, removes the socket and exits.
 #[cfg(target_os = "macos")]
 pub fn shutdown(daemon: &Daemon, code: i32) -> ! {
     daemon.shutdown.notify_waiters();
-    if let Some(pid) = daemon
-        .warm
-        .lock()
-        .ok()
-        .and_then(|w| w.get("pid").and_then(serde_json::Value::as_u64))
-    {
-        kill_group(pid);
-    }
+    warm::stop(daemon);
     if let Ok(path) = ipc::socket_path() {
         let _ = std::fs::remove_file(path);
     }
     log!("stopped");
     std::process::exit(code);
-}
-
-#[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-fn kill_group(pid: u64) {
-    if let Ok(pid) = libc::pid_t::try_from(pid) {
-        // SAFETY: plain syscalls on a pid we spawned; failures are ignored.
-        unsafe {
-            libc::killpg(pid, libc::SIGTERM);
-            libc::kill(pid, libc::SIGTERM);
-        }
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -202,11 +183,14 @@ fn main() {
         started: Instant::now(),
         live: Mutex::new(live),
         observe_lock: Mutex::new(()),
+        hand_off: Mutex::new(()),
+        library: Mutex::default(),
         nudge: tokio::sync::Notify::new(),
         deliver: tokio::sync::Notify::new(),
         events,
         settings: Mutex::new(settings),
         warm: Mutex::new(json!({"state": "starting"})),
+        warm_pid: std::sync::atomic::AtomicU32::new(0),
         update: Mutex::new(json!({"state": "not_checked_yet"})),
         shutdown: tokio::sync::Notify::new(),
     });

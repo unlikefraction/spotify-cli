@@ -5,6 +5,9 @@ object; `null` resets a key to its default. Unknown keys, duplicate keys, wrong 
 out-of-range values are rejected (`invalid_input`) before anything changes, and the error names the
 key and what it accepts, e.g. `verify_timeout_ms must be an integer from 200 to 15000, not "fast".`
 Only the keys you set are checked, so a stale value of another key never blocks a change.
+`config set` takes one JSON object, quoted for the shell: `key=value` or `key value` words are
+refused (exit 2) with the JSON form they meant as the hint, e.g.
+`spotify config set search_limit=5` suggests `spotify config set '{"search_limit": 5}'`.
 
 ```sh
 spotify config set '{"telemetry": false}'
@@ -27,7 +30,7 @@ Stemcell applies `silicon.app_configs.spotify` with exactly this command
 | `org` | org handle | `SILICON_ORG`, then the session's | Organization for Ting delivery. |
 | `strategy` | `auto` \| `spotify_player` \| `applescript` | `auto` | Playback path (`spotify docs playback`). |
 | `launch_spotify` | bool | `true` | Launch Spotify.app hidden when a control command finds it closed. |
-| `verify_timeout_ms` | 200–15000 | `2500` | How long to wait for spotify_player's effect before falling back. |
+| `verify_timeout_ms` | 200–15000 | `2500` | How long to wait for spotify_player's effect before falling back (`play`, `pause`, `toggle`, `volume` and `shuffle` wait at most 1.5 s); `like` waits up to this plus 1.1 s for spotify_player to catch up (`spotify docs playback`). |
 | `spotify_player_binary` | absolute path | auto-detect | spotify_player executable. |
 | `spotify_player_config_dir` | absolute path | `~/.config/spotify-player` | spotify_player `-c`. |
 | `spotify_player_cache_dir` | absolute path | `~/.cache/spotify-player` | spotify_player `-C` (its Spotify tokens). |
@@ -56,6 +59,6 @@ Stemcell applies `silicon.app_configs.spotify` with exactly this command
 | `SPOTIFY_TEST_APP_SECRET` | Select a testing plane for this process. |
 | `SPOTIFY_TELEMETRY`, `SPACE_STATION_TELEMETRY`, `SILICON_TELEMETRY` | `0`, `false`, `off` or `no` (any case) disables telemetry. |
 | `SPOTIFY_DAEMON_HOME` | Daemon state directory (else `~/.silicon-spotify`). |
-| `SPOTIFY_WARM_PLAYER=off` | Do not run the warm spotify_player instance. |
+| `SPOTIFY_WARM_PLAYER=off` | Do not run the warm spotify_player instance (for the daemon; copies left by earlier daemons are still stopped). |
 | `SPOTIFY_DAEMON_AUTOSTART=0` | Never start the daemon on demand (commands that need it fail with `daemon_unavailable`). |
 | `SPOTIFY_DEBUG=1` | Print full error details in human mode. |

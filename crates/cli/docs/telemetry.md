@@ -28,14 +28,17 @@ a per-command trace id, and `ISI` when set.
 **Never recorded:** track, album or artist names, lyrics, search queries, trigger notes, playlist
 names, URIs you play, tokens, SLTs, file contents.
 
-The website records only a `page_view` event per page (the page path, the referrer's host and the
-window size) and an `install_command_copied` event when you copy the install command. It sets no
-cookies and needs JavaScript to send anything.
+The website records only a `page_view` event per page and an `install_command_copied` event when
+you copy the install command. Each carries the page path, the referrer's host (not its full
+address) and the window size, and nothing else. The site sends them straight to the backend's
+gateway, sets no cookies, and needs JavaScript to send anything.
 
 ## Where it goes
 
-The CLI hands events to the daemon, which relays them in batches to the backend's gateway (it
-accepts at most 40 events and 64 KiB per batch); only the backend holds Space Station keys.
+The CLI hands events to the daemon, which keeps up to 2 000 of them and relays them to the
+backend's gateway every minute. Each wake drains the whole backlog, in requests of at most 40
+events and 64 KiB (what the gateway accepts); when the backend cannot be reached, the rest waits
+for the next minute. Only the backend holds Space Station keys.
 Tables (org `unlikefraction`):
 
 | Table | Written by |

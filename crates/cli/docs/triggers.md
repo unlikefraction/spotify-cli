@@ -91,13 +91,18 @@ one item of `request.tings`:
     "track": {"uri": "spotify:track:…", "name": "…", "artist": "…", "album": "…",
               "duration_ms": 253586, "url": "https://open.spotify.com/track/…", "artwork_url": "…"},
     "playback": {"position_ms": 126900, "position": "2:06", "remaining_ms": 126686,
-                 "remaining": "2:06", "progress": 0.5},
+                 "remaining": "2:07", "progress": 0.5},
     "reason": null,
     "at": "2026-09-26T10:00:00.000Z"
   },
   "metadata": {"isi": "planner", "app": "spotify", "app_version": "0.1.0", "host": "studio-mac"}
 }
 ```
+
+`playback.position` and `playback.remaining` are the same moments as `position_ms` and
+`remaining_ms`, written as `m:ss`. `remaining` is rounded to the nearest second, so a
+`--remaining 20s` trigger that fired with 19 782 ms left reads `0:20`; `position` is rounded down,
+like a player's clock.
 
 `metadata.isi` is the `ISI` environment variable of the process that created the trigger (or the
 `notify_isi` setting). It is a routing hint for your flow, never authority. Routing example:

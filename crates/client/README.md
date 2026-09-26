@@ -5,7 +5,7 @@ desktop app on macOS through `spotify_player` and AppleScript (with verification
 Spotify ids and times, run the playback-trigger engine, and call the spotify-cli backend.
 
 ```toml
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.2" }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.3" }
 ```
 
 ```rust
@@ -22,5 +22,9 @@ let controller = Controller {
 };
 let now = controller.status()?;
 ```
+
+Try it against the real Spotify.app without the daemon:
+`cargo run -p silicon-spotify-client --example control -- status` (also `play`, `seek 1:30`,
+`previous`, `repeat track`, `like`, …).
 
 Docs: https://spotify.unlikefraction.com/docs · Source: https://github.com/unlikefraction/spotify-cli

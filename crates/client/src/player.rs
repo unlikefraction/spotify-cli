@@ -123,12 +123,20 @@ impl SpotifyPlayer {
     }
 
     fn command(&self, args: &[&str]) -> Command {
+        self.command_with(&[], args)
+    }
+
+    /// `spotify_player [-c …] [-C …] [-o <override>…] <args>`.
+    fn command_with(&self, overrides: &[String], args: &[&str]) -> Command {
         let mut command = Command::new(&self.binary);
         if let Some(dir) = &self.config_dir {
             command.arg("-c").arg(dir);
         }
         if let Some(dir) = &self.cache_dir {
             command.arg("-C").arg(dir);
+        }
+        for value in overrides {
+            command.arg("-o").arg(value);
         }
         command.args(args);
         command
@@ -162,6 +170,43 @@ impl SpotifyPlayer {
     pub fn json(&self, args: &[&str]) -> Result<Value> {
         let output = self.run(args)?;
         parse_json(&output.stdout, args)
+    }
+
+    /// Runs `args` in a one-shot spotify_player client instead of the running instance, and
+    /// parses stdout as JSON.
+    ///
+    /// The running instance answers `get key playback` from its memory, which only refreshes
+    /// after commands it ran itself; a one-shot client asks the Spotify Web API. It signs in
+    /// first (about 1–2 s, longer when the Web API is rate limiting), so use it only when the
+    /// instance's answer is known to be out of date. It listens on a free port for its one
+    /// request, so it never competes with the running instance for `client_port`.
+    ///
+    /// # Errors
+    /// Classified failures, `timeout` after `timeout`, or `spotify_player_failed`.
+    pub fn fresh_json(&self, args: &[&str], timeout: Duration) -> Result<Value> {
+        self.require_auth()?;
+        let port = std::net::UdpSocket::bind(("127.0.0.1", 0))
+            .and_then(|socket| socket.local_addr())
+            .map(|address| address.port())
+            .map_err(|error| Error::internal(format!("no free local UDP port: {error}")))?;
+        let command = self.command_with(&[format!("client_port={port}")], args);
+        let output = run_with_timeout(command, timeout, args)?;
+        parse_json(&output.stdout, args)
+    }
+
+    /// The Spotify user id spotify_player is signed in as: the `username` that librespot keeps
+    /// in `credentials.json` in the cache folder. Only that field is read. `None` when there is
+    /// no such file or the value is not a plain user id.
+    #[must_use]
+    pub fn username(&self) -> Option<String> {
+        let text = std::fs::read_to_string(self.cache_folder()?.join("credentials.json")).ok()?;
+        let value: Value = serde_json::from_str(&text).ok()?;
+        let name = value.get("username")?.as_str()?;
+        let plain = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        plain.then(|| name.to_owned())
     }
 
     /// `spotify_player --version`, without requiring auth.
@@ -472,6 +517,135 @@ fn escape_controls_in_strings(text: &str) -> Cow<'_, str> {
     String::from_utf8(out).map_or(Cow::Borrowed(text), Cow::Owned)
 }
 
+/// Where the spotify_player logs in the cache folder end, taken before sending a playback
+/// command so [`logged_failure`] can find what the running instance did with it.
+///
+/// With a running instance, `spotify_player playback …` exits 0 once the request is queued; the
+/// Web API call happens afterwards and a refusal (403, 429) shows up only in the instance's log
+/// (`spotify-player-<date>.log`). Reading that log turns a refusal into an immediate answer
+/// instead of a wait for an effect that will not come.
+#[derive(Clone, Debug, Default)]
+pub struct LogCursor {
+    dir: Option<PathBuf>,
+    ends: Vec<(PathBuf, u64)>,
+}
+
+impl SpotifyPlayer {
+    /// The current end of every spotify_player log in the cache folder.
+    #[must_use]
+    pub fn log_cursor(&self) -> LogCursor {
+        let dir = self.cache_folder();
+        let ends = dir
+            .as_deref()
+            .map(|dir| {
+                logs_in(dir)
+                    .into_iter()
+                    .map(|(path, meta)| (path, meta.len()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        LogCursor { dir, ends }
+    }
+}
+
+/// `spotify-player-*.log` files in `dir` with their metadata.
+fn logs_in(dir: &Path) -> Vec<(PathBuf, std::fs::Metadata)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("spotify-player-") && name.ends_with(".log")
+        })
+        .filter_map(|entry| Some((entry.path(), entry.metadata().ok()?)))
+        .collect()
+}
+
+/// The failure the running instance logged for the playback command it received after `cursor`
+/// as `request` (the name it logs, e.g. `Next`, `Volume`, `StartLikedTracks`), if any.
+///
+/// Only a failure that follows that request with no other playback request in between counts,
+/// so a concurrent command's failure is never taken for this one's.
+#[must_use]
+pub fn logged_failure(cursor: &LogCursor, request: &str) -> Option<Error> {
+    const FAILED: &str = "Failed to handle a player request for playback CLI command: ";
+    let marker = format!("request=Playback({request}");
+    let dir = cursor.dir.as_deref()?;
+    for (path, meta) in logs_in(dir) {
+        // Only what was written after the cursor: the rest of a known log, or a new log.
+        let end = match cursor.ends.iter().find(|(known, _)| *known == path) {
+            Some((_, end)) if meta.len() > *end => *end,
+            Some(_) => continue,
+            None => 0,
+        };
+        let Some(text) = read_from(&path, end) else {
+            continue;
+        };
+        let mut ours = false;
+        for line in text.lines() {
+            if line.contains("request=Playback(") {
+                // `Play` must not match `PlayPause`: the name ends at `)`, ` {` or `(`.
+                ours = line.find(&marker).is_some_and(|index| {
+                    matches!(
+                        line[index + marker.len()..].chars().next(),
+                        Some(')' | ' ' | '(')
+                    )
+                });
+            }
+            // Checked on the same line too, in case the failure is logged inside the request's
+            // span.
+            if ours && let Some(index) = line.find(FAILED) {
+                let cause = line[index + FAILED.len()..].trim();
+                let lower = cause.to_ascii_lowercase();
+                let error = if lower.contains("429") || lower.contains("too many requests") {
+                    Error::new(
+                        "rate_limited",
+                        "The Spotify Web API is rate limiting this account, so spotify_player's command was refused.",
+                        "Wait a minute and retry.",
+                    )
+                    .retryable()
+                } else if lower.contains("no playback found")
+                    || lower.contains("no active playback")
+                {
+                    Error::new(
+                        "no_active_device",
+                        "spotify_player has no active playback to send the command to.",
+                        "Play something in Spotify.app first, or pick a device with `spotify devices connect <name>`.",
+                    )
+                } else {
+                    Error::new(
+                        "no_effect",
+                        format!("The Spotify Web API refused spotify_player's command: {cause}."),
+                        "Spotify does not allow it for this item right now (for example previous on a first track), or spotify_player's view of the player is out of date.",
+                    )
+                };
+                return Some(error.with_details(serde_json::json!({
+                    "request": request,
+                    "spotify_player": crate::model::truncate(cause, 300),
+                })));
+            }
+        }
+    }
+    None
+}
+
+/// The UTF-8 text of `path` after byte `offset` (a new log file is read from the start).
+fn read_from(path: &Path, offset: u64) -> Option<String> {
+    use std::io::Seek as _;
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len <= offset {
+        return None;
+    }
+    file.seek(std::io::SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(len - offset).read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn find_on_path(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
@@ -540,6 +714,95 @@ mod tests {
             "{\n\t\"a\": \"b\\n\"\n}"
         );
         assert_eq!(parse_json("  ", &["x"]).expect("empty"), Value::Null);
+    }
+
+    #[test]
+    fn reads_only_a_plain_username_from_credentials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let player = SpotifyPlayer {
+            binary: PathBuf::from("/nonexistent/spotify_player"),
+            config_dir: None,
+            cache_dir: Some(dir.path().to_path_buf()),
+            timeout: Duration::from_secs(1),
+        };
+        assert_eq!(player.username(), None, "no credentials.json");
+        let write = |text: &str| {
+            std::fs::write(dir.path().join("credentials.json"), text).expect("write");
+        };
+        write(
+            r#"{"username":"31ujnsmbxgyrzb4bpbz34j7lejua","auth_type":1,"auth_data":"c2VjcmV0"}"#,
+        );
+        assert_eq!(
+            player.username().as_deref(),
+            Some("31ujnsmbxgyrzb4bpbz34j7lejua")
+        );
+        write(r#"{"username":"a\" & quit & \"","auth_type":1}"#);
+        assert_eq!(
+            player.username(),
+            None,
+            "never a value to paste into a script"
+        );
+        write("not json");
+        assert_eq!(player.username(), None);
+    }
+
+    #[test]
+    fn finds_the_refusal_logged_for_this_command_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let player = SpotifyPlayer {
+            binary: PathBuf::from("/nonexistent/spotify_player"),
+            config_dir: None,
+            cache_dir: Some(dir.path().to_path_buf()),
+            timeout: Duration::from_secs(1),
+        };
+        let log = dir.path().join("spotify-player-26-09-26-16-29.log");
+        std::fs::write(&log, "2026-09-26T11:18:00Z  WARN spotify_player::cli::client: Failed to handle a player request for playback CLI command: http error: status code 403 Forbidden\n").expect("old");
+        let cursor = player.log_cursor();
+        assert!(
+            logged_failure(&cursor, "Next").is_none(),
+            "earlier lines do not count"
+        );
+        // spotify_player 0.25.1's lines for a rate-limited `playback next`.
+        let append = |text: &str| {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log)
+                .expect("open");
+            file.write_all(text.as_bytes()).expect("append");
+        };
+        append(
+            "2026-09-26T11:18:08.959001Z  INFO socket_request{request=Playback(Next) dest_addr=127.0.0.1:50044}: spotify_player::cli::client: Successfully handled the socket request.\n2026-09-26T11:18:08.959234Z  INFO spotify_player::client::middleware: Making a Spotify Web API request method=POST url=https://api.spotify.com/v1/me/player/next\n",
+        );
+        assert!(logged_failure(&cursor, "Next").is_none(), "no outcome yet");
+        append(
+            "2026-09-26T11:18:09.107489Z  WARN spotify_player::cli::client: Failed to handle a player request for playback CLI command: http error: status code 429 Too Many Requests\n",
+        );
+        let error = logged_failure(&cursor, "Next").expect("refusal");
+        assert_eq!(error.code, "rate_limited");
+        assert!(
+            logged_failure(&cursor, "Previous").is_none(),
+            "another command's"
+        );
+        // A different playback request in between makes the failure someone else's.
+        let cursor = player.log_cursor();
+        append(
+            "x INFO socket_request{request=Playback(Pause) dest}: handled\nx INFO socket_request{request=Playback(Volume { percent: 50, is_offset: false }) dest}: handled\nx WARN spotify_player::cli::client: Failed to handle a player request for playback CLI command: http error: status code 403 Forbidden\n",
+        );
+        assert!(logged_failure(&cursor, "Pause").is_none());
+        assert_eq!(
+            logged_failure(&cursor, "Volume").map(|e| e.code),
+            Some("no_effect".to_owned())
+        );
+        let cursor = player.log_cursor();
+        append(
+            "x INFO socket_request{request=Playback(PlayPause) dest}: handled\nx WARN spotify_player::cli::client: Failed to handle a player request for playback CLI command: http error: status code 403 Forbidden\n",
+        );
+        assert!(
+            logged_failure(&cursor, "Play").is_none(),
+            "not a prefix match"
+        );
+        assert!(logged_failure(&cursor, "PlayPause").is_some());
     }
 
     #[test]

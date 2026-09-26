@@ -21,9 +21,9 @@ deploy/         backend deployment (systemd, Caddy, CloudFormation), Honeycomb a
 ## Use the library
 
 ```toml
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.2" }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.3" }
 # no HTTP at all:
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.2", default-features = false }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.3", default-features = false }
 ```
 
 ```rust
@@ -40,8 +40,26 @@ let spotify = Controller {
     launch_spotify: false,
 };
 let now = spotify.status()?;                          // Playback
-let outcome = spotify.seek(SeekTarget::parse("50%")?)?;   // Outcome { via, fallback, playback }
+let outcome = spotify.seek(SeekTarget::parse("50%")?)?;   // Outcome { via, fallback, result, playback }
 ```
+
+`Outcome::result` says what an action did when it can do more than one thing (`previous`:
+`restarted` or `previous_item`). The rules the controller follows (AppleScript first for seeks and
+for starting a track, episode, show or Liked Songs, spotify_player's view checked before commands
+that depend on it, refusals read from its log, restoring what a failed start emptied) are in
+`spotify docs playback`.
+
+Try control code live, without the daemon:
+
+```sh
+cargo run -p silicon-spotify-client --example control -- status
+cargo run -p silicon-spotify-client --example control -- seek 1:30 --strategy spotify_player
+```
+
+It takes `status`, `full`, `play [uri [context]]`, `liked [random]`, `pause`, `toggle`, `next`,
+`previous`, `seek <time>`, `volume <0-100>`, `shuffle <on|off>`, `repeat <off|context|track>`,
+`like` and `unlike`, prints the outcome or error as JSON, and the time it took on stderr. It
+controls the real Spotify.app.
 
 The trigger engine is pure: feed `trigger::Tracker::observe` readings, pass the events to
 `trigger::evaluate`, deliver the returned `Firing`s however you like (`Firing::data()` is the Ting
@@ -71,7 +89,15 @@ Ops: `daemon.status`, `daemon.shutdown`, `doctor`, `player.{status,play,pause,to
 `podcast.saved`, `trigger.{add,list,get,remove,clear,history,test,wait,retry}`,
 `telemetry.{record,clear}`, `update.{check,apply}`. Argument shapes: `crates/cli/src/ops.rs` (the
 CLI is the reference client) and `crates/daemon/src/*.rs`. Unknown ops fail with `unknown_op`.
-The socket accepts only the same OS user.
+The socket accepts only the same OS user. Some fields a client may rely on:
+
+- `queue.add` takes `{"uris": […], "next": bool, "known": [{"uri", "name", "by", "duration_ms"}]}`;
+  `known` (optional) holds facts the caller already has, such as the search hit it picked, so the
+  daemon need not look them up. Older daemons ignore it.
+- `track.info` adds `liked: true|false` for songs when the Liked Songs check answers in 2.5 s.
+- `spotify.launch` answers `{"launched", "already_running", "playback"}`.
+- `player.next` may carry `skipped` (a managed item whose hand-off was still in flight).
+- `queue.list`'s `spotify_upcoming` may carry `current_repeats_left_out` and `note`.
 
 ## Build and test
 

@@ -205,6 +205,13 @@ pub fn clock(ms: u64) -> String {
     }
 }
 
+/// [`clock`] rounded to the nearest second instead of down, for measured spans such as the
+/// time left when a trigger fired: 19 782 ms left shows `0:20`, not `0:19`.
+#[must_use]
+pub fn clock_rounded(ms: u64) -> String {
+    clock(ms.saturating_add(500) / 1000 * 1000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +266,10 @@ mod tests {
     fn clock_formats() {
         assert_eq!(clock(61_000), "1:01");
         assert_eq!(clock(3_723_000), "1:02:03");
+        assert_eq!(clock(19_782), "0:19", "positions round down");
+        assert_eq!(clock_rounded(19_782), "0:20");
+        assert_eq!(clock_rounded(19_499), "0:19");
+        assert_eq!(clock_rounded(59_500), "1:00");
+        assert_eq!(clock_rounded(0), "0:00");
     }
 }

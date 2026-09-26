@@ -208,8 +208,9 @@ async fn dispatch(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
             Ok(json!({"cleared": true}))
         }
         "update.check" | "update.apply" => {
-            let _ = settings_of(daemon, request);
-            crate::updater::check(daemon, request.op == "update.apply")
+            let auto_update =
+                crate::updater::auto_update(&settings_of(daemon, request), &daemon.settings());
+            crate::updater::check(daemon, request.op == "update.apply", auto_update)
                 .await
                 .inspect(|status| {
                     if status.get("restarting").and_then(Value::as_bool) == Some(true) {
@@ -344,9 +345,22 @@ async fn doctor(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
             }
             Err(error) => checks.push(check("spotify_player_installed", false, serde_json::to_value(&error)?, &error.hint)),
         }
-        let warm = d.warm.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        let warm_ok = warm.get("state").and_then(Value::as_str) == Some("running");
-        checks.push(check("spotify_player_warm_instance", warm_ok, warm, "Optional: keeps Web API commands fast. It starts once spotify_player is signed in; see ~/.silicon-spotify/daemon.log."));
+        let mut warm = d.warm.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let state = warm.get("state").and_then(Value::as_str).unwrap_or_default().to_owned();
+        // Who answers spotify_player commands right now (the copy that holds the client port).
+        let port = warm.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok());
+        let owner = port.and_then(crate::warm::port_owner);
+        if port.is_some() {
+            warm["port_owner_pid_now"] = json!(owner);
+        }
+        let own = owner.is_some() && owner.map(i64::from) == warm.get("pid").and_then(Value::as_i64);
+        let warm_ok = state == "running" && own;
+        let fix = match state.as_str() {
+            "running" => "The daemon's spotify_player copy does not hold the client port, so another process answers its commands; run `spotify daemon restart`.",
+            "deferred" => "Another spotify_player (see port_owner) holds the client port and answers spotify-cli's commands from its own state. Quit it to let the daemon run its own copy, which keeps playback state fresh.",
+            _ => "Optional: keeps Web API commands fast. It starts once spotify_player is signed in; see ~/.silicon-spotify/daemon.log.",
+        };
+        checks.push(check("spotify_player_warm_instance", warm_ok, warm, fix));
         let notifications = d.live().notifications;
         checks.push(check("playback_notifications", true, json!({"received": notifications}), ""));
         checks.push(check("daemon", true, json!({"version": VERSION, "pid": std::process::id()}), ""));

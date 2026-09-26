@@ -10,7 +10,8 @@ use silicon_spotify_client::{Error, Result};
 use crate::Ctx;
 use crate::args::{
     Command, DeviceCommand, KindArg, LibrarySection, PlayArgs, PlaylistCommand, PodcastCommand,
-    QueueCommand, QueueKindArg, RepeatArg, ScopeArg, Switch, TriggerAdd, TriggerCommand,
+    QueueCommand, QueueKindArg, RepeatArg, ScopeArg, Switch, TrackKindArg, TriggerAdd,
+    TriggerCommand,
 };
 use crate::render;
 
@@ -25,6 +26,15 @@ fn kind(arg: KindArg) -> Kind {
         KindArg::Playlist => Kind::Playlist,
         KindArg::Show => Kind::Show,
         KindArg::Episode => Kind::Episode,
+    }
+}
+
+fn track_kind(arg: TrackKindArg) -> Kind {
+    match arg {
+        TrackKindArg::Track => Kind::Track,
+        TrackKindArg::Album => Kind::Album,
+        TrackKindArg::Artist => Kind::Artist,
+        TrackKindArg::Playlist => Kind::Playlist,
     }
 }
 
@@ -71,11 +81,15 @@ fn playlist_items(items: &[String]) -> Result<Vec<SpotifyUri>> {
         .collect()
 }
 
-/// Checks `--limit` against what the command can honor. Out-of-range values are rejected rather
-/// than clamped, so the output always reflects the limit applied.
-fn check_limit(limit: Option<usize>, max: Option<usize>, hint: &str) -> Result<Option<usize>> {
-    match limit {
-        Some(value) if value == 0 || max.is_some_and(|max| value > max) => {
+/// Checks `--limit` against what the command can honor. Out-of-range values (negative ones too)
+/// are rejected rather than clamped, so the output always reflects the limit applied.
+fn check_limit(limit: Option<i64>, max: Option<usize>, hint: &str) -> Result<Option<usize>> {
+    let Some(value) = limit else {
+        return Ok(None);
+    };
+    match usize::try_from(value) {
+        Ok(ok) if ok > 0 && max.is_none_or(|max| ok <= max) => Ok(Some(ok)),
+        _ => {
             let range = max.map_or_else(|| "1 or more".to_owned(), |max| format!("1 to {max}"));
             Err(Error::invalid(
                 format!("--limit {value} is out of range: it takes {range}."),
@@ -83,12 +97,11 @@ fn check_limit(limit: Option<usize>, max: Option<usize>, hint: &str) -> Result<O
             )
             .with_details(json!({"limit": value, "min": 1, "max": max})))
         }
-        other => Ok(other),
     }
 }
 
 /// A search's `--limit`: results per kind, at most what spotify_player returns.
-fn search_limit_flag(flag: Option<usize>) -> Result<Option<usize>> {
+fn search_limit_flag(flag: Option<i64>) -> Result<Option<usize>> {
     let max = SEARCH_MAX_PER_KIND as usize;
     check_limit(
         flag,
@@ -100,7 +113,7 @@ fn search_limit_flag(flag: Option<usize>) -> Result<Option<usize>> {
 }
 
 /// Results per kind for `spotify search`: `--limit`, else config `search_limit`, else 10.
-fn search_limit(ctx: &Ctx, flag: Option<usize>) -> Result<usize> {
+fn search_limit(ctx: &Ctx, flag: Option<i64>) -> Result<usize> {
     let max = SEARCH_MAX_PER_KIND as usize;
     if let Some(limit) = search_limit_flag(flag)? {
         return Ok(limit);
@@ -118,8 +131,8 @@ fn search_limit(ctx: &Ctx, flag: Option<usize>) -> Result<usize> {
     })
 }
 
-/// First search hit of a kind.
-async fn first_hit(ctx: &Ctx, query: &str, kind: Kind) -> Result<(SpotifyUri, Value)> {
+/// First search hit of a kind. `kinds` lists what the command's --type accepts, for the hint.
+async fn first_hit(ctx: &Ctx, query: &str, kind: Kind, kinds: &str) -> Result<(SpotifyUri, Value)> {
     let results = ctx
         .daemon(
             "search",
@@ -133,7 +146,7 @@ async fn first_hit(ctx: &Ctx, query: &str, kind: Kind) -> Result<(SpotifyUri, Va
         .ok_or_else(|| {
             Error::not_found(
                 format!("No {} matches `{query}`.", kind),
-                "Try other words, or another --type (track, album, artist, playlist, show, episode).",
+                format!("Try other words, or another --type ({kinds})."),
             )
         })?;
     let uri = hit.get("uri").and_then(Value::as_str).unwrap_or_default();
@@ -146,10 +159,16 @@ async fn play(ctx: &Ctx, args: PlayArgs) -> Result<()> {
     } else if let Some(seed) = &args.radio {
         json!({"type": "radio", "uri": parse_uri(seed, args.kind.map(kind))?})
     } else if let Some(query) = &args.search {
-        let (uri, hit) = first_hit(ctx, query, args.kind.map_or(Kind::Track, kind)).await?;
+        let (uri, hit) = first_hit(
+            ctx,
+            query,
+            args.kind.map_or(Kind::Track, kind),
+            "track, album, artist, playlist, show, episode",
+        )
+        .await?;
         ctx.hint(&format!(
             "Found: {} ({})",
-            hit.get("name").and_then(Value::as_str).unwrap_or("?"),
+            render::one_line(hit.get("name").and_then(Value::as_str).unwrap_or("?")),
             uri
         ));
         json!({"type": "uri", "uri": uri, "context": args.context.as_deref().map(|c| parse_uri(c, Some(Kind::Playlist))).transpose()?, "shuffle": args.shuffle})
@@ -161,6 +180,62 @@ async fn play(ctx: &Ctx, args: PlayArgs) -> Result<()> {
     let value = ctx.daemon("player.play", json!({"target": target})).await?;
     ctx.emit(&value, render::outcome);
     Ok(())
+}
+
+/// A read-only daemon call, repeated once after a transient failure: one network blip while
+/// paging through a long listing should not fail the whole command.
+async fn read(ctx: &Ctx, op: &str, args: Value) -> Result<Value> {
+    match ctx.daemon(op, args.clone()).await {
+        Err(error) if transient(&error) => {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            ctx.daemon(op, args).await
+        }
+        other => other,
+    }
+}
+
+/// A failure worth one more try: a retryable network or busy-instance error.
+fn transient(error: &Error) -> bool {
+    error.retryable && matches!(error.code.as_str(), "transport" | "spotify_player_busy")
+}
+
+/// What `queue add` already knows about a search hit it queues, so the daemon need not look
+/// it up: name, artists (or, for an episode, its show) and length.
+fn known_item(uri: &SpotifyUri, hit: &Value) -> Value {
+    let artists = hit
+        .get("by")
+        .and_then(Value::as_array)
+        .map(|by| {
+            by.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|by| !by.is_empty());
+    let by = match uri.kind {
+        Kind::Episode => hit
+            .get("album")
+            .and_then(Value::as_str)
+            .filter(|show| !show.is_empty())
+            .map(str::to_owned)
+            .or(artists),
+        _ => artists,
+    };
+    json!({
+        "uri": uri.uri(),
+        "name": hit.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()),
+        "by": by,
+        "duration_ms": hit.get("duration_ms").and_then(Value::as_u64),
+    })
+}
+
+/// `not_found` for a bare id looked up as a track: it may name another kind.
+fn bare_id_not_found(mut error: Error, id: &str) -> Error {
+    error.hint = format!(
+        "Bare ids are looked up as tracks: if {id} is an album, artist or playlist, pass --type album|artist|playlist (or use its spotify:<kind>:<id> URI). {}",
+        error.hint
+    );
+    error
 }
 
 async fn control(ctx: &Ctx, op: &str, args: Value) -> Result<()> {
@@ -258,14 +333,24 @@ pub async fn run(ctx: &Ctx, command: Command) -> Result<()> {
         Command::Unlike => control(ctx, "player.like", json!({"like": false})).await?,
         Command::Launch => {
             let value = ctx.daemon("spotify.launch", json!({})).await?;
-            ctx.emit(&value, |_| "Spotify.app is running.".into());
+            ctx.emit(&value, render::launched);
         }
         Command::Track { target, kind: k } => {
             let uri = target
                 .as_deref()
-                .map(|t| parse_uri(t, Some(k.map_or(Kind::Track, kind))))
+                .map(|t| parse_uri(t, Some(k.map_or(Kind::Track, track_kind))))
                 .transpose()?;
-            let mut value = ctx.daemon("track.info", json!({"uri": uri})).await?;
+            // A bare id without --type is looked up as a track.
+            let bare = k.is_none()
+                && target
+                    .as_deref()
+                    .is_some_and(|t| parse_uri(t, None).is_err());
+            let mut value = match ctx.daemon("track.info", json!({"uri": uri})).await {
+                Err(error) if bare && error.code == "not_found" => {
+                    return Err(bare_id_not_found(error, target.as_deref().unwrap_or("")));
+                }
+                other => other?,
+            };
             // Normalize spotify_player's album/artist/track output (`raw`) so the album's tracks
             // or the artist's top tracks and albums are structured fields, not only raw data.
             if let (Some(uri), Some(raw)) = (&uri, value.get("raw").filter(|r| !r.is_null())) {
@@ -351,9 +436,7 @@ pub async fn run(ctx: &Ctx, command: Command) -> Result<()> {
                 None,
                 "Pass --limit 1 or more, or omit it to show the whole section.",
             )?;
-            let value = ctx
-                .daemon("library.get", json!({"key": key, "limit": limit}))
-                .await?;
+            let value = read(ctx, "library.get", json!({"key": key, "limit": limit})).await?;
             ctx.emit(&value, render::items_list);
         }
         Command::Queue { action } => queue(ctx, action.unwrap_or(QueueCommand::List)).await?,
@@ -395,6 +478,7 @@ async fn queue(ctx: &Ctx, action: QueueCommand) -> Result<()> {
             next,
         } => {
             let mut uris = Vec::new();
+            let mut known = Vec::new();
             for item in &items {
                 uris.push(parse_uri(item, Some(Kind::Track))?);
             }
@@ -403,11 +487,12 @@ async fn queue(ctx: &Ctx, action: QueueCommand) -> Result<()> {
                     Some(QueueKindArg::Episode) => Kind::Episode,
                     Some(QueueKindArg::Track) | None => Kind::Track,
                 };
-                let (uri, hit) = first_hit(ctx, query, k).await?;
+                let (uri, hit) = first_hit(ctx, query, k, "track, episode").await?;
                 ctx.hint(&format!(
                     "Found: {} ({uri})",
-                    hit.get("name").and_then(Value::as_str).unwrap_or("?")
+                    render::one_line(hit.get("name").and_then(Value::as_str).unwrap_or("?"))
                 ));
+                known.push(known_item(&uri, &hit));
                 uris.push(uri);
             }
             if uris.is_empty() {
@@ -417,21 +502,18 @@ async fn queue(ctx: &Ctx, action: QueueCommand) -> Result<()> {
                 ));
             }
             let value = ctx
-                .daemon("queue.add", json!({"uris": uris, "next": next}))
-                .await?;
-            ctx.emit(&value, |v| {
-                let added = v["added"].as_array().map_or(0, Vec::len);
-                format!(
-                    "Queued {added} item(s). Managed queue now has {}.",
-                    v["queue"].as_array().map_or(0, Vec::len)
+                .daemon(
+                    "queue.add",
+                    json!({"uris": uris, "next": next, "known": known}),
                 )
-            });
+                .await?;
+            ctx.emit(&value, render::queue_added);
             ctx.hint("They play when the current track ends (or run `spotify next`). See `spotify queue`.");
         }
         QueueCommand::Remove { item } => {
             let value = ctx.daemon("queue.remove", json!({"item": item})).await?;
             ctx.emit(&value, |v| {
-                format!("Removed {}.", v["removed"]["uri"].as_str().unwrap_or("?"))
+                format!("Removed {}.", render::queue_item_label(&v["removed"]))
             });
         }
         QueueCommand::Move { item, to } => {
@@ -441,7 +523,7 @@ async fn queue(ctx: &Ctx, action: QueueCommand) -> Result<()> {
             ctx.emit(&value, |v| {
                 format!(
                     "Moved {} to position {}.",
-                    v["moved"]["uri"].as_str().unwrap_or("?"),
+                    render::queue_item_label(&v["moved"]),
                     v["position"]
                 )
             });
@@ -468,7 +550,9 @@ async fn playlist(ctx: &Ctx, action: PlaylistCommand) -> Result<()> {
                 None,
                 "Pass --limit 1 or more, or omit it to list every playlist.",
             )?;
-            ("playlist.list", json!({"limit": limit}))
+            let value = read(ctx, "playlist.list", json!({"limit": limit})).await?;
+            ctx.emit(&value, |v| render::playlist("playlist.list", v));
+            return Ok(());
         }
         PlaylistCommand::Show { playlist } => {
             ("playlist.show", json!({"id": playlist_id(&playlist)?}))
@@ -532,7 +616,11 @@ async fn playlist(ctx: &Ctx, action: PlaylistCommand) -> Result<()> {
             ("playlist.sync", json!({"id": id, "delete": delete}))
         }
     };
-    let value = ctx.daemon(op, args).await?;
+    let value = if op == "playlist.show" {
+        read(ctx, op, args).await?
+    } else {
+        ctx.daemon(op, args).await?
+    };
     ctx.emit(&value, |v| render::playlist(op, v));
     if let Some(wanted) = fork_name
         && value.get("name").and_then(Value::as_str) != Some(wanted.as_str())
@@ -798,4 +886,90 @@ async fn trigger_add(ctx: &Ctx, add: TriggerAdd) -> Result<()> {
         ctx.hint(&format!("You will get a `spotify.trigger.fired` Ting. Check delivery with `spotify trigger history {id}`; remove with `spotify trigger remove {id}`."));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limits_are_checked_whatever_their_sign() {
+        assert_eq!(check_limit(None, Some(10), "").ok(), Some(None));
+        assert_eq!(check_limit(Some(3), Some(10), "").ok(), Some(Some(3)));
+        assert_eq!(check_limit(Some(500), None, "").ok(), Some(Some(500)));
+        for bad in [0, -1, 11] {
+            let error = check_limit(Some(bad), Some(10), "hint").expect_err("out of range");
+            assert_eq!(error.code, "invalid_input");
+            assert_eq!(
+                error.message,
+                format!("--limit {bad} is out of range: it takes 1 to 10.")
+            );
+            assert_eq!(
+                error.details,
+                Some(json!({"limit": bad, "min": 1, "max": 10}))
+            );
+        }
+    }
+
+    #[test]
+    fn queued_search_hits_carry_what_is_known() {
+        let track = parse_uri("spotify:track:0BxE4FqsDD1Ot4YuBXwAPp", None).expect("uri");
+        let hit = json!({"kind": "track", "name": "505", "by": ["Arctic Monkeys", "X"],
+            "album": "Favourite Worst Nightmare", "duration_ms": 253_000});
+        assert_eq!(
+            known_item(&track, &hit),
+            json!({"uri": "spotify:track:0BxE4FqsDD1Ot4YuBXwAPp", "name": "505",
+                "by": "Arctic Monkeys, X", "duration_ms": 253_000})
+        );
+        // An episode's `by` is its show.
+        let episode = parse_uri("spotify:episode:4IzpgR6RCEkRqMHbJF38Wp", None).expect("uri");
+        let hit = json!({"kind": "episode", "name": "How to Speak Clearly", "album": "Huberman Lab",
+            "duration_ms": 7_140_000});
+        assert_eq!(
+            known_item(&episode, &hit),
+            json!({"uri": "spotify:episode:4IzpgR6RCEkRqMHbJF38Wp", "name": "How to Speak Clearly",
+                "by": "Huberman Lab", "duration_ms": 7_140_000})
+        );
+        // Nothing known: nulls, which the daemon fills in itself.
+        assert_eq!(
+            known_item(&episode, &json!({"name": ""})),
+            json!({"uri": "spotify:episode:4IzpgR6RCEkRqMHbJF38Wp", "name": null, "by": null, "duration_ms": null})
+        );
+        // An empty show is not known either.
+        assert_eq!(
+            known_item(&episode, &json!({"name": "Ep", "album": ""}))["by"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn only_transient_read_failures_are_retried() {
+        assert!(transient(
+            &Error::new("transport", "connection reset", "retry").retryable()
+        ));
+        assert!(transient(
+            &Error::new("spotify_player_busy", "busy", "retry").retryable()
+        ));
+        // Not retryable, or not a network blip: fail at once.
+        assert!(!transient(&Error::new("transport", "bad url", "fix it")));
+        assert!(!transient(
+            &Error::new("rate_limited", "429", "wait").retryable()
+        ));
+        assert!(!transient(&Error::not_found("gone", "search")));
+    }
+
+    #[test]
+    fn bare_track_ids_that_are_not_found_suggest_a_kind() {
+        let error = bare_id_not_found(
+            Error::not_found("Spotify could not find that item.", "Search for it."),
+            "78bpIziExqiI9qztvNFlQu",
+        );
+        assert_eq!(error.code, "not_found");
+        assert!(
+            error.hint.starts_with("Bare ids are looked up as tracks: if 78bpIziExqiI9qztvNFlQu is an album, artist or playlist, pass --type album|artist|playlist"),
+            "{}",
+            error.hint
+        );
+        assert!(error.hint.ends_with("Search for it."), "{}", error.hint);
+    }
 }

@@ -791,11 +791,57 @@ pub fn strict_object(text: &str) -> Result<Vec<(String, Value)>> {
         }
     }
     serde_json::from_str::<Entries>(text.trim()).map(|e| e.0).map_err(|error| {
+        if let Some(object) = assignments_as_json(text) {
+            // Single-quoted for the shell: a quote inside becomes '\''.
+            let quoted = object.replace('\'', r"'\''");
+            return Error::invalid(
+                format!(
+                    "Config must be one JSON object, not `{}`.",
+                    crate::model::truncate(text.trim(), 80)
+                ),
+                format!("Write it as JSON: spotify config set '{quoted}'."),
+            )
+            .with_details(json!({"json": object}));
+        }
         Error::invalid(
             format!("Config must be one JSON object: {error}."),
             "Quote it for the shell, e.g. spotify config set '{\"telemetry\": false, \"strategy\": \"auto\"}'.",
         )
     })
+}
+
+/// `search_limit=5`, `telemetry: false` or `a=1, b=x` (assignments where a JSON object belongs)
+/// as the JSON object they mean: `{"search_limit": 5}`. Values that are JSON scalars stay as
+/// they are; anything else becomes a string. `None` when `text` is not such a list.
+fn assignments_as_json(text: &str) -> Option<String> {
+    let is_key = |key: &str| {
+        !key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    };
+    let mut tokens = text
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|token| !token.is_empty());
+    let mut pairs = Vec::new();
+    while let Some(token) = tokens.next() {
+        let (key, value) = token.split_once(['=', ':'])?;
+        // `key: value` and `key= value`: the value is the next token.
+        let value = if value.is_empty() {
+            tokens.next()?
+        } else {
+            value
+        };
+        if !is_key(key) {
+            return None;
+        }
+        let value = serde_json::from_str::<Value>(value)
+            .ok()
+            .filter(|v| !v.is_object() && !v.is_array())
+            .unwrap_or_else(|| Value::String(value.to_owned()));
+        pairs.push(format!("{}: {value}", Value::String(key.to_owned())));
+    }
+    (!pairs.is_empty()).then(|| format!("{{{}}}", pairs.join(", ")))
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
@@ -910,6 +956,55 @@ mod tests {
         let (reset, _) = config.apply_json(r#"{"telemetry": null}"#).expect("unset");
         assert_eq!(reset.telemetry, None);
         assert!(config.apply_json("[1]").is_err());
+    }
+
+    #[test]
+    fn assignments_get_the_json_form_as_a_hint() {
+        let config = Config::default();
+        let error = config.apply_json("search_limit=5").expect_err("not JSON");
+        assert_eq!(error.code, "invalid_input");
+        assert_eq!(
+            error.hint,
+            r#"Write it as JSON: spotify config set '{"search_limit": 5}'."#
+        );
+        assert!(
+            error.message.contains("`search_limit=5`"),
+            "{}",
+            error.message
+        );
+        for (text, json) in [
+            ("telemetry: false", r#"{"telemetry": false}"#),
+            (
+                "strategy=applescript, launch_spotify=false",
+                r#"{"strategy": "applescript", "launch_spotify": false}"#,
+            ),
+            ("notify_isi=\"planner\"", r#"{"notify_isi": "planner"}"#),
+            (
+                "api_url=https://example.com",
+                r#"{"api_url": "https://example.com"}"#,
+            ),
+            ("notify_isi=it's", r#"{"notify_isi": "it's"}"#),
+        ] {
+            assert_eq!(assignments_as_json(text).as_deref(), Some(json), "{text}");
+        }
+        let quoted = config.apply_json("notify_isi=it's").expect_err("quote");
+        assert!(
+            quoted.hint.contains(r#"'{"notify_isi": "it'\''s"}'"#),
+            "{}",
+            quoted.hint
+        );
+        // Not assignments: the generic JSON advice.
+        for text in [
+            "search_limit",
+            "5",
+            "{search_limit: 5}",
+            "search_limit=",
+            "a b",
+        ] {
+            assert_eq!(assignments_as_json(text), None, "{text}");
+            let error = config.apply_json(text).expect_err(text);
+            assert!(error.hint.starts_with("Quote it for the shell"), "{text}");
+        }
     }
 
     #[test]

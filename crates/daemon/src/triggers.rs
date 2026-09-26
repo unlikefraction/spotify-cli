@@ -722,7 +722,11 @@ async fn send(row: &FiringRow) -> Result<Value> {
     }
 }
 
-/// Relays queued telemetry to the backend every minute.
+/// At most this many [`crate::db::TELEMETRY_PEEK`]-event rounds per wake: the whole bounded
+/// outbox (2 000 events), so a backlog drains in one wake instead of 40 events a minute.
+const TELEMETRY_ROUNDS_PER_WAKE: usize = 50;
+
+/// Relays queued telemetry to the backend every minute, draining the backlog each time.
 pub async fn relay_telemetry(daemon: Arc<Daemon>) {
     loop {
         tokio::select! {
@@ -734,10 +738,11 @@ pub async fn relay_telemetry(daemon: Arc<Daemon>) {
             let _ = daemon.db.clear_telemetry();
             continue;
         }
-        let Ok(batch) = daemon.db.peek_telemetry() else {
-            continue;
-        };
-        if batch.is_empty() {
+        if daemon
+            .db
+            .peek_telemetry()
+            .map_or(true, |batch| batch.is_empty())
+        {
             continue;
         }
         let api_url = settings
@@ -746,25 +751,59 @@ pub async fn relay_telemetry(daemon: Arc<Daemon>) {
         let Ok(api) = Api::new(&api_url, "daemon") else {
             continue;
         };
+        let api = &api;
+        drain_telemetry(
+            &daemon.db,
+            |events| async move { api.telemetry(&events).await },
+            TELEMETRY_ROUNDS_PER_WAKE,
+        )
+        .await;
+    }
+}
+
+/// Sends queued telemetry, oldest first, in rounds of up to [`crate::db::TELEMETRY_PEEK`]
+/// events until the outbox is empty, `max_rounds` is reached, or the backend is unreachable
+/// (the rest waits for the next wake). Returns how many events were delivered.
+async fn drain_telemetry<F, Fut>(db: &crate::db::Db, mut send: F, max_rounds: usize) -> usize
+where
+    F: FnMut(Vec<silicon_spotify_client::telemetry::Event>) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut delivered = 0;
+    for _ in 0..max_rounds {
+        let Ok(batch) = db.peek_telemetry() else {
+            break;
+        };
+        let full = batch.len() >= crate::db::TELEMETRY_PEEK;
+        if batch.is_empty() {
+            break;
+        }
         for (events, ids) in telemetry_chunks(batch) {
             if events.is_empty() {
                 // Unreadable or oversized rows: nothing to send, just forget them.
-                let _ = daemon.db.drop_telemetry(&ids);
+                let _ = db.drop_telemetry(&ids);
                 continue;
             }
-            match api.telemetry(&events).await {
+            let count = events.len();
+            match send(events).await {
                 Ok(()) => {
-                    let _ = daemon.db.drop_telemetry(&ids);
+                    delivered += count;
                 }
-                Err(error) if !error.retryable => {
-                    // The backend rejected the batch; drop it rather than retry forever.
-                    let _ = daemon.db.drop_telemetry(&ids);
-                }
-                // Keep the rest for the next round.
-                Err(_) => break,
+                // The backend rejected the batch; drop it rather than retry forever.
+                Err(error) if !error.retryable => {}
+                // Unreachable: keep the rest for the next wake.
+                Err(_) => return delivered,
+            }
+            if db.drop_telemetry(&ids).is_err() {
+                // Could not forget what was sent: stop rather than send it again.
+                return delivered;
             }
         }
+        if !full {
+            break;
+        }
     }
+    delivered
 }
 
 /// The gateway takes at most 64 KiB per request; stay under it with room for the envelope.
@@ -863,6 +902,62 @@ mod tests {
 #[cfg(test)]
 mod telemetry_tests {
     use super::*;
+
+    fn outbox(events: usize) -> crate::db::Db {
+        let db = crate::db::Db::open(std::path::Path::new(":memory:")).expect("db");
+        let rows: Vec<Value> = (0..events)
+            .map(|i| event(&format!("e{i:04}"), 100).1)
+            .collect();
+        db.push_telemetry(&rows).expect("push");
+        db
+    }
+
+    #[tokio::test]
+    async fn one_wake_drains_a_backlog() {
+        let db = outbox(310);
+        let mut sent = Vec::new();
+        let delivered = drain_telemetry(
+            &db,
+            |events| {
+                sent.extend(events.iter().map(|e| e.id.clone()));
+                async { Ok(()) }
+            },
+            TELEMETRY_ROUNDS_PER_WAKE,
+        )
+        .await;
+        assert_eq!(delivered, 310);
+        assert!(db.peek_telemetry().expect("peek").is_empty());
+        // Oldest first, each once.
+        let mut sorted = sent.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 310);
+        assert_eq!(sent.first().map(String::as_str), Some("e0000"));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_backend_keeps_the_backlog() {
+        let db = outbox(100);
+        let mut calls = 0;
+        let delivered = drain_telemetry(
+            &db,
+            |_| {
+                calls += 1;
+                let result = if calls == 1 {
+                    Ok(())
+                } else {
+                    Err(silicon_spotify_client::Error::backend_unavailable("down"))
+                };
+                async move { result }
+            },
+            TELEMETRY_ROUNDS_PER_WAKE,
+        )
+        .await;
+        assert_eq!(delivered, 40);
+        assert_eq!(calls, 2);
+        let left = db.counts().expect("counts");
+        assert_eq!(left["telemetry_backlog"], json!(60));
+    }
 
     fn event(id: &str, bytes: usize) -> (String, Value) {
         (

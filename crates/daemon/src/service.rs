@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use silicon_spotify_client::applescript::{self, Runner};
 use silicon_spotify_client::control::{Controller, PlayTarget, RepeatMode, Strategy, VolumeTarget};
 use silicon_spotify_client::ipc::Request;
-use silicon_spotify_client::model::{Item, Playback, PlayerState, now_rfc3339};
+use silicon_spotify_client::model::{Item, Playback, PlayerState, Track, now_rfc3339};
 use silicon_spotify_client::player::{Output, SpotifyPlayer};
 use silicon_spotify_client::timing::SeekTarget;
 use silicon_spotify_client::trigger::Tracker;
@@ -117,6 +117,13 @@ pub struct Daemon {
     pub live: Mutex<Live>,
     /// Serializes read-and-process so readings are applied in order.
     pub observe_lock: Mutex<()>,
+    /// Serializes item changes: managed-queue hand-offs (`spotify next` and the watcher's) and
+    /// explicit `play <item>` and `previous`, so two hand-offs never send the same item and no two
+    /// changes reach Spotify out of order.
+    pub hand_off: Mutex<()>,
+    /// Library writes and reads in flight, for [`LIBRARY_SETTLE`] (see
+    /// [`Daemon::after_library_write`] and [`Daemon::before_library_read`]).
+    pub library: Mutex<LibrarySettle>,
     /// Wakes the watcher.
     pub nudge: Notify,
     /// Wakes the delivery worker.
@@ -127,6 +134,8 @@ pub struct Daemon {
     pub settings: Mutex<Settings>,
     /// spotify_player warm instance status.
     pub warm: Mutex<Value>,
+    /// The warm spotify_player's pid (0 = none), for shutdown.
+    pub warm_pid: std::sync::atomic::AtomicU32,
     /// Update checker status.
     pub update: Mutex<Value>,
     /// Stop signal.
@@ -181,6 +190,100 @@ impl Daemon {
             log!("could not persist the queue: {error}");
         }
     }
+
+    /// Records that a library or playlist change just finished (see [`LIBRARY_SETTLE`]).
+    pub fn after_library_write(&self) {
+        self.library_settle().wrote(Instant::now());
+    }
+
+    /// Before reading the library or a playlist: waits until [`LIBRARY_SETTLE`] has passed since
+    /// the last change, so the read cannot get spotify_player's copy of an older response. Keep
+    /// the returned guard until the read has finished.
+    #[must_use = "the read is in flight until the guard is dropped"]
+    pub fn before_library_read(&self) -> LibraryRead<'_> {
+        loop {
+            let wait = {
+                let mut settle = self.library_settle();
+                match settle.delay(Instant::now()) {
+                    None => {
+                        settle.reads += 1;
+                        return LibraryRead(self);
+                    }
+                    Some(wait) => wait,
+                }
+            };
+            // Another change may finish meanwhile: look again after the wait.
+            std::thread::sleep(wait);
+        }
+    }
+
+    fn library_settle(&self) -> std::sync::MutexGuard<'_, LibrarySettle> {
+        self.library
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A library or playlist read in flight (from [`Daemon::before_library_read`]).
+pub struct LibraryRead<'a>(&'a Daemon);
+
+impl Drop for LibraryRead<'_> {
+    fn drop(&mut self) {
+        self.0.library_settle().read_finished(Instant::now());
+    }
+}
+
+/// When library reads may fetch fresh, given spotify_player's shared responses
+/// ([`LIBRARY_SETTLE`]).
+#[derive(Debug, Default)]
+pub struct LibrarySettle {
+    /// When a change last finished, or a read that was in flight when one finished.
+    last_write: Option<Instant>,
+    /// Reads in flight.
+    reads: usize,
+    /// A change finished while reads were in flight. Each of them may complete after the change
+    /// and still carry the older data, which spotify_player then shares for another second, so
+    /// their completion counts as a change too.
+    overlapped: bool,
+}
+
+impl LibrarySettle {
+    /// A change finished at `now`.
+    fn wrote(&mut self, now: Instant) {
+        self.last_write = Some(now);
+        if self.reads > 0 {
+            self.overlapped = true;
+        }
+    }
+
+    /// How long a read starting at `now` must wait (`None`: it need not).
+    fn delay(&self, now: Instant) -> Option<Duration> {
+        settle_delay(self.last_write, now)
+    }
+
+    /// A read finished at `now`.
+    fn read_finished(&mut self, now: Instant) {
+        self.reads = self.reads.saturating_sub(1);
+        if self.overlapped {
+            self.last_write = Some(now);
+            self.overlapped = self.reads > 0;
+        }
+    }
+}
+
+/// spotify_player hands every identical Web API GET that arrives within 1 s of a response's
+/// completion that same response, and a write (POST/PUT/DELETE) does not drop it. So a
+/// `playlist list` right after `playlist delete` could still show the playlist when another list
+/// finished just before the delete. A read issued this long after the write finished always
+/// fetches fresh: a shared response completed before the write did, or it belongs to a read that
+/// was in flight during the write, and this long after that read finished counts instead
+/// ([`LibrarySettle`]).
+pub const LIBRARY_SETTLE: Duration = Duration::from_millis(1_100);
+
+/// How long a read must wait after the last library write (`None`: it need not).
+fn settle_delay(last_write: Option<Instant>, now: Instant) -> Option<Duration> {
+    let ready = last_write? + LIBRARY_SETTLE;
+    (ready > now).then(|| ready - now)
 }
 
 /// Parses `args` into `T` with a clear error.
@@ -281,15 +384,22 @@ pub async fn handle(daemon: &Arc<Daemon>, request: &Request) -> Option<Result<Va
             };
             let s = settings.clone();
             let result = blocking(move || {
-                // Starting something explicit abandons the managed-queue resume point.
-                if !matches!(a.target, PlayTarget::Resume) {
+                if matches!(a.target, PlayTarget::Resume) {
+                    // Resuming changes no item: nothing for the queue to know.
+                    return d
+                        .with_controller(&s, |c| c.play(&a.target))
+                        .map(|o| outcome_json(&o));
+                }
+                explicit_change(&d, |d| {
+                    let outcome = d.with_controller(&s, |c| c.play(&a.target))?;
+                    // Starting something else abandons the managed-queue resume point, but only
+                    // once it started: a failed play leaves playback, and so where the queue
+                    // returns to, as it was.
                     let mut live = d.live();
                     live.queue.resume = None;
-                    live.queue.hold(silicon_spotify_client::model::now_ms());
                     d.save_queue(&live);
-                }
-                d.with_controller(&s, |c| c.play(&a.target))
-                    .map(|o| outcome_json(&o))
+                    Ok(outcome)
+                })
             })
             .await;
             daemon.nudge.notify_one();
@@ -298,8 +408,13 @@ pub async fn handle(daemon: &Arc<Daemon>, request: &Request) -> Option<Result<Va
         "player.pause" => control(daemon, settings, |c| c.pause()).await,
         "player.toggle" => control(daemon, settings, |c| c.toggle()).await,
         "player.previous" => {
-            hold(daemon);
-            control(daemon, settings, |c| c.previous()).await
+            let d = Arc::clone(daemon);
+            let result = blocking(move || {
+                explicit_change(&d, |d| d.with_controller(&settings, |c| c.previous()))
+            })
+            .await;
+            daemon.nudge.notify_one();
+            result
         }
         "player.next" => next(daemon, settings).await,
         "player.seek" => {
@@ -348,19 +463,29 @@ pub async fn handle(daemon: &Arc<Daemon>, request: &Request) -> Option<Result<Va
                 like: bool,
             }
             match args::<A>(request) {
-                Ok(a) => control(daemon, settings, move |c| c.like(a.like)).await,
+                Ok(a) => {
+                    let result = control(daemon, settings, move |c| c.like(a.like)).await;
+                    daemon.after_library_write();
+                    result
+                }
                 Err(e) => Err(e),
             }
         }
         "spotify.launch" => {
             blocking(move || {
+                // Already running: nothing to launch (a read error falls through to `open`).
+                if let Ok(playback) = d.read()
+                    && playback.state != PlayerState::NotRunning
+                {
+                    return Ok(json!({"launched": false, "already_running": true, "playback": playback}));
+                }
                 silicon_spotify_client::control::launch_spotify()?;
                 let deadline = Instant::now() + Duration::from_secs(20);
                 loop {
                     std::thread::sleep(Duration::from_millis(400));
                     let playback = d.read()?;
                     if playback.state != PlayerState::NotRunning {
-                        return Ok(json!({"launched": true, "playback": playback}));
+                        return Ok(json!({"launched": true, "already_running": false, "playback": playback}));
                     }
                     if Instant::now() > deadline {
                         return Err(Error::new(
@@ -383,8 +508,7 @@ pub async fn handle(daemon: &Arc<Daemon>, request: &Request) -> Option<Result<Va
                 Ok(a) => a,
                 Err(e) => return Some(Err(e)),
             };
-            let s = settings.clone();
-            blocking(move || track_info(&d, &s, a.uri.as_ref())).await
+            track_info(&d, settings.clone(), a.uri).await
         }
         "lyrics" => {
             #[derive(Deserialize)]
@@ -469,7 +593,11 @@ pub async fn handle(daemon: &Arc<Daemon>, request: &Request) -> Option<Result<Va
                 Err(e) => return Some(Err(e)),
             };
             let s = settings.clone();
-            blocking(move || library(&s, &a.key, a.limit)).await
+            blocking(move || {
+                let _read = d.before_library_read();
+                library(&s, &a.key, a.limit)
+            })
+            .await
         }
         "queue.list" => queue_list(daemon, settings).await,
         "queue.add" => queue_add(daemon, request, settings).await,
@@ -519,17 +647,38 @@ async fn control(
     result
 }
 
-/// `next`: plays the managed queue's head when it has items, else Spotify's next.
+/// `next`: plays the managed queue's next item when it has one, else Spotify's next. Runs under
+/// [`Daemon::hand_off`], so concurrent `next`s are applied one after the other and never hand
+/// off the same item.
 async fn next(daemon: &Arc<Daemon>, settings: Settings) -> Result<Value> {
-    let has_queue = !daemon.live().queue.items.is_empty();
-    if has_queue {
-        let d = Arc::clone(daemon);
-        let played = blocking(move || crate::watcher::advance_queue(&d, &settings)).await?;
-        daemon.nudge.notify_one();
-        return Ok(played);
-    }
-    hold(daemon);
-    control(daemon, settings, |c| c.next()).await
+    let d = Arc::clone(daemon);
+    let result = blocking(move || {
+        let _serial = d
+            .hand_off
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match crate::watcher::advance_queue(&d, &settings)? {
+            crate::watcher::Advance::Played(reply) => Ok(reply),
+            crate::watcher::Advance::Nothing { skipped } => {
+                // Skipping an item that is still being switched to: let Spotify show it first,
+                // so its own next moves past it (not past what was playing before).
+                if let Some(uri) = &skipped {
+                    crate::watcher::wait_until_current(&d, uri, Duration::from_millis(1_500));
+                }
+                hold(&d);
+                let mut reply = d
+                    .with_controller(&settings, |c| c.next())
+                    .map(|o| outcome_json(&o))?;
+                if let Some(uri) = skipped {
+                    reply["skipped"] = json!(uri);
+                }
+                Ok(reply)
+            }
+        }
+    })
+    .await;
+    daemon.nudge.notify_one();
+    result
 }
 
 /// An explicit item change: the queue must not override it.
@@ -539,68 +688,181 @@ fn hold(daemon: &Daemon) {
     daemon.save_queue(&live);
 }
 
-fn track_info(daemon: &Daemon, settings: &Settings, uri: Option<&SpotifyUri>) -> Result<Value> {
-    match uri {
+/// Runs an explicit item change (`play <item>`, `previous`) under [`Daemon::hand_off`], so it and
+/// a `spotify next` or a managed-queue hand-off reach Spotify one after the other, in the order
+/// they got the lock. The queue's hold opens first, so the queue does not override the change,
+/// and opens again once the change has landed: a slow start (Spotify.app launching, a long
+/// verification) must not outlast it, or the queue would replace what just started. A hand-off
+/// the watcher decided on meanwhile is dropped with it.
+///
+/// When Spotify.app still plays the managed item it played before (the change failed, or
+/// `previous` restarted that item), that item stays the managed one, so the queue still moves on
+/// (or resumes) after it.
+fn explicit_change(
+    daemon: &Daemon,
+    change: impl FnOnce(&Daemon) -> Result<silicon_spotify_client::control::Outcome>,
+) -> Result<Value> {
+    let _serial = daemon
+        .hand_off
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let managed_before = daemon.live().queue.managed_now.clone();
+    hold(daemon);
+    let result = change(daemon);
+    // What plays now: the verified reading of a change that landed; one AppleScript read after a
+    // failure, and only when there is a managed item to keep.
+    let playing = match &result {
+        Ok(outcome) => outcome.playback.track.as_ref().map(|t| t.uri.clone()),
+        Err(_) if managed_before.is_some() => daemon
+            .read()
+            .ok()
+            .and_then(|playback| playback.track)
+            .map(|track| track.uri),
+        Err(_) => None,
+    };
+    let keep = managed_before.filter(|uri| playing.as_ref() == Some(uri));
+    if result.is_ok() || keep.is_some() {
+        let mut live = daemon.live();
+        if result.is_ok() {
+            live.queue.hold(silicon_spotify_client::model::now_ms());
+        }
+        if let Some(uri) = keep
+            && live.queue.managed_now.is_none()
+            && live.queue.pending.is_none()
+        {
+            live.queue.managed_now = Some(uri);
+        }
+        daemon.save_queue(&live);
+    }
+    result.map(|outcome| outcome_json(&outcome))
+}
+
+/// `track.info`: an item by URI, or the item playing now. For a song (a `spotify:track:` URI, or
+/// the current item when it is one) the reply also says whether it is in Liked Songs (`liked`),
+/// looked up at the same time and left out when that lookup fails or takes too long.
+async fn track_info(
+    daemon: &Arc<Daemon>,
+    settings: Settings,
+    uri: Option<SpotifyUri>,
+) -> Result<Value> {
+    let d = Arc::clone(daemon);
+    let s = settings.clone();
+    let (info, liked) = match uri {
         Some(uri) => {
-            let kind = match uri.kind {
-                Kind::Track => "track",
-                Kind::Album => "album",
-                Kind::Artist => "artist",
-                Kind::Playlist => "playlist",
-                Kind::Show | Kind::Episode => {
-                    return Err(Error::unsupported(
-                        "spotify_player cannot look up podcast items by id.",
-                        "Use `spotify podcast search '<name>'` to find shows and episodes.",
-                    ));
-                }
-            };
-            let value = settings
-                .authed_player()?
-                .json(&["get", "item", "--id", &uri.id, kind])?;
-            if kind == "playlist" {
-                return Ok(playlist_view(&value));
-            }
-            let mut out = json!({"item": Item::from_player_json(kind, &value)});
-            if let (Some(object), Value::Object(view)) = (
-                out.as_object_mut(),
-                silicon_spotify_client::model::item_view(kind, &value),
-            ) {
-                object.extend(view);
-            }
-            out["raw"] = value;
-            Ok(out)
+            let song = (uri.kind == Kind::Track).then(|| uri.id.clone());
+            tokio::join!(
+                blocking(move || item_info(&d, &s, &uri)),
+                is_liked(&settings, song)
+            )
         }
         None => {
-            let playback = daemon.read()?;
+            let playback = blocking(move || d.read()).await?;
             let track = playback.track.clone().ok_or_else(Error::nothing_playing)?;
-            let mut web = Value::Null;
-            let mut warnings = Vec::new();
-            if track.kind == "track" {
-                match settings
-                    .authed_player()
-                    .and_then(|p| p.json(&["get", "item", "--id", &track.id, "track"]))
-                {
-                    Ok(value) => web = value,
-                    Err(error) => warnings.push(error),
-                }
-            }
-            let artists = web.get("artists").and_then(Value::as_array).map(|a| {
-                a.iter()
-                    .map(|x| json!({"id": x.get("id"), "name": x.get("name")}))
-                    .collect::<Vec<_>>()
-            });
-            Ok(json!({
-                "track": track,
-                "playback": {
-                    "state": playback.state, "position_ms": playback.position_ms, "position": playback.position,
-                    "remaining_ms": playback.remaining_ms, "progress": playback.progress,
-                },
-                "artists": artists,
-                "album": web.get("album"),
-                "explicit": web.get("explicit"),
-                "warnings": warnings,
-            }))
+            let song = (track.kind == "track").then(|| track.id.clone());
+            tokio::join!(
+                blocking(move || Ok(current_info(&s, &playback, track))),
+                is_liked(&settings, song)
+            )
         }
+    };
+    let mut info = info?;
+    if let (Some(liked), Some(object)) = (liked, info.as_object_mut()) {
+        object.insert("liked".into(), json!(liked));
+    }
+    Ok(info)
+}
+
+/// `spotify track <uri>` (not podcast items: spotify_player cannot look those up by id).
+fn item_info(daemon: &Daemon, settings: &Settings, uri: &SpotifyUri) -> Result<Value> {
+    let kind = match uri.kind {
+        Kind::Track => "track",
+        Kind::Album => "album",
+        Kind::Artist => "artist",
+        Kind::Playlist => "playlist",
+        Kind::Show | Kind::Episode => {
+            return Err(Error::unsupported(
+                "spotify_player cannot look up podcast items by id.",
+                "Use `spotify podcast search '<name>'` to find shows and episodes.",
+            ));
+        }
+    };
+    let _read = (kind == "playlist").then(|| daemon.before_library_read());
+    let value = read_json(
+        &settings.authed_player()?,
+        &["get", "item", "--id", &uri.id, kind],
+    )?;
+    Ok(item_envelope(kind, value))
+}
+
+/// `spotify track` for the item playing now: Spotify.app's view, plus the song's artists, album
+/// and explicit flag from the Web API when it is a song (a failed lookup is a warning).
+fn current_info(settings: &Settings, playback: &Playback, track: Track) -> Value {
+    let mut web = Value::Null;
+    let mut warnings = Vec::new();
+    if track.kind == "track" {
+        match settings
+            .authed_player()
+            .and_then(|p| p.json(&["get", "item", "--id", &track.id, "track"]))
+        {
+            Ok(value) => web = value,
+            Err(error) => warnings.push(error),
+        }
+    }
+    let artists = web.get("artists").and_then(Value::as_array).map(|a| {
+        a.iter()
+            .map(|x| json!({"id": x.get("id"), "name": x.get("name")}))
+            .collect::<Vec<_>>()
+    });
+    json!({
+        "track": track,
+        "playback": {
+            "state": playback.state, "position_ms": playback.position_ms, "position": playback.position,
+            "remaining_ms": playback.remaining_ms, "progress": playback.progress,
+        },
+        "artists": artists,
+        "album": web.get("album"),
+        "explicit": web.get("explicit"),
+        "warnings": warnings,
+    })
+}
+
+/// How long `spotify track` waits for the Liked Songs check before leaving `liked` out.
+const LIKED_LOOKUP_TIMEOUT: Duration = Duration::from_millis(2_500);
+
+/// Whether the song `id` is in Liked Songs (`GET /v1/me/tracks/contains`, with spotify_player's
+/// cached token). `None` without an id, a token or an answer within [`LIKED_LOOKUP_TIMEOUT`]
+/// (a rate limit or the pause after one, the network, a refused token).
+async fn is_liked(settings: &Settings, id: Option<String>) -> Option<bool> {
+    let id = id.filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()))?;
+    let settings = settings.clone();
+    let tokens = blocking(move || {
+        Ok(settings
+            .authed_player()
+            .map(|player| cached_access_tokens(&player))
+            .unwrap_or_default())
+    })
+    .await
+    .ok()
+    .filter(|tokens| !tokens.is_empty())?;
+    let answer = tokio::time::timeout(
+        LIKED_LOOKUP_TIMEOUT,
+        web_api_get(
+            &tokens,
+            "https://api.spotify.com/v1/me/tracks/contains",
+            &[("ids", id.as_str())],
+            LIKED_LOOKUP_TIMEOUT,
+        ),
+    )
+    .await
+    .ok()??;
+    liked_from_web(&answer)
+}
+
+/// The answer of `GET /v1/me/tracks/contains` for one id: `[true]` or `[false]`.
+fn liked_from_web(value: &Value) -> Option<bool> {
+    match value.as_array()?.as_slice() {
+        [liked] => liked.as_bool(),
+        _ => None,
     }
 }
 
@@ -688,6 +950,38 @@ fn search(settings: &Settings, query: &str, kinds: &[Kind], limit: usize) -> Res
     Ok(json!({"query": query, "results": out, "limit": limit}))
 }
 
+/// A read (`get key …`, `get item …`) that spotify_player may page through many Web API requests
+/// for: one network blip in a long listing should not fail it, so a transient failure
+/// ([`retry_read`]) is retried once after a short pause. Only for reads; writes are never repeated.
+///
+/// # Errors
+/// The second attempt's error, or the first's when it is not transient.
+fn read_json(player: &SpotifyPlayer, args: &[&str]) -> Result<Value> {
+    match player.json(args) {
+        Err(error) if retry_read(&error) => {
+            log!(
+                "spotify_player {}: {} ({}); retrying once",
+                args.join(" "),
+                error.code,
+                error.message
+            );
+            std::thread::sleep(READ_RETRY_PAUSE);
+            player.json(args)
+        }
+        other => other,
+    }
+}
+
+/// The pause before [`read_json`]'s retry.
+const READ_RETRY_PAUSE: Duration = Duration::from_millis(500);
+
+/// Whether a failed read is worth one more try at once: the network (`transport`) or the warm
+/// spotify_player restarting (`spotify_player_busy`). Rate limits and timeouts are not: a retry
+/// right away would fail the same way, or double a long wait.
+fn retry_read(error: &Error) -> bool {
+    error.retryable && matches!(error.code.as_str(), "transport" | "spotify_player_busy")
+}
+
 fn library(settings: &Settings, key: &str, limit: Option<usize>) -> Result<Value> {
     let (player_key, kind) = match key {
         "liked" | "tracks" | "user-liked-tracks" => ("user-liked-tracks", "track"),
@@ -702,9 +996,7 @@ fn library(settings: &Settings, key: &str, limit: Option<usize>) -> Result<Value
             ));
         }
     };
-    let value = settings
-        .authed_player()?
-        .json(&["get", "key", player_key])?;
+    let value = read_json(&settings.authed_player()?, &["get", "key", player_key])?;
     let all: Vec<Item> = value
         .as_array()
         .map(|a| {
@@ -718,7 +1010,43 @@ fn library(settings: &Settings, key: &str, limit: Option<usize>) -> Result<Value
     Ok(json!({"section": key, "total": total, "items": items}))
 }
 
+/// `spotify track <uri>`: `{kind, item, …per-kind fields, raw}` for every kind. Playlists also
+/// carry what `playlist show` reports (`playlist`, `owner`, `collaborative`, `track_count`,
+/// `duration`, `tracks`) plus `duration_ms`.
+fn item_envelope(kind: &str, value: Value) -> Value {
+    let mut out = json!({"item": Item::from_player_json(kind, &value)});
+    if let (Some(object), Value::Object(view)) = (
+        out.as_object_mut(),
+        silicon_spotify_client::model::item_view(kind, &value),
+    ) {
+        object.extend(view);
+    }
+    if kind == "playlist"
+        && let Some(object) = out.as_object_mut()
+    {
+        let (view, total_ms) = playlist_parts(&value);
+        object.insert("kind".into(), json!("playlist"));
+        if object.get("item").is_none_or(Value::is_null) {
+            object.insert("item".into(), view["playlist"].clone());
+        }
+        if let Value::Object(view) = view {
+            for (key, field) in view {
+                object.entry(key).or_insert(field);
+            }
+        }
+        object.entry("duration_ms").or_insert(json!(total_ms));
+    }
+    out["raw"] = value;
+    out
+}
+
+/// `playlist show`.
 fn playlist_view(value: &Value) -> Value {
+    playlist_parts(value).0
+}
+
+/// The `playlist show` view and the total length in milliseconds.
+fn playlist_parts(value: &Value) -> (Value, u64) {
     let playlist = value.get("playlist").cloned().unwrap_or(Value::Null);
     let item = Item::from_player_json("playlist", &playlist);
     let tracks: Vec<Item> = value
@@ -731,62 +1059,108 @@ fn playlist_view(value: &Value) -> Value {
         })
         .unwrap_or_default();
     let total_ms: u64 = tracks.iter().filter_map(|t| t.duration_ms).sum();
-    json!({
+    let view = json!({
         "playlist": item,
         "collaborative": playlist.get("collaborative"),
         "owner": playlist.get("owner"),
         "track_count": tracks.len(),
         "duration": silicon_spotify_client::timing::clock(total_ms),
         "tracks": tracks,
-    })
+    });
+    (view, total_ms)
+}
+
+/// `playlist.*` arguments.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PlaylistArgs {
+    id: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    public: bool,
+    collab: bool,
+    items: Vec<SpotifyUri>,
+    from: Option<String>,
+    to: Option<String>,
+    delete: bool,
+    limit: Option<usize>,
 }
 
 async fn playlist(daemon: &Arc<Daemon>, request: &Request, settings: Settings) -> Result<Value> {
-    #[derive(Deserialize, Default)]
-    #[serde(default)]
-    struct A {
-        id: Option<String>,
-        name: Option<String>,
-        description: Option<String>,
-        public: bool,
-        collab: bool,
-        items: Vec<SpotifyUri>,
-        from: Option<String>,
-        to: Option<String>,
-        delete: bool,
-        limit: Option<usize>,
-    }
-    let a: A = args(request)?;
+    let a: PlaylistArgs = args(request)?;
     let op = request.op.clone();
-    let _ = daemon;
+    let d = Arc::clone(daemon);
     blocking(move || {
+        let writes = !matches!(
+            op.as_str(),
+            "playlist.list" | "playlist.show" | "playlist.rename"
+        );
+        let read = (!writes).then(|| d.before_library_read());
+        let result = playlist_op(&settings, &op, &a);
+        drop(read);
+        if writes {
+            d.after_library_write();
+        }
+        result
+    })
+    .await
+}
+
+/// One `playlist.*` op (blocking).
+#[allow(clippy::too_many_lines)]
+fn playlist_op(settings: &Settings, op: &str, a: &PlaylistArgs) -> Result<Value> {
+    {
         let player = settings.authed_player()?;
         let id = |what: &str| -> Result<String> {
-            let raw = a.id.clone().ok_or_else(|| Error::invalid(format!("{what} needs a playlist id."), "List ids with `spotify playlist list`."))?;
+            let raw = a.id.clone().ok_or_else(|| {
+                Error::invalid(
+                    format!("{what} needs a playlist id."),
+                    "List ids with `spotify playlist list`.",
+                )
+            })?;
             Ok(SpotifyUri::parse(&raw, Some(Kind::Playlist))?.id)
         };
-        match op.as_str() {
-            "playlist.list" => library(&settings, "playlists", a.limit),
-            "playlist.show" => Ok(playlist_view(&player.json(&["get", "item", "--id", &id("show")?, "playlist"])?)),
+        match op {
+            "playlist.list" => library(settings, "playlists", a.limit),
+            "playlist.show" => Ok(playlist_view(&read_json(
+                &player,
+                &["get", "item", "--id", &id("show")?, "playlist"],
+            )?)),
             "playlist.create" => {
                 let name = a.name.clone().filter(|n| !n.trim().is_empty()).ok_or_else(|| Error::invalid("A playlist needs a name.", "Example: spotify playlist create 'Deep focus' --description 'no vocals'"))?;
                 let description = a.description.clone().unwrap_or_default();
-                let (id, output) = create_playlist(&player, &name, &description, a.public, a.collab)?;
-                Ok(json!({"created": true, "id": id, "uri": id.as_deref().map(playlist_uri), "name": name, "public": a.public, "collaborative": a.collab, "message": output.stdout}))
+                let (id, output) =
+                    create_playlist(&player, &name, &description, a.public, a.collab)?;
+                Ok(
+                    json!({"created": true, "id": id, "uri": id.as_deref().map(playlist_uri), "name": name, "public": a.public, "collaborative": a.collab, "message": output.stdout}),
+                )
             }
             "playlist.delete" => {
                 let id = id("delete")?;
                 let output = player.run(&["playlist", "delete", &id])?;
                 let unfollowed = !output.stdout.contains("nothing to be done");
-                Ok(json!({"deleted": unfollowed, "id": id, "message": output.stdout,
-                    "note": "Spotify has no hard delete: this unfollows the playlist (it disappears from your library; collaborators and followers keep it)."}))
+                Ok(
+                    json!({"deleted": unfollowed, "id": id, "message": output.stdout,
+                    "note": "Spotify has no hard delete: this unfollows the playlist (it disappears from your library; collaborators and followers keep it)."}),
+                )
             }
             "playlist.add" | "playlist.remove" => {
-                let playlist = id(if op == "playlist.add" { "add" } else { "remove" })?;
+                let playlist = id(if op == "playlist.add" {
+                    "add"
+                } else {
+                    "remove"
+                })?;
                 if a.items.is_empty() {
-                    return Err(Error::invalid("No tracks or albums given.", "Example: spotify playlist add <playlist> spotify:track:<id> spotify:album:<id>"));
+                    return Err(Error::invalid(
+                        "No tracks or albums given.",
+                        "Example: spotify playlist add <playlist> spotify:track:<id> spotify:album:<id>",
+                    ));
                 }
-                let action = if op == "playlist.add" { "add" } else { "delete" };
+                let action = if op == "playlist.add" {
+                    "add"
+                } else {
+                    "delete"
+                };
                 let mut results = Vec::new();
                 for item in &a.items {
                     let flag = match item.kind {
@@ -794,23 +1168,33 @@ async fn playlist(daemon: &Arc<Daemon>, request: &Request, settings: Settings) -
                         Kind::Album => "--album-id",
                         _ => {
                             return Err(Error::unsupported(
-                                format!("{} cannot be added to playlists through spotify_player (tracks and albums only).", item.kind),
+                                format!(
+                                    "{} cannot be added to playlists through spotify_player (tracks and albums only).",
+                                    item.kind
+                                ),
                                 "Pass spotify:track:<id> or spotify:album:<id> items.",
                             ));
                         }
                     };
-                    let output = player.run(&["playlist", "edit", flag, &item.id, action, &playlist])?;
+                    let output =
+                        player.run(&["playlist", "edit", flag, &item.id, action, &playlist])?;
                     results.push(json!({"item": item.uri(), "message": output.stdout}));
                 }
-                Ok(json!({"playlist": format!("spotify:playlist:{playlist}"), "action": action, "results": results}))
+                Ok(
+                    json!({"playlist": format!("spotify:playlist:{playlist}"), "action": action, "results": results}),
+                )
             }
             "playlist.rename" => Err(Error::unsupported(
                 "Renaming or re-describing a playlist is not possible through spotify_player or AppleScript.",
                 "Rename it in the Spotify app. Everything else (create, delete, add, remove, import, fork, sync) works here.",
             )),
             "playlist.import" => {
-                let from = SpotifyUri::parse(a.from.as_deref().unwrap_or_default(), Some(Kind::Playlist))?.id;
-                let to = SpotifyUri::parse(a.to.as_deref().unwrap_or_default(), Some(Kind::Playlist))?.id;
+                let from =
+                    SpotifyUri::parse(a.from.as_deref().unwrap_or_default(), Some(Kind::Playlist))?
+                        .id;
+                let to =
+                    SpotifyUri::parse(a.to.as_deref().unwrap_or_default(), Some(Kind::Playlist))?
+                        .id;
                 let output = import_playlist(&player, &from, &to, a.delete)?;
                 Ok(json!({"imported": true, "from": from, "to": to, "message": output.stdout}))
             }
@@ -819,16 +1203,31 @@ async fn playlist(daemon: &Arc<Daemon>, request: &Request, settings: Settings) -
                 let Some(name) = a.name.clone() else {
                     let output = player.run(&["playlist", "fork", &from])?;
                     let (id, name) = forked_playlist(&output.stdout).unzip();
-                    return Ok(json!({"forked": true, "from": from, "id": id, "uri": id.as_deref().map(playlist_uri), "name": name, "message": output.stdout}));
+                    return Ok(
+                        json!({"forked": true, "from": from, "id": id, "uri": id.as_deref().map(playlist_uri), "name": name, "message": output.stdout}),
+                    );
                 };
                 if name.trim().is_empty() || name.chars().count() > 100 {
-                    return Err(Error::invalid("A playlist name must be 1 to 100 characters.", "Example: spotify playlist fork <playlist-id> --name 'Deep focus (mine)'"));
+                    return Err(Error::invalid(
+                        "A playlist name must be 1 to 100 characters.",
+                        "Example: spotify playlist fork <playlist-id> --name 'Deep focus (mine)'",
+                    ));
                 }
                 // spotify_player cannot name a fork, so do what its fork does under the chosen
                 // name: read the source (so a bad id creates nothing), create, import.
                 let source = player.json(&["get", "item", "--id", &from, "playlist"])?;
-                let description = a.description.clone().or_else(|| source.pointer("/playlist/desc").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
-                let (id, created) = create_playlist(&player, &name, &description, a.public, a.collab)?;
+                let description = a
+                    .description
+                    .clone()
+                    .or_else(|| {
+                        source
+                            .pointer("/playlist/desc")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_default();
+                let (id, created) =
+                    create_playlist(&player, &name, &description, a.public, a.collab)?;
                 let id = id.ok_or_else(|| {
                     Error::new("spotify_player_failed", format!("spotify_player created the playlist '{name}' but did not print its id, so nothing was imported into it."), format!("Find its id with `spotify playlist list`, then run `spotify playlist import {from} <id>`."))
                         .with_details(json!({"stdout": created.stdout}))
@@ -840,26 +1239,33 @@ async fn playlist(daemon: &Arc<Daemon>, request: &Request, settings: Settings) -
                     details: Some(json!({"created": {"id": id, "uri": uri, "name": name}, "cause": error.details})),
                     ..error
                 })?;
-                Ok(json!({"forked": true, "from": from, "id": id, "uri": uri, "name": name, "public": a.public, "collaborative": a.collab,
+                Ok(
+                    json!({"forked": true, "from": from, "id": id, "uri": uri, "name": name, "public": a.public, "collaborative": a.collab,
                     "message": format!("Forked {from}.\nNew playlist: {id}:{name}\n{}", imported.stdout),
-                    "note": "spotify_player cannot name a fork, so this created a playlist with that name and imported the source into it, as its fork does."}))
+                    "note": "spotify_player cannot name a fork, so this created a playlist with that name and imported the source into it, as its fork does."}),
+                )
             }
             "playlist.sync" => {
                 let mut args = vec!["playlist", "sync"];
                 if a.delete {
                     args.push("--delete");
                 }
-                let id = a.id.as_deref().map(|raw| SpotifyUri::parse(raw, Some(Kind::Playlist)).map(|u| u.id)).transpose()?;
+                let id =
+                    a.id.as_deref()
+                        .map(|raw| SpotifyUri::parse(raw, Some(Kind::Playlist)).map(|u| u.id))
+                        .transpose()?;
                 if let Some(id) = &id {
                     args.push(id);
                 }
                 let output = player.run(&args)?;
                 Ok(json!({"synced": true, "id": id, "message": output.stdout}))
             }
-            other => Err(Error::invalid(format!("Unknown playlist op `{other}`."), "Run `spotify playlist --help`.")),
+            other => Err(Error::invalid(
+                format!("Unknown playlist op `{other}`."),
+                "Run `spotify playlist --help`.",
+            )),
         }
-    })
-    .await
+    }
 }
 
 /// `spotify_player playlist new`; returns the new playlist's bare id (when the output names it).
@@ -1015,19 +1421,15 @@ async fn queue_list(daemon: &Arc<Daemon>, settings: Settings) -> Result<Value> {
             .and_then(|p| p.json(&["get", "key", "queue"]))
         {
             Ok(value) => {
-                let items: Vec<Item> = value
-                    .get("queue")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| {
-                                let kind = v.get("type").and_then(Value::as_str).unwrap_or("track");
-                                Item::from_player_json(kind, v)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Ok(json!({"items": items}))
+                let (items, repeats) = spotify_upcoming(&value);
+                let mut upcoming = json!({"items": items});
+                if repeats > 0 {
+                    upcoming["current_repeats_left_out"] = json!(repeats);
+                    upcoming["note"] = json!(format!(
+                        "Spotify listed the item playing now {repeats} more time(s) as upcoming (it does that for an episode played without a context, and with repeat-one); those are left out."
+                    ));
+                }
+                Ok(upcoming)
             }
             Err(error) => Ok(json!({"items": [], "error": error})),
         }
@@ -1042,8 +1444,195 @@ async fn queue_list(daemon: &Arc<Daemon>, settings: Settings) -> Result<Value> {
     }))
 }
 
-/// (name, artists, duration) looked up for a queued item.
+/// Spotify's upcoming items from `get key queue`, without the leading run of the item playing
+/// now (Spotify repeats an episode played without a context ten times there, and a track on
+/// repeat-one), and how many such repeats were left out.
+fn spotify_upcoming(value: &Value) -> (Vec<Item>, usize) {
+    let current = value
+        .get("currently_playing")
+        .and_then(crate::watcher::item_uri);
+    let mut repeats = 0;
+    let mut items = Vec::new();
+    for entry in value
+        .get("queue")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if items.is_empty() && current.is_some() && crate::watcher::item_uri(entry) == current {
+            repeats += 1;
+            continue;
+        }
+        let kind = entry.get("type").and_then(Value::as_str).unwrap_or("track");
+        items.extend(Item::from_player_json(kind, entry));
+    }
+    (items, repeats)
+}
+
+/// (name, artists or show, duration) looked up for a queued item.
 type TrackFacts = (Option<String>, Option<String>, Option<u64>);
+
+/// What a caller already knows about an item it queues (e.g. from the search hit it picked).
+#[derive(Clone, Debug, Default, Deserialize)]
+struct Known {
+    uri: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    by: Option<String>,
+    #[serde(default)]
+    duration_ms: Option<u64>,
+}
+
+/// Why `uri` cannot be queued, with a hint that fits its kind.
+fn not_queueable(uri: &SpotifyUri) -> Error {
+    let article = if matches!(uri.kind, Kind::Album | Kind::Artist) {
+        "an"
+    } else {
+        "a"
+    };
+    let hint = match uri.kind {
+        Kind::Album => {
+            "Play the whole album with `spotify play <uri>`; to queue some of its songs, list them with `spotify track <uri>` and queue those."
+        }
+        Kind::Playlist => {
+            "Play the whole playlist with `spotify play <uri>`; to queue some of its songs, list them with `spotify playlist show <id>` and queue those."
+        }
+        Kind::Artist => {
+            "Play the artist with `spotify play <uri>`; to queue their songs, list the top tracks with `spotify track <uri>` and queue those."
+        }
+        Kind::Show => {
+            "Play the show with `spotify podcast play <uri>`, or queue one of its episodes (find them with `spotify podcast search '<show>' --episodes`)."
+        }
+        Kind::Track | Kind::Episode => "",
+    };
+    Error::invalid(
+        format!(
+            "{} is {article} {}; the queue holds tracks and episodes.",
+            uri.uri(),
+            uri.kind
+        ),
+        hint,
+    )
+}
+
+/// How long one `queue add` may spend looking up episode names in total.
+const EPISODE_LOOKUP_BUDGET: Duration = Duration::from_secs(8);
+
+/// Name, show and length of an episode, which spotify_player cannot look up by id: the Web API
+/// (`GET /v1/episodes/{id}`, see [`web_api_get`]). Any failure leaves the facts out.
+async fn episode_facts(tokens: &[String], id: &str) -> Option<TrackFacts> {
+    let url = format!("https://api.spotify.com/v1/episodes/{id}");
+    let value = web_api_get(tokens, &url, &[], Duration::from_secs(4)).await?;
+    Some(episode_from_web(&value))
+}
+
+/// Until when (unix ms) [`web_api_get`] stays away from the Web API after a rate limit.
+static WEB_API_PAUSED_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long to stay away after a 429: its `Retry-After` in seconds, 30 s without a usable one,
+/// at most 10 minutes (these lookups are niceties; a bogus header must not disable them for long).
+fn rate_limit_pause(retry_after: Option<&str>) -> Duration {
+    let secs = retry_after
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(30);
+    Duration::from_secs(secs.clamp(1, 600))
+}
+
+/// `GET` a Spotify Web API `url` with the access tokens spotify_player keeps in its cache folder
+/// (the warm copy keeps them fresh; see [`cached_access_tokens`]), trying the next token when one
+/// is refused (401/403). `None` on any other status (a rate limit, say), a network error or
+/// after `timeout` per request; nothing is logged or shown. After a rate limit (429) it sends
+/// nothing until the `Retry-After` has passed, so these lookups do not prolong it for
+/// spotify_player, which shares the token's client.
+async fn web_api_get(
+    tokens: &[String],
+    url: &str,
+    query: &[(&str, &str)],
+    timeout: Duration,
+) -> Option<Value> {
+    use std::sync::atomic::Ordering;
+    if silicon_spotify_client::model::now_ms() < WEB_API_PAUSED_UNTIL_MS.load(Ordering::Relaxed) {
+        return None;
+    }
+    silicon_spotify_client::api::ensure_crypto();
+    // The token goes to api.spotify.com only: never follow a redirect with it.
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .build()
+        .ok()?;
+    for token in tokens.iter().take(2) {
+        let mut request = client.get(url).bearer_auth(token);
+        if !query.is_empty() {
+            request = request.query(query);
+        }
+        let response = request.send().await.ok()?;
+        match response.status().as_u16() {
+            200 => return response.json::<Value>().await.ok(),
+            // That token is stale or for a client without the scope: try the next.
+            401 | 403 => {}
+            429 => {
+                let pause = rate_limit_pause(
+                    response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok()),
+                );
+                let until = silicon_spotify_client::model::now_ms()
+                    .saturating_add(u64::try_from(pause.as_millis()).unwrap_or(u64::MAX));
+                WEB_API_PAUSED_UNTIL_MS.fetch_max(until, Ordering::Relaxed);
+                return None;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// (name, show, duration) of a Web API episode object.
+fn episode_from_web(value: &Value) -> TrackFacts {
+    (
+        value.get("name").and_then(Value::as_str).map(str::to_owned),
+        value
+            .pointer("/show/name")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        value.get("duration_ms").and_then(Value::as_u64),
+    )
+}
+
+/// The unexpired Web API access tokens in spotify_player's cache folder, newest first.
+fn cached_access_tokens(player: &SpotifyPlayer) -> Vec<String> {
+    let Some(entries) = player
+        .cache_folder()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+    else {
+        return Vec::new();
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let mut found: Vec<(std::time::SystemTime, String)> = entries
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with("_token.json"))
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            let value: Value = serde_json::from_slice(&std::fs::read(entry.path()).ok()?).ok()?;
+            let expired = value
+                .get("expires_at")
+                .and_then(Value::as_str)
+                .and_then(|at| {
+                    time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+                        .ok()
+                })
+                .is_some_and(|at| at <= now);
+            let token = value.get("access_token")?.as_str()?.to_owned();
+            (!expired).then_some((modified, token))
+        })
+        .collect();
+    found.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    found.into_iter().map(|(_, token)| token).collect()
+}
 
 async fn queue_add(daemon: &Arc<Daemon>, request: &Request, settings: Settings) -> Result<Value> {
     #[derive(Deserialize)]
@@ -1051,6 +1640,9 @@ async fn queue_add(daemon: &Arc<Daemon>, request: &Request, settings: Settings) 
         uris: Vec<SpotifyUri>,
         #[serde(default)]
         next: bool,
+        /// Facts the caller already has (optional).
+        #[serde(default)]
+        known: Vec<Known>,
     }
     let a: A = args(request)?;
     if a.uris.is_empty() {
@@ -1060,28 +1652,29 @@ async fn queue_add(daemon: &Arc<Daemon>, request: &Request, settings: Settings) 
         ));
     }
     for uri in &a.uris {
+        SpotifyUri::new(uri.kind, &uri.id)?;
         if !matches!(uri.kind, Kind::Track | Kind::Episode) {
-            return Err(Error::invalid(
-                format!(
-                    "{} is a {}; the queue holds tracks and episodes.",
-                    uri.uri(),
-                    uri.kind
-                ),
-                "To play a whole album/playlist use `spotify play <uri>`; to queue its tracks, list them with `spotify playlist show <id>` and queue those.",
-            ));
+            return Err(not_queueable(uri));
         }
     }
     let who = request.isi.clone().or_else(|| request.home.clone());
     let uris = a.uris.clone();
-    let details = blocking(move || -> Result<Vec<TrackFacts>> {
-        let player = settings.authed_player().ok();
+    let known = a.known.clone();
+    let player = settings.authed_player().ok();
+    let lookup = player.clone();
+    let mut details = blocking(move || -> Result<Vec<TrackFacts>> {
         Ok(uris
             .iter()
             .map(|uri| {
+                if let Some(k) = known.iter().find(|k| k.uri == uri.uri())
+                    && k.name.is_some()
+                {
+                    return (k.name.clone(), k.by.clone(), k.duration_ms);
+                }
                 if uri.kind != Kind::Track {
                     return (None, None, None);
                 }
-                player
+                lookup
                     .as_ref()
                     .and_then(|p| p.json(&["get", "item", "--id", &uri.id, "track"]).ok())
                     .and_then(|v| Item::from_player_json("track", &v))
@@ -1092,6 +1685,31 @@ async fn queue_add(daemon: &Arc<Daemon>, request: &Request, settings: Settings) 
             .collect())
     })
     .await?;
+    if let Some(player) = player
+        && a.uris
+            .iter()
+            .zip(&details)
+            .any(|(uri, facts)| uri.kind == Kind::Episode && facts.0.is_none())
+    {
+        let tokens = blocking(move || Ok(cached_access_tokens(&player)))
+            .await
+            .unwrap_or_default();
+        // Names are a nicety: on a slow network, stop looking them up rather than hold the
+        // `queue add` (many episodes at 4 s each) near the caller's timeout.
+        let deadline = tokio::time::Instant::now() + EPISODE_LOOKUP_BUDGET;
+        for (uri, facts) in a.uris.iter().zip(details.iter_mut()) {
+            if tokens.is_empty() || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if uri.kind == Kind::Episode
+                && facts.0.is_none()
+                && let Ok(Some(found)) =
+                    tokio::time::timeout_at(deadline, episode_facts(&tokens, &uri.id)).await
+            {
+                *facts = found;
+            }
+        }
+    }
     let added: Vec<QueueItem> = a
         .uris
         .iter()
@@ -1217,6 +1835,292 @@ mod tests {
     use super::*;
 
     const ID: &str = "0NiLR6uUU0Mk0bfN4VRu5u";
+
+    fn track_json(id: &str, name: &str, secs: u64) -> Value {
+        json!({"id": id, "name": name, "type": "track", "artists": [{"name": "A"}], "duration": {"secs": secs, "nanos": 0}})
+    }
+
+    #[test]
+    fn every_kind_of_track_lookup_shares_the_envelope() {
+        let playlist = json!({
+            "playlist": {"id": ID, "name": "Deep focus", "owner": ["someone", "id"], "collaborative": false, "desc": "calm"},
+            "tracks": [track_json("4uLU6hMCjMI75M1A2tKUQC", "One", 200), track_json("5uLU6hMCjMI75M1A2tKUQC", "Two", 100)],
+        });
+        let out = item_envelope("playlist", playlist.clone());
+        assert_eq!(out["kind"], json!("playlist"));
+        assert_eq!(out["item"]["name"], json!("Deep focus"));
+        assert_eq!(out["item"]["uri"], json!(format!("spotify:playlist:{ID}")));
+        assert_eq!(out["raw"], playlist);
+        // What `playlist show` reports is kept.
+        assert_eq!(out["track_count"], json!(2));
+        assert_eq!(out["duration_ms"], json!(300_000));
+        assert_eq!(out["duration"], json!("5:00"));
+        assert_eq!(out["collaborative"], json!(false));
+        assert_eq!(out["tracks"][1]["name"], json!("Two"));
+        assert_eq!(out["playlist"]["name"], json!("Deep focus"));
+        let track = item_envelope("track", track_json(ID, "One", 200));
+        for key in ["kind", "item", "raw"] {
+            assert!(!out[key].is_null() && !track[key].is_null(), "{key}");
+        }
+        // `playlist show` keeps its own shape.
+        let show = playlist_view(&playlist);
+        assert!(show.get("kind").is_none() && show.get("raw").is_none());
+        assert_eq!(show["track_count"], json!(2));
+    }
+
+    #[test]
+    fn reads_wait_out_spotify_players_shared_responses_after_a_write() {
+        let now = Instant::now();
+        assert_eq!(settle_delay(None, now), None);
+        let delay = settle_delay(Some(now), now + Duration::from_millis(100));
+        assert_eq!(delay, Some(LIBRARY_SETTLE - Duration::from_millis(100)));
+        assert_eq!(settle_delay(Some(now), now + LIBRARY_SETTLE), None);
+    }
+
+    #[test]
+    fn a_read_in_flight_during_a_write_counts_as_one_when_it_finishes() {
+        let ms = Duration::from_millis;
+        let start = Instant::now();
+        let mut settle = LibrarySettle::default();
+        assert_eq!(settle.delay(start), None);
+        // A read starts, a write finishes while it is in flight, the read finishes 400 ms later.
+        settle.reads += 1;
+        settle.wrote(start + ms(100));
+        settle.read_finished(start + ms(500));
+        // spotify_player may share that read's (older) response until 1 s after it completed.
+        assert_eq!(
+            settle.delay(start + ms(1_200)),
+            Some(LIBRARY_SETTLE - ms(700))
+        );
+        assert_eq!(settle.delay(start + ms(500) + LIBRARY_SETTLE), None);
+        // Reads that overlap no write change nothing.
+        settle.reads += 1;
+        settle.read_finished(start + ms(5_000));
+        assert_eq!(settle.delay(start + ms(5_000)), None);
+        // Two overlapping reads: the later one to finish counts.
+        settle.reads += 2;
+        settle.wrote(start + ms(6_000));
+        settle.read_finished(start + ms(6_100));
+        settle.read_finished(start + ms(6_300));
+        assert_eq!(settle.delay(start + ms(6_300)), Some(LIBRARY_SETTLE));
+        assert_eq!(settle.reads, 0);
+        assert!(!settle.overlapped);
+    }
+
+    #[test]
+    fn upcoming_leaves_out_repeats_of_the_current_item() {
+        let episode = |id: &str| json!({"id": id, "type": "episode", "name": "Ep", "duration": {"secs": 60, "nanos": 0}});
+        let current = "4IzpgR6RCEkRqMHbJF38Wp";
+        let repeated = json!({
+            "currently_playing": episode(current),
+            "queue": (0..10).map(|_| episode(current)).collect::<Vec<_>>(),
+        });
+        let (items, repeats) = spotify_upcoming(&repeated);
+        assert!(items.is_empty());
+        assert_eq!(repeats, 10);
+        // A normal queue is untouched, including a later repeat of the current track.
+        let normal = json!({
+            "currently_playing": track_json(ID, "Now", 100),
+            "queue": [track_json("4uLU6hMCjMI75M1A2tKUQC", "Next", 100), track_json(ID, "Now", 100)],
+        });
+        let (items, repeats) = spotify_upcoming(&normal);
+        assert_eq!(repeats, 0);
+        assert_eq!(
+            items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            vec!["Next", "Now"]
+        );
+        assert_eq!(items[0].kind, "track");
+    }
+
+    #[test]
+    fn unqueueable_items_are_named_with_the_right_article_and_hint() {
+        let error = |kind: Kind| not_queueable(&SpotifyUri::new(kind, ID).expect("uri"));
+        let album = error(Kind::Album);
+        assert!(album.message.contains("is an album;"), "{}", album.message);
+        assert!(album.hint.contains("spotify play"));
+        assert!(error(Kind::Artist).message.contains("is an artist;"));
+        assert!(error(Kind::Playlist).message.contains("is a playlist;"));
+        let show = error(Kind::Show);
+        assert!(show.message.contains("is a show;"));
+        assert!(show.hint.contains("spotify podcast play"));
+        assert_eq!(album.code, "invalid_input");
+    }
+
+    /// Spotify.app playing `uri` (every script answers with its status).
+    struct Playing(String);
+
+    impl Runner for Playing {
+        fn run(&self, _source: &str) -> Result<String> {
+            let s = applescript::SEP;
+            Ok(format!(
+                "ok{s}playing{s}50{s}false{s}false{s}60000{s}{}{s}Song{s}A{s}Album{s}A{s}200000{s}1{s}1{s}0{s}{s}{s}true{s}true",
+                self.0
+            ))
+        }
+    }
+
+    fn daemon_playing(uri: &str) -> Daemon {
+        Daemon {
+            db: Db::open(std::path::Path::new(":memory:")).expect("db"),
+            dir: std::env::temp_dir(),
+            script: Arc::new(Playing(uri.to_owned())),
+            started_at: String::new(),
+            started: Instant::now(),
+            live: Mutex::default(),
+            observe_lock: Mutex::new(()),
+            hand_off: Mutex::new(()),
+            library: Mutex::default(),
+            nudge: Notify::new(),
+            deliver: Notify::new(),
+            events: broadcast::channel(4).0,
+            settings: Mutex::default(),
+            warm: Mutex::new(Value::Null),
+            warm_pid: std::sync::atomic::AtomicU32::new(0),
+            update: Mutex::new(Value::Null),
+            shutdown: Notify::new(),
+        }
+    }
+
+    fn outcome_on(daemon: &Daemon) -> Result<silicon_spotify_client::control::Outcome> {
+        Ok(silicon_spotify_client::control::Outcome {
+            action: "play".into(),
+            via: silicon_spotify_client::control::Via::Applescript,
+            fallback: None,
+            result: None,
+            playback: daemon.read()?,
+        })
+    }
+
+    #[test]
+    fn explicit_changes_keep_the_managed_item_only_while_it_plays() {
+        let managed = format!("spotify:track:{ID}");
+        let other = "spotify:track:4uLU6hMCjMI75M1A2tKUQC";
+        let failed = || Err(Error::new("verification_failed", "no", "retry"));
+        // A failed change that left the managed item playing keeps it managed.
+        let daemon = daemon_playing(&managed);
+        daemon.live().queue.managed_now = Some(managed.clone());
+        assert!(explicit_change(&daemon, |_| failed()).is_err());
+        assert_eq!(daemon.live().queue.managed_now.as_deref(), Some(&*managed));
+        // So does a `previous` that restarted it.
+        let restarted = explicit_change(&daemon, outcome_on).expect("restart");
+        assert_eq!(restarted["playback"]["track"]["uri"], json!(managed));
+        assert_eq!(daemon.live().queue.managed_now.as_deref(), Some(&*managed));
+        // Anything else playing now is the user's, not the queue's.
+        let daemon = daemon_playing(other);
+        daemon.live().queue.managed_now = Some(managed.clone());
+        assert!(explicit_change(&daemon, |_| failed()).is_err());
+        assert_eq!(daemon.live().queue.managed_now, None);
+        daemon.live().queue.managed_now = Some(managed);
+        explicit_change(&daemon, outcome_on).expect("play");
+        assert_eq!(daemon.live().queue.managed_now, None);
+    }
+
+    #[test]
+    fn a_slow_explicit_change_reopens_the_hold_and_drops_a_hand_off_decided_meanwhile() {
+        let daemon = daemon_playing("spotify:track:4uLU6hMCjMI75M1A2tKUQC");
+        let claim = crate::queue::Pending {
+            uri: format!("spotify:track:{ID}"),
+            since_ms: 1,
+            sent: false,
+        };
+        let changed = explicit_change(&daemon, |d| {
+            // The change outlasted the hold, and the watcher decided on a hand-off meanwhile.
+            let mut live = d.live();
+            live.queue.hold_until_ms = 0;
+            live.queue.pending = Some(claim.clone());
+            drop(live);
+            outcome_on(d)
+        });
+        assert!(changed.is_ok());
+        let mut live = daemon.live();
+        assert!(live.queue.hold_until_ms > silicon_spotify_client::model::now_ms());
+        // The watcher finds its claim gone and sends nothing.
+        assert!(!live.queue.send_claimed(&claim));
+        drop(live);
+        // A failed change does not reopen the hold.
+        daemon.live().queue.hold_until_ms = 0;
+        let failed = explicit_change(&daemon, |d| {
+            d.live().queue.hold_until_ms = 0;
+            Err(Error::new("verification_failed", "no", "retry"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(daemon.live().queue.hold_until_ms, 0);
+    }
+
+    #[test]
+    fn liked_comes_from_the_contains_answer_for_one_song() {
+        assert_eq!(liked_from_web(&json!([true])), Some(true));
+        assert_eq!(liked_from_web(&json!([false])), Some(false));
+        // Anything else (an error body, several answers) leaves `liked` out.
+        for other in [
+            json!([]),
+            json!([true, false]),
+            json!(["yes"]),
+            json!({"error": {"status": 429}}),
+            Value::Null,
+        ] {
+            assert_eq!(liked_from_web(&other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn rate_limits_pause_web_api_lookups_for_their_retry_after() {
+        assert_eq!(rate_limit_pause(Some("7")), Duration::from_secs(7));
+        assert_eq!(rate_limit_pause(Some(" 12 ")), Duration::from_secs(12));
+        // No usable header: a default pause; a bogus one is capped.
+        assert_eq!(rate_limit_pause(None), Duration::from_secs(30));
+        assert_eq!(
+            rate_limit_pause(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            Duration::from_secs(30)
+        );
+        assert_eq!(rate_limit_pause(Some("86400")), Duration::from_secs(600));
+        assert_eq!(rate_limit_pause(Some("0")), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn only_transient_read_failures_are_retried() {
+        let transport = silicon_spotify_client::player::classify(
+            "error sending request for url (https://api.spotify.com/v1/me/tracks?offset=450)",
+            "",
+            &["get", "key", "user-liked-tracks"],
+        );
+        assert_eq!(transport.code, "transport");
+        assert!(retry_read(&transport));
+        let busy = silicon_spotify_client::player::classify(
+            "Address already in use",
+            "",
+            &["get", "key", "user-playlists"],
+        );
+        assert!(retry_read(&busy));
+        let limited = silicon_spotify_client::player::classify(
+            "429 Too Many Requests",
+            "",
+            &["get", "key", "user-liked-tracks"],
+        );
+        assert!(limited.retryable && !retry_read(&limited));
+        let missing = silicon_spotify_client::player::classify(
+            "404 not found",
+            "",
+            &["get", "item", "--id", ID, "playlist"],
+        );
+        assert!(!retry_read(&missing));
+        let slow = Error::new("timeout", "slow", "retry").retryable();
+        assert!(!retry_read(&slow));
+    }
+
+    #[test]
+    fn episodes_are_described_from_the_web_api() {
+        let value = json!({"id": ID, "name": "How to Speak Clearly", "duration_ms": 7_320_000, "show": {"name": "Huberman Lab"}});
+        assert_eq!(
+            episode_from_web(&value),
+            (
+                Some("How to Speak Clearly".into()),
+                Some("Huberman Lab".into()),
+                Some(7_320_000)
+            )
+        );
+        assert_eq!(episode_from_web(&json!({})), (None, None, None));
+    }
 
     #[test]
     fn created_playlist_ids_are_bare_whatever_spotify_player_prints() {

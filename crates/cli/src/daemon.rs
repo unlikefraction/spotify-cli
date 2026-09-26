@@ -1,7 +1,7 @@
 //! Talking to, starting and installing `spotify-daemon`.
 
 use std::fs::OpenOptions;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -81,7 +81,12 @@ pub async fn ensure(ctx: &Ctx) -> Result<()> {
         Ok(_) => Ok(()),
         // An older daemon speaking another protocol version answers with protocol_mismatch.
         Err(error) if error.code == "protocol_mismatch" => replace(ctx, &json!({})).await,
-        Err(error) if error.code == "daemon_unavailable" => start().await.map(drop),
+        Err(error) if error.code == "daemon_unavailable" => match start().await {
+            // The launchd agent can still point at an older install: replace what it started.
+            Ok(started) if older(&started["status"]) => replace(ctx, &started["status"]).await,
+            Err(error) if error.code == "protocol_mismatch" => replace(ctx, &json!({})).await,
+            other => other.map(drop),
+        },
         Err(error) => Err(error),
     }
 }
@@ -104,8 +109,7 @@ async fn replace(ctx: &Ctx, status: &Value) -> Result<()> {
         .and_then(Value::as_str)
         .unwrap_or("an older version");
     ctx.hint(&format!("Restarting spotify-daemon {running} → {VERSION}."));
-    stop().await?;
-    start().await?;
+    let restarted = restart().await;
     let still_older = probe().await.map_or(true, |s| older(&s));
     if still_older {
         // The launchd agent may point at an older install: re-point it at this CLI's daemon.
@@ -113,6 +117,12 @@ async fn replace(ctx: &Ctx, status: &Value) -> Result<()> {
             let _ = stop().await;
             install()?;
             start().await?;
+        } else if let Err(error) = restarted
+            && error.code != "protocol_mismatch"
+        {
+            // Why the restart failed (stuck, missing binary, did not come up) says more than
+            // `daemon_outdated`.
+            return Err(error);
         }
         if probe().await.map_or(true, |s| older(&s)) {
             return Err(Error::new(
@@ -183,6 +193,84 @@ fn launchctl(args: &[&str]) -> std::io::Result<std::process::Output> {
         .output()
 }
 
+fn launchctl_ok(args: &[&str]) -> bool {
+    launchctl(args).is_ok_and(|o| o.status.success())
+}
+
+/// The agent's launchd service target, `gui/<uid>/<label>`.
+fn service() -> String {
+    format!("gui/{}/{LABEL}", uid())
+}
+
+/// `launchctl print` of the agent, when launchd has it loaded. A booted-out job stays loaded until
+/// its process has exited, and loading it again before then fails (`bootstrap` error 5).
+fn launchd_job() -> Option<String> {
+    launchctl(&["print", &service()])
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// The pid of the job's running process in `launchctl print` output (none while it is stopped).
+fn job_pid(print: &str) -> Option<u64> {
+    print
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pid = "))
+        .and_then(|pid| pid.trim().parse().ok())
+}
+
+/// Loads the agent when launchd does not have it, else starts it if it is not running (a no-op
+/// for a running job). Failures show as the daemon not coming up.
+fn launchd_start() {
+    if launchd_job().is_some() {
+        let _ = launchctl(&["kickstart", &service()]);
+    } else if let Some(plist) = plist_path() {
+        let _ = launchctl(&[
+            "bootstrap",
+            &format!("gui/{}", uid()),
+            &plist.to_string_lossy(),
+        ]);
+    }
+}
+
+/// How long `start` and `restart` wait for the daemon to answer: launchd holds a respawn back
+/// until the previous instance has run for ThrottleInterval (10 s).
+const START_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Waits for a daemon other than `old_pid` to answer.
+async fn wait_for_new(old_pid: Option<u64>, via: &str) -> Result<Value> {
+    let deadline = Instant::now() + START_TIMEOUT;
+    let mut next_nudge = Instant::now() + Duration::from_secs(1);
+    loop {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        match probe().await {
+            Ok(status)
+                if old_pid.is_none() || status.get("pid").and_then(Value::as_u64) != old_pid =>
+            {
+                return Ok(status);
+            }
+            // Up, but an older release: the caller replaces it.
+            Err(error) if error.code == "protocol_mismatch" => return Err(error),
+            _ => {}
+        }
+        let now = Instant::now();
+        if via == "launchd" && now >= next_nudge {
+            // A job booted out a moment ago is still leaving (bootstrap fails until it has), and
+            // a job whose last run was short waits out its throttle: keep asking.
+            launchd_start();
+            next_nudge = now + Duration::from_secs(1);
+        }
+        if now > deadline {
+            let tail = tail(20).unwrap_or_default();
+            return Err(Error::daemon_unavailable(format!(
+                "spotify-daemon did not come up within {} s (started via {via}).",
+                START_TIMEOUT.as_secs()
+            ))
+            .with_details(json!({"log_tail": tail})));
+        }
+    }
+}
+
 /// Starts the daemon (launchd when installed, else detached) and waits for its socket.
 ///
 /// # Errors
@@ -196,90 +284,84 @@ pub async fn start() -> Result<Value> {
         .map_err(|e| Error::daemon_unavailable(format!("Cannot create {}: {e}.", dir.display())))?;
     let installed = plist_path().is_some_and(|p| p.is_file());
     let via = if installed {
-        let target = format!("gui/{}/{LABEL}", uid());
-        let kick = launchctl(&["kickstart", &target]);
-        if !kick.as_ref().is_ok_and(|o| o.status.success()) {
-            // Not loaded (e.g. after `launchctl bootout`): load it.
-            if let Some(plist) = plist_path() {
-                let _ = launchctl(&[
-                    "bootstrap",
-                    &format!("gui/{}", uid()),
-                    &plist.to_string_lossy(),
-                ]);
-            }
-        }
+        launchd_start();
         "launchd"
     } else {
-        let binary = daemon_binary()?;
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path()?)
-            .map_err(|e| Error::daemon_unavailable(format!("Cannot open the daemon log: {e}.")))?;
-        let err = log
-            .try_clone()
-            .map_err(|e| Error::daemon_unavailable(e.to_string()))?;
-        let mut command = Command::new(&binary);
-        command
-            .stdin(Stdio::null())
-            .stdout(log)
-            .stderr(err)
-            .current_dir(&dir);
-        // The daemon serves every home: it must not inherit one caller's home, plane or backend.
-        for key in [
-            "SILICON_HOME",
-            "NOTIFY_SOCKET",
-            "SPOTIFY_TEST_APP_SECRET",
-            "SPOTIFY_API_URL",
-            "ISI",
-        ] {
-            command.env_remove(key);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-            command.process_group(0);
-        }
-        command.spawn().map_err(|e| {
-            Error::daemon_unavailable(format!("Cannot start {}: {e}.", binary.display()))
-        })?;
+        spawn(&dir)?;
         "spawn"
     };
-    let deadline = Instant::now() + Duration::from_secs(12);
-    loop {
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        if let Ok(status) = probe().await {
-            return Ok(json!({"started": true, "via": via, "status": status}));
-        }
-        if Instant::now() > deadline {
-            let tail = tail(20).unwrap_or_default();
-            return Err(Error::daemon_unavailable(format!(
-                "spotify-daemon did not come up within 12 s (started via {via})."
-            ))
-            .with_details(json!({"log_tail": tail})));
-        }
-    }
+    let status = wait_for_new(None, via).await?;
+    Ok(json!({"started": true, "via": via, "status": status}))
 }
 
-/// Asks the daemon to stop and waits for its socket to disappear.
-///
-/// # Errors
-/// When it refuses to stop.
-pub async fn stop() -> Result<Value> {
-    // A launchd KeepAlive agent would restart it; stop the job instead.
-    if plist_path().is_some_and(|p| p.is_file()) {
-        let _ = launchctl(&["bootout", &format!("gui/{}/{LABEL}", uid())]);
+/// Starts the daemon as a detached process (no launchd agent).
+fn spawn(dir: &Path) -> Result<()> {
+    let binary = daemon_binary()?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path()?)
+        .map_err(|e| Error::daemon_unavailable(format!("Cannot open the daemon log: {e}.")))?;
+    let err = log
+        .try_clone()
+        .map_err(|e| Error::daemon_unavailable(e.to_string()))?;
+    let mut command = Command::new(&binary);
+    command
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(err)
+        .current_dir(dir);
+    // The daemon serves every home: it must not inherit one caller's home, plane or backend.
+    for key in [
+        "SILICON_HOME",
+        "NOTIFY_SOCKET",
+        "SPOTIFY_TEST_APP_SECRET",
+        "SPOTIFY_API_URL",
+        "ISI",
+    ] {
+        command.env_remove(key);
     }
-    if probe().await.is_err() {
-        return Ok(json!({"stopped": true, "was_running": false}));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
     }
+    command.spawn().map_err(|e| {
+        Error::daemon_unavailable(format!("Cannot start {}: {e}.", binary.display()))
+    })?;
+    Ok(())
+}
+
+/// Asks a daemon to shut down cleanly (it stops its warm spotify_player first).
+async fn request_shutdown() {
     let _ = ipc::call(
         &request(None, "daemon.shutdown", json!({})),
         Duration::from_secs(5),
     )
     .await;
+}
+
+/// Asks the daemon to stop and waits for its socket to disappear and, for the launchd agent, for
+/// launchd to let go of the job (until then it cannot be started again).
+///
+/// # Errors
+/// When it refuses to stop.
+pub async fn stop() -> Result<Value> {
+    let was_running = probe().await.is_ok();
+    // A launchd KeepAlive agent would restart it; stop the job instead (even when its plist is
+    // gone: the loaded job still restarts it). `bootout` returns before the process has exited.
+    let was_loaded = launchd_job().is_some();
+    if was_loaded {
+        let _ = launchctl(&["bootout", &service()]);
+    }
+    if !was_running && !was_loaded {
+        return Ok(json!({"stopped": true, "was_running": false}));
+    }
+    if probe().await.is_ok() {
+        request_shutdown().await;
+    }
     let deadline = Instant::now() + Duration::from_secs(10);
-    while probe().await.is_ok() {
+    while probe().await.is_ok() || (was_loaded && launchd_job().is_some()) {
         if Instant::now() > deadline {
             return Err(Error::new(
                 "daemon_stuck",
@@ -289,7 +371,54 @@ pub async fn stop() -> Result<Value> {
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    Ok(json!({"stopped": true, "was_running": true}))
+    Ok(json!({"stopped": true, "was_running": was_running}))
+}
+
+/// Stops the running daemon and starts a new one. With the launchd agent loaded, launchd itself
+/// restarts the job (`kickstart -k`: SIGTERM, which the daemon handles like `daemon.shutdown`,
+/// then a new process once the old one has exited), so the agent stays loaded; `bootout` then
+/// `bootstrap` would race the exiting process and leave the agent unloaded.
+///
+/// # Errors
+/// `daemon_stuck` or `daemon_unavailable`.
+pub async fn restart() -> Result<Value> {
+    let before = probe().await.ok();
+    let old_pid = before
+        .as_ref()
+        .and_then(|s| s.get("pid"))
+        .and_then(Value::as_u64);
+    let installed = plist_path().is_some_and(|p| p.is_file());
+    if let Some(job) = launchd_job().filter(|_| installed) {
+        if old_pid.is_some() && old_pid != job_pid(&job) {
+            // A daemon started outside launchd holds the single-instance lock: stop it first.
+            request_shutdown().await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while probe()
+                .await
+                .is_ok_and(|s| s.get("pid").and_then(Value::as_u64) == old_pid)
+            {
+                if Instant::now() > deadline {
+                    return Err(Error::new(
+                        "daemon_stuck",
+                        "spotify-daemon did not stop within 10 s.",
+                        "Find it with `pgrep -fl spotify-daemon` and kill it.",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+        if launchctl_ok(&["kickstart", "-k", &service()]) {
+            let status = wait_for_new(old_pid, "launchd").await?;
+            return Ok(
+                json!({"restarted": true, "started": true, "via": "launchd", "previous_pid": old_pid, "status": status}),
+            );
+        }
+    }
+    stop().await?;
+    let mut value = start().await?;
+    value["restarted"] = json!(true);
+    value["previous_pid"] = json!(old_pid);
+    Ok(value)
 }
 
 fn tail(lines: usize) -> Result<Vec<String>> {
@@ -351,8 +480,15 @@ fn install() -> Result<Value> {
     std::fs::write(&plist, content)
         .map_err(|e| Error::internal(format!("cannot write {}: {e}", plist.display())))?;
     let domain = format!("gui/{}", uid());
-    let _ = launchctl(&["bootout", &format!("{domain}/{LABEL}")]);
-    let _ = launchctl(&["enable", &format!("{domain}/{LABEL}")]);
+    if launchd_job().is_some() {
+        let _ = launchctl(&["bootout", &service()]);
+        // Loading it again fails until the old process has exited and launchd let go of it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while launchd_job().is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+    let _ = launchctl(&["enable", &service()]);
     let output = launchctl(&["bootstrap", &domain, &plist.to_string_lossy()])
         .map_err(|e| Error::internal(format!("launchctl failed: {e}")))?;
     if !output.status.success() {
@@ -409,11 +545,11 @@ pub async fn command(ctx: &Ctx, action: DaemonCommand) -> Result<()> {
             }
         }
         DaemonCommand::Restart => {
-            stop().await?;
-            let value = start().await?;
+            let value = restart().await?;
             ctx.emit(&value, |v| {
                 format!(
-                    "spotify-daemon restarted (pid {}, v{}).",
+                    "spotify-daemon restarted via {} (pid {}, v{}).",
+                    v["via"].as_str().unwrap_or("?"),
                     v["status"]["pid"],
                     v["status"]["version"].as_str().unwrap_or("?")
                 )
@@ -509,5 +645,18 @@ pub fn record_telemetry(ctx: &Ctx, event: silicon_spotify_client::telemetry::Eve
         .build()
     {
         let _ = runtime.block_on(ipc::call(&request, Duration::from_millis(800)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::job_pid;
+
+    #[test]
+    fn launchd_job_pid_is_read_from_launchctl_print() {
+        let running = "gui/501/com.unlikefraction.spotify.daemon = {\n\tactive count = 1\n\tpath = /Users/x/Library/LaunchAgents/com.unlikefraction.spotify.daemon.plist\n\ttype = LaunchAgent\n\tstate = running\n\n\tprogram = /Users/x/.local/bin/spotify-daemon\n\tpid = 4242\n\timmediate reason = speculative\n}\n";
+        assert_eq!(job_pid(running), Some(4242));
+        let waiting = "gui/501/com.unlikefraction.spotify.daemon = {\n\tactive count = 0\n\tstate = not running\n\tlast exit code = 1\n}\n";
+        assert_eq!(job_pid(waiting), None);
     }
 }

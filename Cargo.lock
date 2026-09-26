@@ -1783,7 +1783,7 @@ dependencies = [
 
 [[package]]
 name = "silicon-spotify"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1817,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "silicon-spotify-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "silicon-spotify-client"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "blake3",
  "libc",
@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "silicon-spotify-daemon"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "block2",

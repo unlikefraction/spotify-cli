@@ -8,6 +8,38 @@ fn s<'a>(v: &'a Value, pointer: &str) -> &'a str {
     v.pointer(pointer).and_then(Value::as_str).unwrap_or("")
 }
 
+/// `text` on one line: every run of whitespace and control characters (newlines, tabs, the
+/// Unicode line and paragraph separators) becomes one space. Spotify names can contain line
+/// breaks, which would break the list layout; --json keeps them as they are.
+pub(crate) fn one_line(text: &str) -> String {
+    text.split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A name (or other Spotify-provided text) at `pointer`, on one line.
+fn name(v: &Value, pointer: &str) -> String {
+    one_line(s(v, pointer))
+}
+
+/// `name — by`, without a dangling separator when `by` is empty (podcast episodes have no artist).
+fn titled(title: &str, by: &str) -> String {
+    if by.is_empty() {
+        title.to_owned()
+    } else {
+        format!("{title} — {by}")
+    }
+}
+
+/// `liked: yes|no` when the value says whether the song is in Liked Songs.
+fn liked(v: &Value) -> Option<&'static str> {
+    ["/liked", "/track/liked", "/item/liked"]
+        .iter()
+        .find_map(|p| v.pointer(p).and_then(Value::as_bool))
+        .map(|liked| if liked { "yes" } else { "no" })
+}
+
 fn state_icon(state: &str) -> &'static str {
     match state {
         "playing" => "▶",
@@ -44,12 +76,11 @@ pub fn playback(p: &Value) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{} {} — {}",
+        "{} {}",
         state_icon(state),
-        s(p, "/track/name"),
-        s(p, "/track/artist")
+        titled(&name(p, "/track/name"), &name(p, "/track/artist"))
     );
-    let album = s(p, "/track/album");
+    let album = name(p, "/track/album");
     if !album.is_empty() {
         let _ = writeln!(out, "  {album}");
     }
@@ -61,7 +92,7 @@ pub fn playback(p: &Value) -> String {
         bar(progress, 24),
         s(p, "/position"),
         s(p, "/track/duration"),
-        silicon_spotify_client::timing::clock(remaining)
+        silicon_spotify_client::timing::clock_rounded(remaining)
     );
     let mut flags = Vec::new();
     if let Some(v) = p.get("volume").and_then(Value::as_u64) {
@@ -70,7 +101,15 @@ pub fn playback(p: &Value) -> String {
     if p.get("shuffling").and_then(Value::as_bool) == Some(true) {
         flags.push("shuffle".into());
     }
-    match p.pointer("/web/repeat_state").and_then(Value::as_str) {
+    // Web API facts that could not be matched to what Spotify.app plays now (`web.stale`).
+    let stale = p.pointer("/web/stale").and_then(Value::as_bool) == Some(true);
+    // Spotify.app's own flag is current; the Web API's mode tells repeat-one apart when fresh.
+    let web_repeat = if stale {
+        None
+    } else {
+        p.pointer("/web/repeat_state").and_then(Value::as_str)
+    };
+    match web_repeat {
         Some("track") => flags.push("repeat one".into()),
         Some("context") => flags.push("repeat".into()),
         _ if p.get("repeating").and_then(Value::as_bool) == Some(true) => {
@@ -82,7 +121,10 @@ pub fn playback(p: &Value) -> String {
         flags.push(format!("from {ctx}"));
     }
     if let Some(device) = p.pointer("/web/device/name").and_then(Value::as_str) {
-        flags.push(format!("on {device}"));
+        flags.push(format!("on {}", one_line(device)));
+    }
+    if stale {
+        flags.push("web data out of date".into());
     }
     if !flags.is_empty() {
         let _ = writeln!(out, "  {}", flags.join(" · "));
@@ -121,16 +163,27 @@ pub fn status(v: &Value) -> String {
 /// A control outcome (`via`, `fallback`, resulting playback).
 #[must_use]
 pub fn outcome(v: &Value) -> String {
+    // A `next` that skipped a managed item whose hand-off was still in flight.
+    let skipped = v
+        .get("skipped")
+        .and_then(Value::as_str)
+        .map(|uri| format!("\n  skipped {uri} (it was still being switched to)"))
+        .unwrap_or_default();
     if v.get("source").and_then(Value::as_str) == Some("managed_queue") {
         return format!(
-            "▶ Next from the managed queue: {} ({} left in queue)",
-            v.pointer("/playing/name")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| s(v, "/playing/uri")),
+            "▶ Next from the managed queue: {} ({} left in queue){skipped}",
+            queue_item_label(&v["playing"]),
             v["queue_remaining"]
         );
     }
-    let mut out = playback(&v["playback"]);
+    // What `previous` did: it restarts the item from 3 s in, else goes to the one before.
+    let mut out = match v.get("result").and_then(Value::as_str) {
+        Some("restarted") => "Back to the start of this item.\n".to_owned(),
+        Some("previous_item") => "Back to the previous item.\n".to_owned(),
+        Some(other) => format!("{}.\n", other.replace('_', " ")),
+        None => String::new(),
+    };
+    out.push_str(&playback(&v["playback"]));
     let via = s(v, "/via");
     let _ = write!(out, "\n  via {via}");
     if let Some(reason) = v.pointer("/fallback/reason") {
@@ -141,7 +194,22 @@ pub fn outcome(v: &Value) -> String {
             s(reason, "/message")
         );
     }
+    out.push_str(&skipped);
     out
+}
+
+/// `spotify launch`.
+#[must_use]
+pub fn launched(v: &Value) -> String {
+    match v.get("already_running").and_then(Value::as_bool) {
+        Some(true) => "Spotify.app was already running.".into(),
+        Some(false) if v.get("launched").and_then(Value::as_bool) == Some(true) => {
+            "Started Spotify.app (hidden).".into()
+        }
+        // A daemon from before `already_running` (0.1.2 and older) always answers
+        // `launched: true`, also when Spotify.app was running, so it cannot tell.
+        _ => "Spotify.app is running.".into(),
+    }
 }
 
 /// `3 tracks`, `1 track`.
@@ -159,6 +227,7 @@ fn names(item: &Value) -> String {
         .map(|b| {
             b.iter()
                 .filter_map(Value::as_str)
+                .map(one_line)
                 .collect::<Vec<_>>()
                 .join(", ")
         })
@@ -192,11 +261,7 @@ fn numbered(out: &mut String, items: &[Value], max: usize) {
 /// `spotify track spotify:album:…`.
 fn album(v: &Value) -> String {
     let item = &v["item"];
-    let mut out = s(item, "/name").to_owned();
-    let by = names(item);
-    if !by.is_empty() {
-        let _ = write!(out, " — {by}");
-    }
+    let mut out = titled(&name(item, "/name"), &names(item));
     let mut facts = Vec::new();
     if let Some(kind) = item.get("album_type").and_then(Value::as_str) {
         facts.push(kind.to_owned());
@@ -217,12 +282,13 @@ fn album(v: &Value) -> String {
 /// `spotify track spotify:artist:…`.
 fn artist(v: &Value) -> String {
     let item = &v["item"];
-    let mut out = format!("{}\n  {}", s(item, "/name"), s(item, "/uri"));
-    let genres: Vec<&str> = v["genres"]
+    let mut out = format!("{}\n  {}", name(item, "/name"), s(item, "/uri"));
+    let genres: Vec<String> = v["genres"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
+        .map(one_line)
         .collect();
     if !genres.is_empty() {
         let _ = write!(out, "\n  genres: {}", genres.join(", "));
@@ -248,11 +314,12 @@ fn artist(v: &Value) -> String {
             numbered(&mut out, &items, max);
         }
     }
-    let related: Vec<&str> = v["related_artists"]
+    let related: Vec<String> = v["related_artists"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|a| a.get("name").and_then(Value::as_str))
+        .map(one_line)
         .take(10)
         .collect();
     if !related.is_empty() {
@@ -274,13 +341,12 @@ pub fn track(v: &Value) -> String {
     }
     if let Some(item) = v.get("item").filter(|i| !i.is_null()) {
         let mut out = format!(
-            "{} — {}\n  {}",
-            s(item, "/name"),
-            names(item),
+            "{}\n  {}",
+            titled(&name(item, "/name"), &names(item)),
             s(item, "/uri")
         );
         if let Some(album) = item.get("album").and_then(Value::as_str) {
-            let _ = write!(out, "\n  album: {album}");
+            let _ = write!(out, "\n  album: {}", one_line(album));
         }
         if let Some(d) = item.get("duration").and_then(Value::as_str) {
             let _ = write!(out, "\n  length: {d}");
@@ -288,14 +354,22 @@ pub fn track(v: &Value) -> String {
         if let Some(r) = item.get("release_date").and_then(Value::as_str) {
             let _ = write!(out, "\n  released: {r}");
         }
+        if let Some(liked) = liked(v) {
+            let _ = write!(out, "\n  liked: {liked}");
+        }
         return out;
     }
     let t = &v["track"];
     let mut out = format!(
-        "{} — {}\n  album: {}",
-        s(t, "/name"),
-        s(t, "/artist"),
-        s(t, "/album")
+        "{}\n  {}: {}",
+        titled(&name(t, "/name"), &name(t, "/artist")),
+        // An episode's "album" is its show.
+        if s(t, "/kind") == "episode" {
+            "show"
+        } else {
+            "album"
+        },
+        name(t, "/album")
     );
     if let Some(date) = v.pointer("/album/release_date").and_then(Value::as_str) {
         let _ = write!(out, " ({date})");
@@ -305,7 +379,7 @@ pub fn track(v: &Value) -> String {
         "\n  length: {}  ·  at {} (-{})",
         s(t, "/duration"),
         s(v, "/playback/position"),
-        silicon_spotify_client::timing::clock(
+        silicon_spotify_client::timing::clock_rounded(
             v.pointer("/playback/remaining_ms")
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
@@ -317,16 +391,15 @@ pub fn track(v: &Value) -> String {
     if v.get("explicit").and_then(Value::as_bool) == Some(true) {
         let _ = write!(out, "\n  explicit");
     }
+    if let Some(liked) = liked(v) {
+        let _ = write!(out, "\n  liked: {liked}");
+    }
     let _ = write!(out, "\n  {}\n  {}", s(t, "/uri"), s(t, "/url"));
     out
 }
 
 fn item_line(item: &Value) -> String {
-    let by = names(item);
-    let mut line = s(item, "/name").to_owned();
-    if !by.is_empty() {
-        let _ = write!(line, " — {by}");
-    }
+    let mut line = titled(&name(item, "/name"), &names(item));
     if let Some(d) = item.get("duration").and_then(Value::as_str) {
         let _ = write!(line, " ({d})");
     }
@@ -351,7 +424,22 @@ pub fn search(v: &Value) -> String {
     if out.is_empty() {
         return format!("No results for `{}`.", s(v, "/query"));
     }
-    out.push_str("Play one: spotify play <uri> · queue it: spotify queue add <uri>");
+    let has = |kinds: &[&str]| {
+        kinds.iter().any(|k| {
+            v.pointer(&format!("/results/{k}"))
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+        })
+    };
+    let mut next = vec!["Play one: spotify play <uri>"];
+    // The queue holds single items only.
+    if has(&["tracks", "episodes"]) {
+        next.push("queue it: spotify queue add <uri>");
+    }
+    if has(&["albums", "artists", "playlists"]) {
+        next.push("look inside: spotify track <uri>");
+    }
+    out.push_str(&next.join(" · "));
     out
 }
 
@@ -388,7 +476,7 @@ pub fn devices(v: &Value) -> String {
                 } else {
                     "○"
                 },
-                s(d, "/name"),
+                name(d, "/name"),
                 s(d, "/type"),
                 d.get("volume_percent")
                     .and_then(Value::as_u64)
@@ -401,6 +489,54 @@ pub fn devices(v: &Value) -> String {
         .join("\n")
 }
 
+/// `spotify:episode:<id>` as `episode <id>`: what a queued item without a known name shows.
+fn kind_and_id(uri: &str) -> String {
+    match uri
+        .strip_prefix("spotify:")
+        .and_then(|rest| rest.split_once(':'))
+    {
+        Some((kind, id)) if !kind.is_empty() && !id.is_empty() => format!("{kind} {id}"),
+        _ => uri.to_owned(),
+    }
+}
+
+/// A queued item: `name — artists` (or its show), else `track <id>` / `episode <id>`. `by` is
+/// one string for managed items and a list for Spotify's upcoming items.
+#[must_use]
+pub fn queue_item_label(item: &Value) -> String {
+    let title = name(item, "/name");
+    if title.is_empty() {
+        return kind_and_id(s(item, "/uri"));
+    }
+    let by = match item.get("by") {
+        Some(Value::Array(_)) => names(item),
+        _ => name(item, "/by"),
+    };
+    let episode = s(item, "/kind") == "episode" || s(item, "/uri").starts_with("spotify:episode:");
+    let by = if by.is_empty() && episode {
+        // An episode's show (a track's album is not who it is by).
+        name(item, "/album")
+    } else {
+        by
+    };
+    titled(&title, &by)
+}
+
+/// `spotify queue add`.
+#[must_use]
+pub fn queue_added(v: &Value) -> String {
+    let added = v["added"].as_array().cloned().unwrap_or_default();
+    let mut out = format!(
+        "Queued {}. Managed queue now has {}.",
+        count(added.len() as u64, "item"),
+        v["queue"].as_array().map_or(0, Vec::len)
+    );
+    for item in &added {
+        let _ = write!(out, "\n  + {}", queue_item_label(item));
+    }
+    out
+}
+
 /// `spotify queue`.
 #[must_use]
 pub fn queue(v: &Value) -> String {
@@ -411,16 +547,13 @@ pub fn queue(v: &Value) -> String {
     } else {
         out.push_str("Managed queue (plays next, editable):\n");
         for (index, item) in managed.iter().enumerate() {
-            let label = item.get("name").and_then(Value::as_str).map_or_else(
-                || s(item, "/uri").to_owned(),
-                |n| {
-                    format!(
-                        "{n} — {}",
-                        item.get("by").and_then(Value::as_str).unwrap_or("")
-                    )
-                },
+            let _ = writeln!(
+                out,
+                "  {:>2}. {}  [{}]",
+                index + 1,
+                queue_item_label(item),
+                s(item, "/id")
             );
-            let _ = writeln!(out, "  {:>2}. {label}  [{}]", index + 1, s(item, "/id"));
         }
     }
     let upcoming = v
@@ -431,7 +564,7 @@ pub fn queue(v: &Value) -> String {
     if !upcoming.is_empty() {
         out.push_str("Then Spotify's upcoming (read-only):\n");
         for (index, item) in upcoming.iter().take(10).enumerate() {
-            let _ = writeln!(out, "  {:>2}. {}", index + 1, s(item, "/name"));
+            let _ = writeln!(out, "  {:>2}. {}", index + 1, queue_item_label(item));
         }
         if upcoming.len() > 10 {
             let _ = writeln!(out, "  … {} more", upcoming.len() - 10);
@@ -443,13 +576,17 @@ pub fn queue(v: &Value) -> String {
             s(error, "/message")
         );
     }
+    // E.g. the item playing now, which Spotify repeats there, was left out.
+    if let Some(note) = v.pointer("/spotify_upcoming/note").and_then(Value::as_str) {
+        let _ = writeln!(out, "{note}");
+    }
     out
 }
 
 fn playlist_show(v: &Value, playlist: &Value) -> String {
     let mut out = format!(
         "{} — {}, {}\n  {}\n",
-        s(playlist, "/name"),
+        name(playlist, "/name"),
         count(v["track_count"].as_u64().unwrap_or(0), "track"),
         s(v, "/duration"),
         s(playlist, "/uri")
@@ -466,7 +603,7 @@ pub fn playlist(op: &str, v: &Value) -> String {
     match op {
         "playlist.list" => items_list(v),
         "playlist.show" => playlist_show(v, &v["playlist"]),
-        "playlist.create" => format!("Created playlist {} ({}).", s(v, "/name"), s(v, "/uri")),
+        "playlist.create" => format!("Created playlist {} ({}).", name(v, "/name"), s(v, "/uri")),
         "playlist.delete" => format!("{}\n{}", s(v, "/message"), s(v, "/note")),
         "playlist.fork" => {
             let mut out = match v.get("uri").and_then(Value::as_str) {
@@ -474,7 +611,7 @@ pub fn playlist(op: &str, v: &Value) -> String {
                     let name = v
                         .get("name")
                         .and_then(Value::as_str)
-                        .map(|n| format!("'{n}' "))
+                        .map(|n| format!("'{}' ", one_line(n)))
                         .unwrap_or_default();
                     format!(
                         "Forked spotify:playlist:{} into {name}({uri}).",
@@ -546,9 +683,11 @@ pub fn trigger_added(v: &Value) -> String {
             let _ = write!(
                 out,
                 " on {}",
-                v.pointer("/now_playing/name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("the current song")
+                one_line(
+                    v.pointer("/now_playing/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("the current song")
+                )
             );
         }
         Some("every") => out.push_str(" on every song"),
@@ -581,7 +720,8 @@ pub fn firing_line(f: &Value) -> String {
     if let Some(track) = f.pointer("/data/track/name").and_then(Value::as_str) {
         let _ = write!(
             line,
-            "\n      {track} at {}",
+            "\n      {} at {}",
+            one_line(track),
             s(f, "/data/playback/position")
         );
     }
@@ -618,6 +758,140 @@ pub fn trigger_detail(v: &Value) -> String {
     out
 }
 
+/// `3 s`, `500 ms`.
+fn millis(ms: u64) -> String {
+    if ms >= 1000 && ms.is_multiple_of(1000) {
+        format!("{} s", ms / 1000)
+    } else {
+        format!("{ms} ms")
+    }
+}
+
+/// Who holds spotify_player's client port, as the daemon describes it: `null` (nobody),
+/// `"unknown"`, or `{pid, parent_pid, kind, command}`.
+fn port_owner(owner: &Value) -> String {
+    let Some(pid) = owner.get("pid").and_then(Value::as_u64) else {
+        return match owner.as_str() {
+            Some("unknown") => "an unknown process".into(),
+            Some(other) => other.to_owned(),
+            None => "nobody".into(),
+        };
+    };
+    let what = match s(owner, "/kind") {
+        "your_spotify_player" => "your own spotify_player",
+        "stale_warm_copy" => "a warm copy left by an earlier daemon",
+        "another_daemons_warm_copy" => "another daemon's warm copy",
+        "spotify_player_command" => "a one-off spotify_player command",
+        "other_process" => "another program",
+        _ => "a process",
+    };
+    match owner.get("command").and_then(Value::as_str).map(one_line) {
+        Some(command) if !command.is_empty() && s(owner, "/kind") == "other_process" => {
+            format!("pid {pid}, {what}: {command}")
+        }
+        _ => format!("pid {pid}, {what}"),
+    }
+}
+
+/// An error the daemon reports as a string or as `{code, message}`.
+fn error_text(error: &Value) -> String {
+    error.as_str().map_or_else(
+        || {
+            let message = name(error, "/message");
+            match error.get("code").and_then(Value::as_str) {
+                Some(code) if !message.is_empty() => format!("{message} ({code})"),
+                Some(code) => code.to_owned(),
+                None => message,
+            }
+        },
+        one_line,
+    )
+}
+
+/// The daemon's warm spotify_player: `starting`, `running`, `not_serving`, `deferred`,
+/// `restarting`, `failed`, `unavailable`, `waiting_for_spotify_auth` or `disabled`.
+#[must_use]
+pub fn warm_player(w: &Value) -> String {
+    let state = s(w, "/state");
+    let port = w
+        .get("port")
+        .and_then(Value::as_u64)
+        .map(|port| format!("127.0.0.1:{port}"));
+    let port_text = port.clone().unwrap_or_else(|| "its client port".into());
+    let pid = w.get("pid").and_then(Value::as_u64);
+    let retry = w
+        .get("retry_in_s")
+        .and_then(Value::as_u64)
+        .map(|secs| format!("; retrying in {secs} s"))
+        .unwrap_or_default();
+    let mut line = match state {
+        "running" => {
+            let mut facts: Vec<String> = pid.map(|pid| format!("pid {pid}")).into_iter().collect();
+            facts.extend(port.clone());
+            if let Some(refresh) = w.get("refresh_ms").and_then(Value::as_u64) {
+                facts.push(format!("playback refresh every {}", millis(refresh)));
+            }
+            match w.get("serves_cli").and_then(Value::as_bool) {
+                Some(true) => facts.push("serves spotify-cli".into()),
+                Some(false) => facts.push("does not serve spotify-cli".into()),
+                None => {}
+            }
+            if facts.is_empty() {
+                "running".to_owned()
+            } else {
+                format!("running ({})", facts.join(", "))
+            }
+        }
+        "starting" => match pid {
+            Some(pid) => format!("starting (pid {pid}, waiting for it to take {port_text})"),
+            None => "starting".to_owned(),
+        },
+        "not_serving" => format!(
+            "not serving: the daemon's copy never got {port_text} (held by {}); it was stopped{retry}",
+            port_owner(&w["port_owner"])
+        ),
+        "deferred" => {
+            let since = w
+                .get("since")
+                .and_then(Value::as_str)
+                .map(|since| format!(" since {since}"))
+                .unwrap_or_default();
+            format!(
+                "deferred{since}: {port_text} is held by {}, which answers spotify-cli's commands; the daemon starts its own copy once it exits",
+                port_owner(&w["port_owner"])
+            )
+        }
+        "restarting" => {
+            let exit = w
+                .get("last_exit")
+                .and_then(Value::as_str)
+                .map(|exit| format!(" after it exited ({exit})"))
+                .unwrap_or_default();
+            format!("restarting{exit}{retry}")
+        }
+        "failed" | "unavailable" => match error_text(&w["error"]) {
+            error if error.is_empty() => state.to_owned(),
+            error => format!("{state}: {error}"),
+        },
+        "waiting_for_spotify_auth" => {
+            "waiting for Spotify sign-in (run `spotify auth login`)".to_owned()
+        }
+        "disabled" => match w.get("reason").and_then(Value::as_str) {
+            Some(reason) => format!("disabled ({reason})"),
+            None => "disabled".to_owned(),
+        },
+        "" => "unknown".to_owned(),
+        other => other.replace('_', " "),
+    };
+    // Notes that say more than the line: why a copy is not serving, where its log is.
+    if !matches!(state, "deferred" | "not_serving")
+        && let Some(note) = w.get("note").and_then(Value::as_str)
+    {
+        let _ = write!(line, "\n    {}", one_line(note));
+    }
+    line
+}
+
 /// `daemon status`.
 #[must_use]
 pub fn daemon_status(v: &Value) -> String {
@@ -652,7 +926,7 @@ pub fn daemon_status(v: &Value) -> String {
             out,
             "\n  Spotify: {} {}",
             s(spotify, "/state"),
-            spotify.get("track").and_then(Value::as_str).unwrap_or("")
+            one_line(spotify.get("track").and_then(Value::as_str).unwrap_or(""))
         );
     }
     let c = &v["counts"];
@@ -664,7 +938,7 @@ pub fn daemon_status(v: &Value) -> String {
     let _ = write!(
         out,
         "\n  warm spotify_player: {}",
-        s(v, "/warm_spotify_player/state")
+        warm_player(&v["warm_spotify_player"])
     );
     match v.get("automation").and_then(Value::as_str) {
         Some("not_answering") => out.push_str(
@@ -747,6 +1021,281 @@ mod tests {
             object.extend(view);
         }
         track(&value)
+    }
+
+    #[test]
+    fn names_stay_on_one_line() {
+        assert_eq!(one_line("a\nb\r\nc\td\u{2028}e  f "), "a b c d e f");
+        let found = json!({"query": "queen", "results": {"playlists": [
+            {"name": "Mai teri queen aave\nDil di clean aave\nKarda smile", "by": ["Meenal\tSaharan"],
+             "uri": "spotify:playlist:6S5eKpEJcVEzXdb8TkO3Ud"}]}});
+        let text = search(&found);
+        assert!(
+            text.starts_with("playlists:\n   1. Mai teri queen aave Dil di clean aave Karda smile — Meenal Saharan\n      spotify:playlist:6S5eKpEJcVEzXdb8TkO3Ud\n"),
+            "{text}"
+        );
+        // Album facts still follow the artists when the name had a line break.
+        let mut out = String::new();
+        numbered(
+            &mut out,
+            &[
+                json!({"kind": "album", "name": "Two\nLines", "by": ["X"], "release_date": "2020-01-01",
+                "album_type": "album", "uri": "spotify:album:78bpIziExqiI9qztvNFlQu"}),
+            ],
+            10,
+        );
+        assert_eq!(
+            out,
+            "    1. Two Lines — X (2020-01-01, album)\n      spotify:album:78bpIziExqiI9qztvNFlQu\n"
+        );
+    }
+
+    #[test]
+    fn search_footer_offers_only_what_fits_the_results() {
+        let albums = json!({"results": {"albums": [{"name": "AM", "uri": "spotify:album:78bpIziExqiI9qztvNFlQu"}],
+            "artists": [{"name": "Arctic Monkeys", "uri": "spotify:artist:7Ln80lUS6He07XvHI8qqHH"}], "tracks": []}});
+        let text = search(&albums);
+        assert!(
+            text.ends_with("Play one: spotify play <uri> · look inside: spotify track <uri>"),
+            "{text}"
+        );
+        let tracks = json!({"results": {"tracks": [{"name": "505", "uri": "spotify:track:0BxE4FqsDD1Ot4YuBXwAPp"}]}});
+        assert!(
+            search(&tracks)
+                .ends_with("Play one: spotify play <uri> · queue it: spotify queue add <uri>")
+        );
+    }
+
+    #[test]
+    fn episodes_have_no_dangling_separator() {
+        let episode = json!({"playback": {"state": "playing", "position": "0:26", "remaining_ms": 1_000,
+            "progress": 0.1, "track": {"kind": "episode", "name": "How to Speak Clearly", "artist": "",
+            "album": "Huberman Lab", "duration": "1:59:00", "uri": "spotify:episode:4IzpgR6RCEkRqMHbJF38Wp"}}});
+        let text = status(&episode);
+        assert!(
+            text.starts_with("▶ How to Speak Clearly\n  Huberman Lab\n"),
+            "{text}"
+        );
+        let text =
+            track(&json!({"track": episode["playback"]["track"], "playback": episode["playback"]}));
+        assert!(
+            text.starts_with("How to Speak Clearly\n  show: Huberman Lab\n"),
+            "{text}"
+        );
+        let queued = json!({"managed": [{"id": "q_1", "name": "How to Speak Clearly", "by": "",
+            "uri": "spotify:episode:4IzpgR6RCEkRqMHbJF38Wp"}]});
+        assert!(
+            queue(&queued).contains("   1. How to Speak Clearly  [q_1]\n"),
+            "{}",
+            queue(&queued)
+        );
+        // The daemon's note on left-out repeats is shown, with or without other upcoming items.
+        let note =
+            "Spotify listed the item playing now 10 more time(s) as upcoming; those are left out.";
+        let empty = json!({"managed": [], "spotify_upcoming": {"items": [], "note": note}});
+        assert!(
+            queue(&empty).ends_with(&format!("{note}\n")),
+            "{}",
+            queue(&empty)
+        );
+        let more =
+            json!({"managed": [], "spotify_upcoming": {"items": [{"name": "Next"}], "note": note}});
+        assert!(
+            queue(&more).ends_with(&format!("   1. Next\n{note}\n")),
+            "{}",
+            queue(&more)
+        );
+    }
+
+    #[test]
+    fn track_says_whether_the_song_is_liked() {
+        let current = json!({"track": {"kind": "track", "name": "505", "artist": "Arctic Monkeys", "album": "Favourite Worst Nightmare",
+            "duration": "4:13", "uri": "spotify:track:0BxE4FqsDD1Ot4YuBXwAPp"}, "playback": {"position": "1:00", "remaining_ms": 193_000},
+            "liked": true});
+        assert!(
+            track(&current).contains("\n  liked: yes"),
+            "{}",
+            track(&current)
+        );
+        let mut unknown = current.clone();
+        unknown["liked"] = Value::Null;
+        assert!(!track(&unknown).contains("liked"), "{}", track(&unknown));
+    }
+
+    #[test]
+    fn stale_web_data_is_flagged_and_spotify_app_repeat_wins() {
+        let mut status = json!({"playback": {"state": "playing", "position": "1:00", "remaining_ms": 19_600,
+            "progress": 0.5, "repeating": false, "track": {"kind": "track", "name": "505", "artist": "Arctic Monkeys",
+            "album": "Favourite Worst Nightmare", "duration": "4:13", "uri": "spotify:track:0BxE4FqsDD1Ot4YuBXwAPp"},
+            "web": {"repeat_state": "track", "context_uri": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+                "source": "web_api", "stale": true}},
+            "warnings": [{"code": "web_state_stale", "message": "The Spotify Web API's playback does not match."}]});
+        let text = super::status(&status);
+        // Remaining time is rounded to the nearest second: 19.6 s left shows 0:20.
+        assert!(text.contains("1:00 / 4:13  (-0:20)"), "{text}");
+        assert!(!text.contains("repeat"), "{text}");
+        assert!(
+            text.contains("from spotify:playlist:37i9dQZF1DXcBWIGoYBM5M · web data out of date"),
+            "{text}"
+        );
+        assert!(
+            text.contains("note: The Spotify Web API's playback does not match. (web_state_stale)"),
+            "{text}"
+        );
+        // Stale, but Spotify.app says repeat is on: shown from Spotify.app's flag.
+        status["playback"]["repeating"] = json!(true);
+        let text = super::status(&status);
+        assert!(text.contains("  repeat · from"), "{text}");
+        assert!(!text.contains("repeat one"), "{text}");
+        // Fresh web data tells repeat-one apart and is not flagged.
+        status["playback"]["web"]["stale"] = json!(false);
+        let text = super::status(&status);
+        assert!(text.contains("repeat one"), "{text}");
+        assert!(!text.contains("out of date"), "{text}");
+    }
+
+    #[test]
+    fn previous_says_what_it_did() {
+        let playback = json!({"state": "playing", "position": "0:00", "remaining_ms": 180_000, "progress": 0.0,
+            "track": {"name": "505", "artist": "Arctic Monkeys", "duration": "3:00", "uri": "spotify:track:0BxE4FqsDD1Ot4YuBXwAPp"}});
+        let restarted = json!({"action": "previous", "via": "applescript", "result": "restarted", "playback": playback});
+        let text = outcome(&restarted);
+        assert!(
+            text.starts_with("Back to the start of this item.\n▶ 505 — Arctic Monkeys"),
+            "{text}"
+        );
+        let moved = json!({"action": "previous", "via": "spotify_player", "result": "previous_item", "playback": playback});
+        assert!(outcome(&moved).starts_with("Back to the previous item.\n▶ "));
+        let other = json!({"action": "pause", "via": "applescript", "playback": playback});
+        assert!(outcome(&other).starts_with("▶ 505"));
+        let skipped = json!({"action": "next", "via": "applescript", "playback": playback,
+            "skipped": "spotify:track:5FVd6KXrgO9B3JPmC8OPst"});
+        assert!(
+            outcome(&skipped).ends_with(
+                "\n  skipped spotify:track:5FVd6KXrgO9B3JPmC8OPst (it was still being switched to)"
+            ),
+            "{}",
+            outcome(&skipped)
+        );
+    }
+
+    #[test]
+    fn launch_says_whether_it_started_spotify() {
+        assert_eq!(
+            launched(&json!({"launched": false, "already_running": true})),
+            "Spotify.app was already running."
+        );
+        assert_eq!(
+            launched(&json!({"launched": true, "already_running": false})),
+            "Started Spotify.app (hidden)."
+        );
+        assert_eq!(
+            launched(&json!({"playback": {}})),
+            "Spotify.app is running."
+        );
+        // 0.1.2 daemons answer `launched: true` whether or not Spotify.app was running.
+        assert_eq!(
+            launched(&json!({"launched": true, "playback": {}})),
+            "Spotify.app is running."
+        );
+    }
+
+    #[test]
+    fn unnamed_queue_items_show_kind_and_id() {
+        let listed = json!({"managed": [
+            {"id": "q_1", "uri": "spotify:episode:4IzpgR6RCEkRqMHbJF38Wp"},
+            {"id": "q_2", "uri": "spotify:track:0BxE4FqsDD1Ot4YuBXwAPp", "name": "505", "by": "Arctic Monkeys"}],
+            "spotify_upcoming": {"items": [
+                {"kind": "track", "name": "Do I Wanna Know?", "by": ["Arctic Monkeys"], "uri": "spotify:track:5FVd6KXrgO9B3JPmC8OPst"},
+                {"kind": "episode", "name": "How to Speak Clearly", "album": "Huberman Lab", "uri": "spotify:episode:4IzpgR6RCEkRqMHbJF38Wp"},
+                {"kind": "track", "name": "", "uri": "spotify:track:5XeFesFbtLpXzIVDNQP22n"},
+                {"kind": "track", "name": "Untitled", "album": "Some Album", "uri": "spotify:track:0BxE4FqsDD1Ot4YuBXwAPp"}]}});
+        let text = queue(&listed);
+        assert!(
+            text.contains(
+                "   1. episode 4IzpgR6RCEkRqMHbJF38Wp  [q_1]\n   2. 505 — Arctic Monkeys  [q_2]\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            // A track without artists is not shown as by its album.
+            text.contains("   1. Do I Wanna Know? — Arctic Monkeys\n   2. How to Speak Clearly — Huberman Lab\n   3. track 5XeFesFbtLpXzIVDNQP22n\n   4. Untitled\n"),
+            "{text}"
+        );
+        let added = json!({"added": [{"id": "q_3", "uri": "spotify:episode:4IzpgR6RCEkRqMHbJF38Wp",
+            "name": "How to Speak Clearly", "by": "Huberman Lab"}], "queue": [{}, {}, {}]});
+        assert_eq!(
+            queue_added(&added),
+            "Queued 1 item. Managed queue now has 3.\n  + How to Speak Clearly — Huberman Lab"
+        );
+        assert_eq!(kind_and_id("not a uri"), "not a uri");
+    }
+
+    #[test]
+    fn warm_spotify_player_states_read_as_sentences() {
+        let owner = json!({"pid": 4242, "parent_pid": 1, "kind": "your_spotify_player", "command": "spotify_player"});
+        for (warm, expected) in [
+            (
+                json!({"state": "running", "pid": 812, "port": 8080, "refresh_ms": 3000, "port_owner_pid": 812, "serves_cli": true}),
+                "running (pid 812, 127.0.0.1:8080, playback refresh every 3 s, serves spotify-cli)",
+            ),
+            (
+                json!({"state": "running", "pid": 812, "port": 8080, "refresh_ms": 1500, "serves_cli": null,
+                    "note": "lsof could not confirm that this copy holds the client port."}),
+                "running (pid 812, 127.0.0.1:8080, playback refresh every 1500 ms)\n    lsof could not confirm that this copy holds the client port.",
+            ),
+            (
+                json!({"state": "starting", "pid": 812, "port": 8080}),
+                "starting (pid 812, waiting for it to take 127.0.0.1:8080)",
+            ),
+            (
+                json!({"state": "deferred", "port": 8080, "port_owner": owner, "since": "2026-09-26T10:00:00Z", "note": "..."}),
+                "deferred since 2026-09-26T10:00:00Z: 127.0.0.1:8080 is held by pid 4242, your own spotify_player, which answers spotify-cli's commands; the daemon starts its own copy once it exits",
+            ),
+            (
+                json!({"state": "not_serving", "port": 8080, "port_owner": {"pid": 77, "kind": "other_process", "command": "node"}, "retry_in_s": 8, "note": "..."}),
+                "not serving: the daemon's copy never got 127.0.0.1:8080 (held by pid 77, another program: node); it was stopped; retrying in 8 s",
+            ),
+            (
+                json!({"state": "not_serving", "port": 8080, "port_owner": null, "retry_in_s": 4}),
+                "not serving: the daemon's copy never got 127.0.0.1:8080 (held by nobody); it was stopped; retrying in 4 s",
+            ),
+            (
+                json!({"state": "restarting", "last_exit": "ExitStatus(unix_wait_status(256))", "retry_in_s": 10,
+                    "note": "The daemon starts a new copy after the delay."}),
+                "restarting after it exited (ExitStatus(unix_wait_status(256))); retrying in 10 s\n    The daemon starts a new copy after the delay.",
+            ),
+            (
+                json!({"state": "failed", "error": "cannot start spotify_player: No such file"}),
+                "failed: cannot start spotify_player: No such file",
+            ),
+            (
+                json!({"state": "unavailable", "error": {"code": "spotify_player_missing", "message": "spotify_player is not installed."}}),
+                "unavailable: spotify_player is not installed. (spotify_player_missing)",
+            ),
+            (
+                json!({"state": "waiting_for_spotify_auth", "error": {"code": "spotify_auth_required"}}),
+                "waiting for Spotify sign-in (run `spotify auth login`)",
+            ),
+            (
+                json!({"state": "disabled", "reason": "SPOTIFY_WARM_PLAYER=off"}),
+                "disabled (SPOTIFY_WARM_PLAYER=off)",
+            ),
+            (json!({"state": "failed"}), "failed"),
+            (json!({"state": "something_new"}), "something new"),
+            (Value::Null, "unknown"),
+        ] {
+            assert_eq!(warm_player(&warm), expected);
+        }
+        let status = json!({"running": true, "version": "0.1.3", "pid": 1, "uptime_s": 5, "launch_agent_installed": true,
+            "counts": {}, "managed_queue": 0, "readings": 1, "notifications": 0, "log": "/tmp/daemon.log",
+            "warm_spotify_player": {"state": "disabled", "reason": "SPOTIFY_WARM_PLAYER=off"}});
+        assert!(
+            daemon_status(&status)
+                .contains("\n  warm spotify_player: disabled (SPOTIFY_WARM_PLAYER=off)\n"),
+            "{}",
+            daemon_status(&status)
+        );
     }
 
     #[test]

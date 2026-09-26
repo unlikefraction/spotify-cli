@@ -230,10 +230,38 @@ pub fn seek(position_ms: u64) -> String {
     guarded(&format!("\t\tset player position to {seconds}.{millis:03}"))
 }
 
-/// `set sound volume to <0-100>`.
+/// `set sound volume to <0-100>`, compensating for Spotify.app's rounding.
+///
+/// Spotify.app keeps the level at 16-bit precision and reads it back rounded down, so after
+/// `set sound volume to 64` it reports 63 (every level except the multiples of 20). Setting one
+/// more then reads back the requested level. The script waits (up to 0.3 s) for the first set to
+/// show before judging it, because Spotify.app can still report the old level right after a set.
+/// 19, 39, 59, 79 and 99 cannot be reached this way; they land one above (see
+/// [`volume_reached`]).
 #[must_use]
 pub fn volume(percent: u8) -> String {
-    guarded(&format!("\t\tset sound volume to {}", percent.min(100)))
+    let percent = percent.min(100);
+    if percent == 100 {
+        return guarded("\t\tset sound volume to 100");
+    }
+    guarded(&format!(
+        "\t\tset xWas to sound volume
+\t\tset sound volume to {percent}
+\t\trepeat 10 times
+\t\t\tif sound volume is not xWas then exit repeat
+\t\t\tdelay 0.03
+\t\tend repeat
+\t\tif sound volume < {percent} then set sound volume to {}",
+        percent + 1
+    ))
+}
+
+/// Whether Spotify.app reporting volume `read` means a request for `requested` took effect:
+/// exactly, except for the levels [`volume`] cannot reach through AppleScript, which land one
+/// above.
+#[must_use]
+pub fn volume_reached(requested: u8, read: u8) -> bool {
+    read == requested || (requested % 20 == 19 && read == requested.saturating_add(1))
 }
 
 /// `set shuffling to <bool>`.
@@ -496,5 +524,23 @@ mod tests {
     #[test]
     fn seek_script_uses_dot_decimal() {
         assert!(seek(90_250).contains("set player position to 90.250"));
+    }
+
+    #[test]
+    fn volume_script_compensates_for_rounding_down() {
+        // Spotify.app 1.2 reads `set sound volume to 64` back as 63; setting 65 reads back 64.
+        let script = volume(64);
+        assert!(script.contains("set sound volume to 64\n"), "{script}");
+        assert!(
+            script.contains("if sound volume < 64 then set sound volume to 65"),
+            "{script}"
+        );
+        assert!(!volume(100).contains("101"));
+        assert!(volume(0).contains("set sound volume to 0\n"));
+        assert!(volume_reached(64, 64));
+        assert!(!volume_reached(64, 63), "one below is the bug, not success");
+        assert!(!volume_reached(64, 65));
+        assert!(volume_reached(59, 60), "59 is unreachable and lands on 60");
+        assert!(!volume_reached(59, 58));
     }
 }

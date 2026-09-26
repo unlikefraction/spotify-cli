@@ -182,8 +182,19 @@ impl Playback {
 }
 
 /// Playback facts from the Spotify Web API (through spotify_player).
+///
+/// The running spotify_player instance answers from memory that refreshes only after commands it
+/// ran itself, so these facts can describe an earlier moment. [`crate::control::Controller::status_full`]
+/// compares them with Spotify.app and asks the Web API directly when they disagree; `source`
+/// says which answer this is and `stale` marks one that still does not match Spotify.app.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WebPlayback {
+    /// The item the Web API reports (`spotify:track:<id>`, `spotify:episode:<id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_uri: Option<String>,
+    /// Whether the Web API reports playback as running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_playing: Option<bool>,
     /// The list being played (`spotify:playlist:…`, `spotify:album:…`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_uri: Option<String>,
@@ -199,6 +210,15 @@ pub struct WebPlayback {
     /// The Spotify Connect device playing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<Device>,
+    /// `spotify_player` (the running instance's memory, consistent with Spotify.app when read) or
+    /// `web_api` (a fresh Web API read, made because the instance's memory was out of date).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// These facts could not be matched to what Spotify.app plays now (the Web API reports a
+    /// different item, or could not be asked), so they are out of date; repeat and shuffle that
+    /// contradict Spotify.app are left out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 impl WebPlayback {
@@ -210,6 +230,8 @@ impl WebPlayback {
         }
         let context = value.get("context").filter(|c| !c.is_null());
         Some(Self {
+            item_uri: playing_item_uri(value),
+            is_playing: value.get("is_playing").and_then(Value::as_bool),
             context_uri: context
                 .and_then(|c| c.get("uri"))
                 .and_then(Value::as_str)
@@ -224,8 +246,24 @@ impl WebPlayback {
                 .map(str::to_owned),
             shuffle_state: value.get("shuffle_state").and_then(Value::as_bool),
             device: value.get("device").and_then(Device::from_json),
+            source: None,
+            stale: false,
         })
     }
+}
+
+/// The item of `spotify_player get key playback` JSON as a URI. The Web API's item objects carry
+/// `type` and a bare `id` but no `uri`; local files have no id and give `None`.
+#[must_use]
+pub fn playing_item_uri(value: &Value) -> Option<String> {
+    let item = value.get("item").filter(|i| !i.is_null())?;
+    let id = item.get("id")?.as_str().filter(|id| !id.is_empty())?;
+    let kind = item
+        .get("type")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("currently_playing_type").and_then(Value::as_str))
+        .unwrap_or("track");
+    Some(format!("spotify:{kind}:{id}"))
 }
 
 /// A Spotify Connect device.
@@ -504,6 +542,35 @@ pub fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn web_playback_names_the_item_and_play_state() {
+        // Shape of `spotify_player get key playback` (0.25.1), trimmed.
+        let value = json!({"device":{"id":"e49","is_active":true,"name":"Mac","type":"Computer","volume_percent":66},
+            "repeat_state":"off","shuffle_state":false,
+            "context":{"uri":"spotify:album:37fimO5ahI9qtvEN7OqlME","type":"album"},
+            "timestamp":1_790_419_404_257_u64,"progress_ms":191_192,"is_playing":false,
+            "item":{"id":"1PVeB2mHmWwdB9YHm0yeIZ","name":"Chandni Raat","type":"track","is_local":false},
+            "currently_playing_type":"track","actions":{"disallows":{"pausing":true,"skipping_prev":true}}});
+        let web = WebPlayback::from_player_json(&value).expect("web");
+        assert_eq!(
+            web.item_uri.as_deref(),
+            Some("spotify:track:1PVeB2mHmWwdB9YHm0yeIZ")
+        );
+        assert_eq!(web.is_playing, Some(false));
+        assert_eq!(web.repeat_state.as_deref(), Some("off"));
+        assert!(!web.stale && web.source.is_none());
+        let episode = json!({"item":{"id":"4IzpgR6RCEkRqMHbJF38Wp","type":"episode"}});
+        assert_eq!(
+            playing_item_uri(&episode).as_deref(),
+            Some("spotify:episode:4IzpgR6RCEkRqMHbJF38Wp")
+        );
+        let local = json!({"item":{"id":null,"type":"track","is_local":true}});
+        assert_eq!(playing_item_uri(&local), None);
+        assert!(WebPlayback::from_player_json(&Value::Null).is_none());
+        let json = serde_json::to_value(&web).expect("json");
+        assert!(json.get("stale").is_none(), "only present when true");
+    }
 
     #[test]
     fn normalizes_spotify_player_items() {

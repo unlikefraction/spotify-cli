@@ -15,6 +15,9 @@ use serde_json::Value;
 use silicon_spotify_client::trigger::Trigger;
 use silicon_spotify_client::{Error, Result};
 
+/// Telemetry events relayed per request batch.
+pub const TELEMETRY_PEEK: usize = 40;
+
 /// Where a trigger's notifications go.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Delivery {
@@ -476,14 +479,16 @@ impl Db {
         Ok(())
     }
 
-    /// Takes up to 40 telemetry events.
+    /// Takes up to [`TELEMETRY_PEEK`] telemetry events, oldest first.
     ///
     /// # Errors
     /// SQLite or JSON errors.
     pub fn peek_telemetry(&self) -> Result<Vec<(String, Value)>> {
         let conn = self.conn();
         let mut statement = conn
-            .prepare("SELECT id, body FROM telemetry ORDER BY created_ms LIMIT 40")
+            .prepare(&format!(
+                "SELECT id, body FROM telemetry ORDER BY created_ms, rowid LIMIT {TELEMETRY_PEEK}"
+            ))
             .map_err(|e| db_error(&e))?;
         let rows = statement
             .query_map([], |row| {
