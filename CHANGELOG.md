@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1 — 2026-09-26
+
+- The daemon no longer hangs while macOS asks whether it may control Spotify. It raises the
+  Automation dialog itself at startup, and until someone clicks Allow commands fail fast with
+  `automation_permission_pending` (exit 4) instead of timing out. `spotify doctor` no longer
+  reports the permission as granted after a timeout; `spotify daemon status` shows it; the
+  installer waits for the answer.
+- Backend: graceful shutdown on SIGTERM; `/healthz` reports `service: spotify-cli`.
+
 ## 0.1.0 — 2026-09-26
 
 First release.
