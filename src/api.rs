@@ -170,7 +170,7 @@ async fn not_found() -> AppError {
 
 async fn healthz() -> Json<Value> {
     Json(
-        json!({"status": "ok", "service": "silicon-spotify", "version": env!("CARGO_PKG_VERSION")}),
+        json!({"status": "ok", "service": "spotify-cli", "version": env!("CARGO_PKG_VERSION")}),
     )
 }
 

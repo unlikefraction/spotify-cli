@@ -11,7 +11,7 @@ Common headers: `Idempotency-Key` (16–255 visible ASCII; required on auth muta
 
 | Method & path | Auth | Body → response |
 | --- | --- | --- |
-| `GET /healthz` | — | `{"status":"ok","service":"silicon-spotify","version"}` |
+| `GET /healthz` | — | `{"status":"ok","service":"spotify-cli","version"}` |
 | `GET /readyz` | — | `{"status":"ready"}` or 503 |
 | `GET /api/v1/iam` | — | `{"app_id":"spotify","org_id":"unlikefraction","api_version":"v1","iam_url","ting_url","testing_environment_id","ting_types",…}` |
 | `GET /api/v1/version` | — | `{"version","api_versions":["v1"],"min_cli"}` |
