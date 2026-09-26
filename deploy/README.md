@@ -13,7 +13,7 @@ run it. Nothing here is run by the build.
 | 6 | Approve the IAM webhook (step-up) | direct Carbon owner/admin of `unlikefraction` |
 | 7 | Register Ting types | Ting session of an `unlikefraction` owner/admin |
 | 8 | Space Station tables → keys into the secret; redeploy | `unlikefraction` member |
-| 9 | Release binaries (GitHub release + Honeycomb package) | macOS build host with zig and cargo-xwin |
+| 9 | Release binaries (GitHub release + Honeycomb package) | macOS build host with zig and cargo-xwin; Developer ID certificate and notarytool profile |
 | 10 | Website + docs on Vercel | Vercel CLI |
 | 11 | End-to-end check with a real Silicon | a Silicon with `iam` 4.x |
 
@@ -102,7 +102,18 @@ deploy/spacestation-tables.sh     # add the four keys to the runtime secret, the
 
 ## 9. Release
 
+Once per Mac (the owner, interactively; never paste the credentials anywhere else):
+
 ```sh
+security find-identity -v -p codesigning     # lists "Developer ID Application: Shubham Gupta (LTBSK59BJ2)"
+xcrun notarytool store-credentials spotify-cli --apple-id <apple-id> --team-id LTBSK59BJ2   # asks for an app-specific password
+```
+
+Each release:
+
+```sh
+export SPOTIFY_CODESIGN_IDENTITY="Developer ID Application: Shubham Gupta (LTBSK59BJ2)"
+export SPOTIFY_NOTARY_PROFILE=spotify-cli
 scripts/package-release.sh                                    # dist/v0.1.0/*
 gh release create v0.1.0 dist/v0.1.0/spotify-v0.1.0-* dist/v0.1.0/SHA256SUMS dist/v0.1.0/install.sh --title v0.1.0 --notes-file CHANGELOG.md
 honeycomb validate dist/v0.1.0/spotify-0.1.0.tar.gz
@@ -110,9 +121,36 @@ honeycomb releases upload spotify dist/v0.1.0/spotify-0.1.0.tar.gz --channel pro
   --revision "$(honeycomb --json apps get spotify | jq -r .revision)"
 ```
 
-macOS binaries are ad-hoc signed unless `SPOTIFY_CODESIGN_IDENTITY` names a Developer ID
-certificate. With ad-hoc signatures macOS asks for the Automation permission again after each
-update; a Developer ID signature keeps it.
+For each macOS target, `scripts/package-release.sh` runs `scripts/macos-sign.sh` before it packs
+anything, so the archives, the Honeycomb package and `SHA256SUMS` all carry the signed binaries:
+
+- `codesign --force --timestamp --options runtime` with identifiers `com.unlikefraction.spotify`
+  and `com.unlikefraction.spotify-daemon`; the daemon also gets
+  `packaging/spotify-daemon.entitlements` (`com.apple.security.automation.apple-events`, which
+  the hardened runtime needs for Apple Events) and carries its embedded Info.plist
+  (`crates/daemon/build.rs`).
+- Checks each signature (`codesign --verify --strict`, identifier, runtime flag, secure
+  timestamp, team, the daemon's Info.plist and exact entitlements) and stops on any mismatch.
+- With `SPOTIFY_NOTARY_PROFILE`: zips both binaries, runs
+  `xcrun notarytool submit --keychain-profile … --wait`, and stops unless the status is
+  `Accepted` (printing `notarytool log` otherwise) and the ticket lists both binaries' cdhashes.
+  The profile is checked before the build starts, and `SPOTIFY_NOTARY_PROFILE` without
+  `SPOTIFY_CODESIGN_IDENTITY` is an error.
+- Also before the build: `SPOTIFY_CODESIGN_IDENTITY` must match exactly one identity in
+  `security find-identity -v -p codesigning`, and a Developer ID Application one when notarizing.
+
+Bare executables cannot be stapled, so Gatekeeper looks the ticket up online the first time a
+browser-downloaded binary runs (install.sh and the daemon's updater download with curl or plain
+HTTP, which set no quarantine flag, so Gatekeeper does not assess those). Check a binary with
+`spctl --assess --type open --context context:primary-signature -vv <file>`
+(`source=Notarized Developer ID`); `spctl --type execute` rejects every bare executable, notarized
+or not. On the build Mac, Gatekeeper can keep answering `Unnotarized Developer ID` for a binary
+it assessed before notarization (a cached answer that cleared within about ten minutes in
+testing); that does not mean the ticket is missing.
+
+Without `SPOTIFY_CODESIGN_IDENTITY` (CI, contributors) the binaries are ad-hoc signed and not
+notarized: macOS then asks for the Automation permission again after each update. The script's
+last lines say which kind it built.
 
 ## 10. Website
 

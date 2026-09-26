@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.5 — 2026-09-26
+
+Signing (macOS):
+
+- Release binaries are signed with the project's Developer ID (team `LTBSK59BJ2`) under the
+  hardened runtime, with a secure timestamp, and notarized by Apple. macOS keeps the Automation
+  answer ("spotify-daemon" may control "Spotify") by that signature, so updates no longer ask
+  again; the first signed release asks once more after the ad-hoc signed 0.1.4. Gatekeeper
+  accepts a binary downloaded with a browser (bare executables cannot be stapled, so it looks the
+  ticket up online on first launch). The codesign identifiers stay
+  `com.unlikefraction.spotify` and `com.unlikefraction.spotify-daemon`.
+- `spotify-daemon` embeds an Info.plist (`__TEXT,__info_plist`: bundle identifier
+  `com.unlikefraction.spotify-daemon`, name, version, and `NSAppleEventsUsageDescription`, the
+  reason macOS shows in the permission prompt), and signed releases give it the
+  `com.apple.security.automation.apple-events` entitlement the hardened runtime requires for its
+  Apple Events. The `spotify` command sends no Apple Events, so it gets neither. Linux and
+  Windows builds are unchanged.
+- `scripts/package-release.sh` signs each macOS architecture through the new
+  `scripts/macos-sign.sh` before packing: `SPOTIFY_CODESIGN_IDENTITY` for Developer ID (unset:
+  ad-hoc, as before, for CI and contributors) and `SPOTIFY_NOTARY_PROFILE` (a
+  `notarytool store-credentials` keychain profile) for notarization. It verifies every signature
+  (identifier, runtime flag, timestamp, team, the daemon's Info.plist and exact entitlements),
+  requires notarization status `Accepted` with a ticket that lists both binaries' cdhashes
+  (printing the notary log otherwise), checks the identity (exactly one match, and a Developer
+  ID Application one when notarizing) and the profile before the build starts, and refuses a
+  notary profile without an identity.
+
 ## 0.1.4 — 2026-09-26
 
 Daemon and its spotify_player:

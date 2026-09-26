@@ -21,9 +21,9 @@ deploy/         backend deployment (systemd, Caddy, CloudFormation), Honeycomb a
 ## Use the library
 
 ```toml
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.4" }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.5" }
 # no HTTP at all:
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.4", default-features = false }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.5", default-features = false }
 ```
 
 ```rust
@@ -116,7 +116,20 @@ SPOTIFY_API_URL=http://127.0.0.1:8787 cargo run -p silicon-spotify-cli -- trigge
 
 The dev backend serves the real router with in-process IAM and Ting fakes and appends every
 "sent" Ting to the JSONL file, so the whole path (CLI → daemon → session → backend → Ting) can be
-exercised on a Mac without an IAM application secret. Release artifacts: `scripts/package-release.sh`.
+exercised on a Mac without an IAM application secret.
+
+Release artifacts: `scripts/package-release.sh` (all six targets). macOS binaries are ad-hoc
+signed unless `SPOTIFY_CODESIGN_IDENTITY` is set; releases set it and the notary profile:
+
+```sh
+SPOTIFY_CODESIGN_IDENTITY="Developer ID Application: …" \
+SPOTIFY_NOTARY_PROFILE=spotify-cli \
+  scripts/package-release.sh     # Developer ID + hardened runtime, then Apple notarization
+```
+
+`scripts/macos-sign.sh <dir>` does the signing for one architecture; the release steps are in
+`deploy/README.md`. On macOS, `crates/daemon/build.rs` embeds `crates/daemon/Info.plist` in
+`spotify-daemon`; keep its `CFBundleIdentifier` equal to the codesign identifier.
 
 ## Conventions
 

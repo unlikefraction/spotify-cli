@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Embedded in the macOS spotify-daemon executable (section __TEXT,__info_plist) by build.rs, with
+  @VERSION@ replaced by the crate version. codesign binds it into the signature. macOS shows
+  NSAppleEventsUsageDescription in the Automation prompt ("spotify-daemon" wants access to control
+  "Spotify"). Keep CFBundleIdentifier equal to the codesign identifier in scripts/macos-sign.sh.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.unlikefraction.spotify-daemon</string>
+	<key>CFBundleName</key>
+	<string>spotify-daemon</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>spotify-daemon reads what Spotify is playing and plays, pauses, skips and seeks in it for the spotify command and its playback triggers.</string>
+</dict>
+</plist>

@@ -77,5 +77,7 @@ playback triggers delivered over Ting) and the ecosystem rules every IAM app fol
   Premium; AppleScript control works without either.
 - Playlist rename/description edits, removing items from Spotify's native queue, and episode
   lists of a show are not possible through spotify_player or AppleScript.
-- Ad-hoc signed macOS binaries make macOS ask for the Automation permission again after updates;
-  a Developer ID certificate fixes that (`SPOTIFY_CODESIGN_IDENTITY`).
+- Ad-hoc signed macOS binaries (development builds) make macOS ask for the Automation permission
+  again after each build. Releases are Developer ID signed with the hardened runtime and notarized
+  (`SPOTIFY_CODESIGN_IDENTITY`, `SPOTIFY_NOTARY_PROFILE`), so the answer survives updates. Bare
+  executables cannot be stapled; Gatekeeper checks the ticket online.

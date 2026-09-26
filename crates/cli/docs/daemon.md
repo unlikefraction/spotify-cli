@@ -179,9 +179,19 @@ executable, not an app bundle, so `tccutil` may answer `No such bundle identifie
 other reset is `tccutil reset AppleEvents` with no identifier, which forgets the Automation
 answers of every app on the Mac, so each of them asks again.
 
-Release binaries are ad-hoc signed, so macOS may ask again after an update: click Allow. A
-Developer ID signature (`SPOTIFY_CODESIGN_IDENTITY` when packaging) keeps the answer across
-updates.
+macOS remembers the answer for the daemon's signature. Releases after 0.1.4 are signed with the
+project's Developer ID (team `LTBSK59BJ2`, hardened runtime) and notarized by Apple, so the Allow
+survives updates; the first such release asks once more after an ad-hoc signed one. Check with
+`codesign -dv "$(command -v spotify-daemon)"`: `TeamIdentifier=LTBSK59BJ2` and
+`flags=0x10000(runtime)`. Builds you make yourself (`cargo build`, or
+`scripts/package-release.sh` without `SPOTIFY_CODESIGN_IDENTITY`) are ad-hoc signed: that
+signature changes with every build, so macOS may ask again after each one. Click Allow.
+
+The daemon carries an embedded Info.plist (bundle identifier
+`com.unlikefraction.spotify-daemon`, and the reason macOS shows in the prompt) and, in signed
+releases, the one entitlement the hardened runtime needs for Apple Events
+(`com.apple.security.automation.apple-events`). The `spotify` command sends no Apple Events
+itself; it asks the daemon.
 
 ## Security
 

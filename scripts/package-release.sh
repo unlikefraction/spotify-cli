@@ -5,12 +5,20 @@
 #   dist/<tag>/spotify-<version>.tar.gz        (Honeycomb package: honeycomb.yaml + targets/)
 #   dist/<tag>/install.sh
 # Needs: rustup targets, cargo-zigbuild + zig (Linux musl), cargo-xwin (Windows msvc).
-# Optional: SPOTIFY_CODESIGN_IDENTITY="Developer ID Application: …" to sign macOS binaries.
+# macOS signing (scripts/macos-sign.sh; each macOS target is signed before anything is packed):
+#   SPOTIFY_CODESIGN_IDENTITY="Developer ID Application: …"  Developer ID + hardened runtime
+#                                                           (unset: ad-hoc, for CI and contributors)
+#   SPOTIFY_NOTARY_PROFILE=spotify-cli                      notarize with this notarytool keychain
+#                                                           profile; fails unless Apple accepts
+# A release: both set. Without SPOTIFY_NOTARY_PROFILE the binaries are not notarized, and
+# browser downloads are refused by Gatekeeper.
 set -eu
 # No AppleDouble (._*) or extended-attribute entries in any archive.
 export COPYFILE_DISABLE=1
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
+# Fails now, not after a long build, when the identity or the notary profile is missing.
+scripts/macos-sign.sh --preflight
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 tag="v$version"
 out="$root/dist/$tag"
@@ -48,14 +56,8 @@ for spec in \
   dir="target/$triple/release"
   ext=""; case "$triple" in *windows*) ext=".exe" ;; esac
   for bin in spotify spotify-daemon; do check_arch "$dir/$bin$ext" "$arch"; done
-  case "$triple" in
-    *apple-darwin)
-      if [ -n "${SPOTIFY_CODESIGN_IDENTITY:-}" ]; then
-        for bin in spotify spotify-daemon; do codesign --force --options runtime --timestamp --identifier "com.unlikefraction.$bin" -s "$SPOTIFY_CODESIGN_IDENTITY" "$dir/$bin"; done
-      else
-        for bin in spotify spotify-daemon; do codesign --force --identifier "com.unlikefraction.$bin" -s - "$dir/$bin"; done
-      fi ;;
-  esac
+  # Sign (and notarize) before the binaries are copied into the Honeycomb package or an archive.
+  case "$triple" in *apple-darwin) scripts/macos-sign.sh "$dir" "$triple" ;; esac
   mkdir -p "$pkg/targets/$target/bin"
   cp "$dir/spotify$ext" "$dir/spotify-daemon$ext" "$pkg/targets/$target/bin/"
   case "$target" in macos-*) cp packaging/honeycomb-install-macos.sh "$pkg/targets/$target/install.sh" ;; esac
@@ -73,4 +75,11 @@ fi
 cp scripts/install.sh "$out/install.sh"
 (cd "$out" && shasum -a 256 spotify-* install.sh >SHA256SUMS)
 if command -v honeycomb >/dev/null 2>&1; then honeycomb validate "$out/spotify-$version.tar.gz" --json || echo "warning: honeycomb validate failed" >&2; fi
+if [ -z "${SPOTIFY_CODESIGN_IDENTITY:-}" ] || [ "$SPOTIFY_CODESIGN_IDENTITY" = - ]; then
+  echo "macOS binaries: ad-hoc signed, not notarized (development build)"
+elif [ -z "${SPOTIFY_NOTARY_PROFILE:-}" ]; then
+  echo "macOS binaries: Developer ID signed, NOT notarized (set SPOTIFY_NOTARY_PROFILE for a release)" >&2
+else
+  echo "macOS binaries: Developer ID signed and notarized"
+fi
 echo "Artifacts in $out:"; ls -1 "$out"
