@@ -57,4 +57,5 @@ ids).
 | `rate_limited` | Spotify or the backend is limiting | wait and retry |
 | `timeout` | Spotify, spotify_player or the daemon did not answer in time | retry; if macOS shows "spotify-daemon wants access to control Spotify", click Allow first |
 | `platform_unsupported` | this needs macOS | run it on the Mac that plays the music |
+| `webhook_unverified` | backend only: an `/webhook/` delivery failed IAM signature, timestamp or header checks | none for users; the backend logs the reason |
 | `internal` | a bug | `spotify report` |

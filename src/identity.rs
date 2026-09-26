@@ -581,7 +581,15 @@ impl Identity for Iam {
         let delivery = self
             .verifier
             .verify(headers, body)
-            .map_err(|_| AppError::unauthenticated())?;
+            .map_err(|error| {
+                tracing::warn!(reason = %error, key_version = ?headers.get("x-silicon-iam-key-version"), "IAM webhook rejected");
+                AppError::new(
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    "webhook_unverified",
+                    format!("The webhook delivery did not verify: {error}."),
+                    "Only Silicon IAM deliveries signed with this application's webhook secret are accepted.",
+                )
+            })?;
         if delivery.is_testing() != self.environment_id.is_some() {
             return Err(AppError::forbidden(
                 "Webhook plane mismatch.",

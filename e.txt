@@ -1,0 +1,1 @@
+{"error":{"code":"doctor_failed","details":{"failed":["automation_permission"]},"hint":"Run the listed fixes, or `spotify setup`.","message":"One or more required checks failed.","retryable":false}}
