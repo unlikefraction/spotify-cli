@@ -7,7 +7,7 @@ and fallback), start songs, episodes, shows and Liked Songs without bringing Spo
 playback-trigger engine, and call the spotify-cli backend.
 
 ```toml
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.6" }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.7" }
 ```
 
 ```rust

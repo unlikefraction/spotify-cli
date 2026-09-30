@@ -24,31 +24,38 @@ subcommands and adds "To skip to the next track: spotify next."
 ## How it plays
 
 - When the current song is within 0.9 s of its end, the daemon starts the managed head through
-  AppleScript. If Spotify moves on first (the queue was added too late, crossfade, a skip or stop
-  in the Spotify app), the daemon switches to the managed head immediately. When the start brings
-  Spotify.app to the front, the focus goes back to the app that had it, as for every AppleScript
-  start (`keep_spotify_in_background`, `spotify docs playback`); the daemon log says so.
-- An item leaves the queue only once Spotify actually shows it playing. Until then the hand-off
-  is pending and nothing else is decided; if it does not show up within 5 s it is retried, and
-  after three failed hand-offs the item is dropped (logged in `spotify daemon logs`).
+  the same controller as `spotify play`: under `auto`, the Web API first, with AppleScript as
+  fallback. Automatic starts, managed `next` and resumes all honor `strategy`. If Spotify moves
+  on first (the queue was added too late, crossfade, a skip or stop in the Spotify app), the daemon
+  switches to the managed head immediately. When an AppleScript start brings Spotify.app to the
+  front, the focus goes back to the app that had it (`keep_spotify_in_background`,
+  `spotify docs playback`); the daemon log says so.
+- An item leaves the queue once the controller verifies that Spotify plays it or its relinked
+  release, using `verify_timeout_ms` for each playback path. Failed hand-offs are retried; after
+  three failures the item is dropped (logged in `spotify daemon logs`).
 - Shortly before the first hand-off (and when you add to an idle queue) the daemon remembers what
   the queue will interrupt: the playing context (playlist/album) and the item up next in it. The
   up-next item comes from the Web API; the context comes from spotify_player's memory of playback,
   and when that memory names another item than the Web API (it can be up to about 20 s behind a
   change made in Spotify.app), from one fresh Web API read instead.
 - When the managed queue drains and its last item ends (or Spotify stops), the daemon resumes
-  that item in that context, so a playlist continues where you left it.
+  that item in that context, so a playlist continues where you left it. Saved local files and
+  older `spotify:user:…:collection` contexts need AppleScript (`auto` or `applescript`);
+  `spotify_player` refuses those resume points. A failed resume keeps its saved point unless a
+  newer one has been captured.
 - Queue timing needs a known track length; right after a switch, while Spotify still reports 0,
   nothing is handed over.
 
 ## `next`
 
-- With managed items, `spotify next` plays the head now. With an empty managed queue it is
+- With managed items, `spotify next` plays the head now; `--json` reports the actual `via`,
+  playback and any fallback, note or focus hand-back. With an empty managed queue it is
   Spotify's own next track (never an error).
-- Quick or concurrent `next`s are applied one after another. A `next` that arrives while the
-  previous hand-off is still in flight (sent, not yet showing) skips that item: it leaves the
-  queue, counts as played, and the item after it plays. When nothing is left, Spotify's own next
-  runs once the skipped item shows (up to 1.5 s), so it moves past that item. The reply then has
+- Quick or concurrent `next`s are applied one after another, waiting for earlier playback
+  verification to finish. If an unconfirmed hand-off remains (for example after a restart),
+  `next` skips that item: it leaves the queue, counts as played, and the item after it plays.
+  When nothing is left, Spotify's own next runs once the skipped item shows (up to 1.5 s), so it
+  moves past that item. The reply then has
   `skipped` (the human output adds `skipped <uri> (it was still being switched to)`).
 - Queueing the item that plays now and running `next` restarts it, and that counts as its turn.
 

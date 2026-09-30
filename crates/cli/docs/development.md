@@ -22,9 +22,9 @@ deploy/         backend deployment (systemd, Caddy, CloudFormation), Honeycomb a
 ## Use the library
 
 ```toml
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.6" }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.7" }
 # no HTTP at all:
-silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.6", default-features = false }
+silicon-spotify-client = { git = "https://github.com/unlikefraction/spotify-cli", tag = "v0.1.7", default-features = false }
 ```
 
 ```rust
@@ -83,8 +83,8 @@ cargo run -p silicon-spotify-client --example control -- devices
 It takes `status`, `full`, `play [uri [context]]`, `liked [random]`, `pause`, `toggle`, `next`,
 `previous`, `seek <time>`, `volume <0-100>`, `shuffle <on|off>`, `repeat <off|context|track>`,
 `like`, `unlike`, `front` (the frontmost app), `handoff <uri> [context]` (a bare AppleScript start
-with the focus hand-back, as the daemon's managed queue makes one), `lookup <uri>` (the album or
-show a Web API start would use, the release a relinked song plays from, its position),
+with the focus hand-back), `lookup <uri>` (the album or show a Web API start would use, the
+release a relinked song plays from, its position),
 `webstate` (a summary of the Web API's `GET /me/player`), `devices` (the Spotify Connect devices
 and where a start would go now), `websearch <query>` (the Web API's search, as the daemon falls
 back to it) and `raw <GET|PUT> <path> [key=value…] [json body]` (one Web API request, to see how
@@ -133,7 +133,9 @@ The socket accepts only the same OS user. Some fields a client may rely on:
   the background) and `note`.
 - `track.info` adds `liked: true|false` for songs when the Liked Songs check answers in 2.5 s.
 - `spotify.launch` answers `{"launched", "already_running", "playback"}`.
-- `player.next` may carry `skipped` (a managed item whose hand-off was still in flight).
+- `player.next` may carry `skipped` (a managed item whose hand-off was still in flight). Managed
+  starts use the same controller as `player.play` and report its actual `via`, `playback`,
+  `fallback`, `note` and `refocused` fields when present.
 - `queue.list`'s `spotify_upcoming` may carry `current_repeats_left_out` and `note`. Its
   top-level `warnings` (on every reply, empty unless something is worth knowing) holds
   `no_active_device` when Spotify reports nothing playing on any device and Spotify.app does not

@@ -287,7 +287,7 @@ Notes:
 AppleScript's starts bring Spotify.app to the front, which steals the focus from the app you work
 in. So whenever AppleScript starts something (the fallback of a song, episode, show or Liked
 Songs start, an album or playlist that spotify_player could not start, the restore after a
-failed start, and the daemon's managed-queue hand-offs and resumes), spotify-cli notes which app
+failed start, and managed-queue starts that use AppleScript), spotify-cli notes which app
 is in front, watches the front while the start runs and for 1 s after it, and as soon as
 Spotify.app takes it gives the focus back to that app (at most 3 times per start). If Spotify.app
 was hidden before, it is hidden again. In practice Spotify.app is in front for about half a

@@ -139,7 +139,7 @@ impl Reading {
 pub enum Action {
     /// Nothing.
     None,
-    /// Send `play track <uri>` (the hand-off is already marked pending).
+    /// Start this item (the hand-off is already marked pending).
     Play(String),
     /// Play the resume point.
     Resume(Resume),
@@ -217,16 +217,20 @@ impl QueueState {
         }
     }
 
-    /// The pending item started: it leaves the queue and is the managed item playing now.
-    fn started(&mut self, uri: &str, notes: &mut Vec<Note>) {
+    /// A pending item was verified: remove the requested URI and remember the URI Spotify
+    /// actually plays (it can be a relinked release). A canceled claim stays canceled.
+    pub fn hand_off_started(&mut self, uri: &str, playing: &str) -> Option<Note> {
+        if !self.pending.as_ref().is_some_and(|p| p.uri == uri) {
+            return None;
+        }
         self.pending = None;
         // Remove that item (not blindly the head: `queue add --next` may have inserted another
         // item in front while the hand-off was in flight).
         if let Some(index) = self.items.iter().position(|h| h.uri == uri) {
             self.items.remove(index);
         }
-        self.managed_now = Some(uri.to_owned());
-        notes.push(Note::Started(uri.to_owned()));
+        self.managed_now = Some(playing.to_owned());
+        Some(Note::Started(playing.to_owned()))
     }
 
     /// Records a hand-off that failed to send.
@@ -287,7 +291,7 @@ impl QueueState {
             match event {
                 PlayEvent::Started(play) => {
                     if self.pending.as_ref().is_some_and(|p| p.uri == play.uri) {
-                        self.started(&play.uri, notes);
+                        notes.extend(self.hand_off_started(&play.uri, &play.uri));
                         want = None;
                         continue;
                     }
@@ -337,7 +341,7 @@ impl QueueState {
             && now_ms >= pending.since_ms
             && reading.position_ms <= now_ms - pending.since_ms + RESTART_SLACK_MS
         {
-            self.started(&pending.uri, notes);
+            notes.extend(self.hand_off_started(&pending.uri, &pending.uri));
             return Action::None;
         }
         // A hand-off still in flight: wait for it, or count it failed after the grace period.
@@ -708,6 +712,32 @@ mod tests {
         let old: Pending =
             serde_json::from_str(r#"{"uri":"spotify:track:x","since_ms":5}"#).expect("parse");
         assert!(old.sent);
+    }
+
+    #[test]
+    fn verified_hand_offs_keep_relinked_playback_and_do_not_revive_canceled_claims() {
+        let mut q = queue(&[X, X, Y]);
+        let mut notes = Vec::new();
+        q.claim_next(1_000, &mut notes);
+        // The controller verified X as release U, even after the old grace period.
+        assert_eq!(q.hand_off_started(X, U), Some(Note::Started(U.into())));
+        assert_eq!(q.pending, None);
+        assert_eq!(q.managed_now.as_deref(), Some(U));
+        assert_eq!(q.items, vec![item(X), item(Y)]);
+        assert_eq!(
+            q.decide(&[started(U)], &reading(U, 100), 20_000, &mut notes),
+            Action::None
+        );
+        // The duplicate still gets its own turn, without replaying the confirmed claim.
+        assert_eq!(q.claim_next(20_100, &mut notes), Some(item(X)));
+        assert!(notes.is_empty(), "no failed or skipped hand-off: {notes:?}");
+        q.hold(20_200);
+        assert_eq!(q.hand_off_started(X, U), None);
+        assert_eq!(q.managed_now, None);
+        assert_eq!(q.items, vec![item(X), item(Y)]);
+        q.claim_next(20_300, &mut notes);
+        assert_eq!(q.hand_off_started(Y, Y), None);
+        assert_eq!(q.pending.as_ref().map(|p| p.uri.as_str()), Some(X));
     }
 
     #[test]

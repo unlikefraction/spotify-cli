@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.7 — 2026-10-01
+
+- Managed-queue transitions, `next` and resuming the interrupted context now use the same
+  API-first playback controller as `spotify play`. Under `auto`, AppleScript runs only when
+  the API cannot start playback, so queued songs no longer switch focus to Spotify each time.
+- Queue starts honor the configured strategy, record verified playback immediately, and
+  recognize relinked songs. Slow API requests no longer expire a hand-off while it is running.
+- Managed `next --json` reports the actual playback method, fallback reason and playback state;
+  automatic transitions log the same routing information.
+- Saved local files and legacy collection contexts retain their AppleScript resume path when
+  the configured strategy permits it; a failed resume no longer discards its saved point.
+
 ## 0.1.6 — 2026-09-27
 
 Playback control:

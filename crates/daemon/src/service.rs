@@ -684,6 +684,12 @@ async fn control(
 async fn next(daemon: &Arc<Daemon>, settings: Settings) -> Result<Value> {
     let d = Arc::clone(daemon);
     let result = blocking(move || {
+        // Same lock order as the watcher: a slow, verified API start must not have its
+        // pending claim expired by an observation taken while the request is still running.
+        let _observing = d
+            .observe_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _serial = d
             .hand_off
             .lock()
@@ -2304,7 +2310,7 @@ fn queue_edit(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const ID: &str = "0NiLR6uUU0Mk0bfN4VRu5u";
@@ -2718,7 +2724,7 @@ mod tests {
         }
     }
 
-    fn daemon_playing(uri: &str) -> Daemon {
+    pub(crate) fn daemon_playing(uri: &str) -> Daemon {
         Daemon {
             db: Db::open(std::path::Path::new(":memory:")).expect("db"),
             dir: std::env::temp_dir(),

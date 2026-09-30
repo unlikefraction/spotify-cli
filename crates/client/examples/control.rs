@@ -5,8 +5,8 @@
 //! Commands: `status`, `full`, `play [uri [context]]`, `liked [random]`, `pause`, `toggle`,
 //! `next`, `previous`, `seek <time>`, `volume <0-100>`, `shuffle <on|off>`,
 //! `repeat <off|context|track>`, `like`, `unlike`, `front` (the frontmost app), `handoff <uri>
-//! [context]` (a bare AppleScript start with the focus hand-back, as the daemon's managed queue
-//! makes one), `webstate` (the Web API's `GET /me/player`: item, context, device), `devices`
+//! [context]` (a bare AppleScript start with the focus hand-back), `webstate` (the Web API's
+//! `GET /me/player`: item, context, device), `devices`
 //! (the Spotify Connect devices and where a start would go now), `lookup <uri>` (the album or
 //! show a Web API start would use, the id it lists the item under, and the release a relinked
 //! song plays from; an item not playable here is `not_playable`), `websearch
