@@ -2505,6 +2505,12 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
+    #[derive(Clone, Copy)]
+    enum ShuffleDelay {
+        At(Instant),
+        AfterNextRead,
+    }
+
     /// Spotify.app as the fake sees it.
     struct App {
         state: String,
@@ -2513,18 +2519,17 @@ mod tests {
         volume: u8,
         shuffling: bool,
         repeating: bool,
-        /// A shuffle Spotify.app switches to late: after this many more reads, `shuffling`
-        /// becomes the value (as Spotify applies the shuffle it keeps for a list a moment after
-        /// the list's first song shows).
-        late_shuffle: Option<(u32, bool)>,
-        /// Liked Songs' kept shuffle when Spotify.app switches to it only [`LATE_READS`] reads
-        /// after an AppleScript start of the list (`None`: at once, as `shuffling` already is).
+        /// A delayed shuffle change. List switches follow elapsed time; explicit undo tests
+        /// wait until after the initial verification read before switching the value back.
+        late_shuffle: Option<(ShuffleDelay, bool)>,
+        /// Liked Songs' kept shuffle when Spotify.app switches after [`LATE_SHUFFLE_DELAY`]
+        /// from an AppleScript start (`None`: at once, as `shuffling` already is).
         late_kept: Option<bool>,
     }
 
-    /// Reads that still show the shuffle of the list before, after a list started: more than
-    /// "two reads in a row agree" would wait for.
-    const LATE_READS: u32 = 3;
+    /// Longer than two normal polling intervals, but inside the real shuffle quiet period.
+    /// A read-count delay can outlive that wall-clock period on a busy CI runner.
+    const LATE_SHUFFLE_DELAY: Duration = Duration::from_millis(360);
 
     /// A fake Spotify.app: AppleScript commands mutate state; status reads it. With `shared`, it
     /// also applies what the fake spotify_player did (lines in `shared/app`).
@@ -2592,12 +2597,14 @@ mod tests {
             let s = applescript::SEP;
             if source.contains("character id 31") {
                 match app.late_shuffle {
-                    Some((0, on)) => {
+                    Some((ShuffleDelay::At(at), on)) if Instant::now() >= at => {
                         app.shuffling = on;
                         app.late_shuffle = None;
                     }
-                    Some((reads, on)) => app.late_shuffle = Some((reads - 1, on)),
-                    None => {}
+                    Some((ShuffleDelay::AfterNextRead, on)) => {
+                        app.late_shuffle = Some((ShuffleDelay::At(Instant::now()), on));
+                    }
+                    _ => {}
                 }
                 let head = format!(
                     "{}{s}{}{s}{}{s}{}",
@@ -2636,9 +2643,10 @@ mod tests {
                     // Liked Songs starts at the song its kept shuffle order starts with (the same
                     // one every time), or in order at its first song.
                     // With `late_kept`, it starts in the shuffle of the list before and
-                    // switches to the kept one a few reads later.
+                    // switches to the kept one a moment later.
                     if let Some(kept) = app.late_kept.filter(|_| uri.ends_with(":collection")) {
-                        app.late_shuffle = Some((LATE_READS, kept));
+                        app.late_shuffle =
+                            Some((ShuffleDelay::At(Instant::now() + LATE_SHUFFLE_DELAY), kept));
                     }
                     let uri = match (uri.ends_with(":collection"), app.shuffling) {
                         (true, true) => "spotify:track:kept-shuffle-start",
@@ -3809,7 +3817,7 @@ exit 0
         app: &'a FakeApp,
         kept_shuffle: Mutex<bool>,
         liked_playing: Mutex<bool>,
-        /// Spotify.app switches to Liked Songs' kept shuffle only [`LATE_READS`] reads after the
+        /// Spotify.app switches to Liked Songs' kept shuffle after [`LATE_SHUFFLE_DELAY`] from the
         /// list started: its first song shows in the shuffle of the list before (seen live).
         late: bool,
         /// Spotify switches this many of the next shuffle sets back, one read later.
@@ -3840,7 +3848,7 @@ exit 0
         }
 
         /// Spotify.app shows the start in the shuffle of the list before, and switches to Liked
-        /// Songs' kept one only [`LATE_READS`] reads later.
+        /// Songs' kept one after [`LATE_SHUFFLE_DELAY`].
         fn late(self) -> Self {
             Self { late: true, ..self }
         }
@@ -3883,7 +3891,7 @@ exit 0
                 let mut undo = self.undo_next_shuffle.lock().expect("lock");
                 if *undo > 0 {
                     *undo -= 1;
-                    app.late_shuffle = Some((1, !on));
+                    app.late_shuffle = Some((ShuffleDelay::AfterNextRead, !on));
                 }
                 return Ok(reply);
             }
@@ -3898,7 +3906,8 @@ exit 0
             let uri = if context.ends_with(":collection") {
                 *liked = true;
                 if self.late {
-                    app.late_shuffle = Some((LATE_READS, *kept));
+                    app.late_shuffle =
+                        Some((ShuffleDelay::At(Instant::now() + LATE_SHUFFLE_DELAY), *kept));
                 } else {
                     app.shuffling = *kept;
                 }
