@@ -119,7 +119,7 @@ fn facts(ctx: &Ctx, found: &Found) -> Vec<Value> {
         .home
         .sessions()
         .ok()
-        .and_then(|s| s.slots.get(&ctx.slot()).cloned());
+        .and_then(|s| ctx.slot().ok().and_then(|key| s.slots.get(&key).cloned()));
     let ting = session
         .as_ref()
         .and_then(|s| s.session.ting.as_ref())

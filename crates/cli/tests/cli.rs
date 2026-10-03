@@ -94,6 +94,135 @@ fn login_status_without_a_session_is_false_and_exit_zero() {
 }
 
 #[test]
+fn ting_consent_retries_keep_the_request_and_account_context() {
+    use silicon_spotify_client::api::{Actor, Session};
+    use silicon_spotify_client::store::{self, Home};
+    use std::io::{BufRead as _, Read as _, Write as _};
+
+    let env = Env::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+    let origin = format!("http://{}", listener.local_addr().expect("address"));
+    let home = Home::from_root(env.home.path().to_path_buf());
+    let session = Session {
+        access_token: "test-access".into(),
+        refresh_token: "test-refresh".into(),
+        token_type: "Bearer".into(),
+        expires_in: 1800,
+        scope: String::new(),
+        actor: Actor {
+            kind: "silicon".into(),
+            public_id: "si:planner".into(),
+        },
+        org_id: "one".into(),
+        org_ids: vec!["one".into()],
+        testing_environment_id: None,
+        testing_generation: None,
+        ting: None,
+    };
+    let base = store::slot_key(&origin, None);
+    store::save_login(&home, &base, &origin, session).expect("save login");
+    let server = std::thread::spawn(move || {
+        let mut keys = Vec::new();
+        for attempt in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("timeout");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+            let mut first = String::new();
+            reader.read_line(&mut first).expect("request");
+            assert!(first.starts_with(if attempt < 2 {
+                "POST /api/v1/ting/authorizations "
+            } else {
+                "GET /api/v1/ting/authorizations/request-1 "
+            }));
+            let mut headers = String::new();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("header");
+                if line == "\r\n" {
+                    break;
+                }
+                let lower = line.to_ascii_lowercase();
+                if let Some(value) = lower.strip_prefix("content-length:") {
+                    length = value.trim().parse().expect("length");
+                }
+                if let Some(value) = lower.strip_prefix("idempotency-key:") {
+                    keys.push(value.trim().to_owned());
+                }
+                headers.push_str(&lower);
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).expect("body");
+            assert!(headers.contains("x-org-id: one\r\n"));
+            assert!(headers.contains("authorization: bearer test-access\r\n"));
+            let (status, body) = if attempt == 0 {
+                (
+                    "503 Service Unavailable",
+                    r#"{"error":{"code":"backend_unavailable","message":"lost response","retryable":true}}"#,
+                )
+            } else {
+                (
+                    "200 OK",
+                    r#"{"request_id":"request-1","authorization":{"authorization_url":"https://auth.iam.teamofsilicons.com/approve","status":"pending"},"completed":false,"roots":[]}"#,
+                )
+            };
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("respond");
+        }
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            keys[0], keys[1],
+            "an uncertain start keeps its mutation identity"
+        );
+    });
+    let run = |args: &[&str]| {
+        env.command(args)
+            .env("SPOTIFY_API_URL", &origin)
+            .output()
+            .expect("run")
+    };
+    assert_eq!(run(&["ting", "authorize", "--json"]).status.code(), Some(5));
+    let recovered = run(&["ting", "authorize", "--json"]);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(stdout_json(&recovered)["request_id"], "request-1");
+    assert!(run(&["ting", "authorize", "--json"]).status.success());
+    let wrong = run(&[
+        "ting",
+        "complete",
+        "another-request",
+        "--code-file",
+        "/missing",
+        "--json",
+    ]);
+    assert_eq!(wrong.status.code(), Some(2));
+    assert!(
+        stderr_error(&wrong)["message"]
+            .as_str()
+            .expect("message")
+            .contains("selected account")
+    );
+    let saved = home.sessions().expect("saved");
+    assert_eq!(saved.slots.len(), 1);
+    assert_eq!(
+        saved
+            .slots
+            .values()
+            .next()
+            .expect("slot")
+            .session
+            .actor
+            .public_id,
+        "si:planner"
+    );
+    server.join().expect("server");
+}
+
+#[test]
 fn logout_is_probeable_and_idempotent() {
     let env = Env::new();
     assert!(env.run(&["logout", "--help"]).status.success());

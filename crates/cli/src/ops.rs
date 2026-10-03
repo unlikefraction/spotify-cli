@@ -839,7 +839,7 @@ async fn trigger(ctx: &Ctx, action: TriggerCommand) -> Result<()> {
             let value = ctx
                 .daemon(
                     "trigger.test",
-                    json!({"id": id, "target": target(ctx), "isi": isi(ctx)}),
+                    json!({"id": id, "target": target(ctx)?, "isi": isi(ctx)}),
                 )
                 .await?;
             ctx.emit(&value, |v| {
@@ -885,13 +885,13 @@ async fn trigger(ctx: &Ctx, action: TriggerCommand) -> Result<()> {
     }
 }
 
-fn target(ctx: &Ctx) -> Value {
-    json!({
+fn target(ctx: &Ctx) -> Result<Value> {
+    Ok(json!({
         "api_url": ctx.api_url,
-        "slot": ctx.slot(),
+        "slot": ctx.slot()?,
         "testing": ctx.testing.is_some(),
         "org": ctx.org(None),
-    })
+    }))
 }
 
 fn isi(ctx: &Ctx) -> Option<String> {
@@ -950,7 +950,7 @@ async fn trigger_add(ctx: &Ctx, add: TriggerAdd) -> Result<()> {
                 "label": add.label,
                 "notify_expiry": !add.no_expiry_notice,
                 "ting": !add.local,
-                "target": target(ctx),
+                "target": target(ctx)?,
                 "isi": isi(ctx),
             }),
         )

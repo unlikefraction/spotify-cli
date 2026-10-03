@@ -1197,7 +1197,7 @@ pub const ENTRIES: &[Entry] = &[
         featured: Some("spotify login 'oac_…'"),
         capabilities: &[
             "exchange an IAM short-lived token (SLT) for a session",
-            "register as a Ting recipient so triggers can notify you",
+            "select one account and organization; Ting consent is separate",
         ],
         keywords: &[
             "sign in",
@@ -1254,6 +1254,21 @@ pub const ENTRIES: &[Entry] = &[
         ..Entry::EMPTY
     },
     Entry {
+        path: "login contexts",
+        keywords: &["accounts", "organizations", "contexts"],
+        output: &[("contexts[]", "saved account and organization sessions")],
+        ..Entry::EMPTY
+    },
+    Entry {
+        path: "login use",
+        keywords: &["switch account", "switch organization"],
+        output: &[
+            ("account", "selected public account ID"),
+            ("org_id", "selected organization"),
+        ],
+        ..Entry::EMPTY
+    },
+    Entry {
         path: "ting",
         goal: Some(Goal::Account),
         keywords: &["notification recipient", "register"],
@@ -1269,6 +1284,23 @@ pub const ENTRIES: &[Entry] = &[
             ("ting.subscribed", "true"),
             ("subscription", "Ting's answer"),
         ],
+        ..Entry::EMPTY
+    },
+    Entry {
+        path: "ting authorize",
+        keywords: &["notification permission", "consent", "obo"],
+        needs: IAM,
+        output: &[
+            ("request_id", "saved consent request identity"),
+            ("authorization.authorization_url", "IAM approval URL"),
+        ],
+        ..Entry::EMPTY
+    },
+    Entry {
+        path: "ting complete",
+        keywords: &["consent code", "approve notifications"],
+        needs: IAM,
+        output: &[("ting.subscribed", "recipient registered after consent")],
         ..Entry::EMPTY
     },
     Entry {
@@ -1863,9 +1895,13 @@ const EFFECTS: &[(&str, &[Change], Option<&str>)] = &[
     ("iam", &[], None),
     ("login", &[C::Session], None),
     ("login status", &[], None),
+    ("login contexts", &[], None),
+    ("login use", &[C::Session], None),
     ("logout", &[C::Session], None),
     ("ting", &[], None),
     ("ting register", &[C::Session], None),
+    ("ting authorize", &[C::Session], None),
+    ("ting complete", &[C::Session], None),
     ("ting status", &[], None),
     ("auth", &[], None),
     ("auth status", &[], None),

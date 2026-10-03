@@ -9,8 +9,12 @@ curl -fsSL https://spotify.unlikefraction.com/install.sh | sh
 spotify doctor
 spotify play --search 'arctic monkeys 505'
 spotify lyrics spotify:track:0BxE4FqsDD1Ot4YuBXwAPp     # any song's lyrics; nothing has to play
-spotify trigger add --remaining 30s --note 'wrap up'
+spotify trigger add --remaining 30s --note 'wrap up' --local
 ```
+
+For Ting notifications, sign in with `spotify login`, then run `spotify ting authorize` and
+complete the IAM approval with `spotify ting complete REQUEST_ID --code-file FILE`. Login and
+notification consent are separate. See [Authentication](docs/auth.md).
 
 Installer options, where state lives and how to uninstall:
 [Install options](docs/usage.md#install-options).

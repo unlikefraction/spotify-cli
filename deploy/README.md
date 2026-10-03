@@ -15,7 +15,7 @@ run it. Nothing here is run by the build.
 | 8 | Space Station tables → keys into the secret; redeploy | `unlikefraction` member |
 | 9 | Release binaries (GitHub release + Honeycomb package) | macOS build host with zig and cargo-xwin; Developer ID certificate and notarytool profile |
 | 10 | Website + docs on Vercel | Vercel CLI |
-| 11 | End-to-end check with a real Silicon | a Silicon with `iam` 4.x |
+| 11 | End-to-end check with a real Silicon | a Carbon or Silicon with `iam` 5.2.1 |
 
 ## 1. Repository
 
@@ -68,7 +68,7 @@ log in; `honeycomb --json publication get spotify` shows the state.
 Write a private JSON file (never pass values on the command line):
 
 ```json
-{"SPOTIFY_IAM_APP_SECRET":"ask_…","SPOTIFY_IAM_WEBHOOK_SECRET":"…","SPOTIFY_BACKUP_BUCKET":"<ArtifactBucket>",
+{"SPOTIFY_ENCRYPTION_KEY":"<openssl rand -hex 32>","SPOTIFY_IAM_APP_SECRET":"ask_…","SPOTIFY_IAM_WEBHOOK_SECRET":"…","SPOTIFY_BACKUP_BUCKET":"<ArtifactBucket>",
  "SPOTIFY_PUBLIC_ORIGIN":"https://backend.spotify.unlikefraction.com","RUST_LOG":"info"}
 ```
 
@@ -79,6 +79,12 @@ python3 deploy/deploy.py --caddy /path/to/caddy_linux_arm64
 curl -fsS https://backend.spotify.unlikefraction.com/healthz
 curl -fsS https://backend.spotify.unlikefraction.com/api/v1/iam
 ```
+
+The encryption key protects durable Ting OBO token families in SQLite. Generate it once with
+`openssl rand -hex 32`, store it in the runtime secret, and retain it across deployments and restores.
+Back up the SQLite database and runtime secret together. IAM 5 login never grants Ting authority: users
+run `spotify ting authorize`, complete the displayed request with `spotify ting complete <request-id> --code-file -`,
+then `spotify ting register`. Logout preserves this independent grant.
 
 ## 6. Webhook approval
 
@@ -171,5 +177,8 @@ On a Mac with Spotify, as a Silicon:
 curl -fsSL https://spotify.unlikefraction.com/install.sh | sh
 spotify doctor
 iam -o json silicon-login --app-id spotify --grant-org unlikefraction --approve-scopes | jq -r .slt | spotify login --token-file -
-spotify trigger test          # a spotify.trigger.fired Ting reaches the Silicon's flow
+spotify ting authorize       # review the separate Ting permission request in IAM
+spotify ting complete <request-id> --code-file -   # paste IAM's one-use code
+spotify ting register
+spotify trigger test          # a spotify.trigger.fired Ting reaches the selected account
 ```

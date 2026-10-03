@@ -231,7 +231,9 @@ SLT comes from `iam`, Silicon IAM's own CLI, separate from spotify-cli (details 
 cargo install silicon-iam-cli                        # once: the iam CLI
 spotify iam --json                                   # app_id: spotify
 iam silicon-login --app-id spotify --grant-org "$SILICON_ORG" --approve-scopes   # prints an SLT
-spotify login '<SLT>'                                # exchanges it; registers you with Ting
+spotify login '<SLT>'                                # one account and organization
+spotify ting authorize                              # review separate notification consent in IAM
+spotify ting complete REQUEST_ID --code-file /secure/consent-code
 spotify login status --json                          # {"authenticated": true, ...}
 ```
 

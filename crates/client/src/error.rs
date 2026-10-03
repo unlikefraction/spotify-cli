@@ -139,10 +139,11 @@ impl Error {
     pub fn exit_code(&self) -> i32 {
         match self.code.as_str() {
             "invalid_input" | "usage" | "threshold_passed" => 2,
-            "not_authenticated" | "spotify_auth_required" | "reconsent_required" => 3,
+            "not_authenticated" | "spotify_auth_required" => 3,
             "permission_denied"
             | "automation_permission_denied"
             | "forbidden"
+            | "reconsent_required"
             | "recipient_not_registered" => 4,
             "daemon_unavailable"
             | "backend_unavailable"

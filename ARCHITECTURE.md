@@ -18,7 +18,7 @@ playback triggers delivered over Ting) and the ecosystem rules every IAM app fol
                 │ SLT, refresh, report      │ Silicon's own oat_ token
                 ▼                           ▼
              backend (spotify-api, holds the IAM app secret)
-                │ IAM: SLT exchange, introspection, OBO proofs      │ Ting: subscriptions, tings
+                │ IAM: SLT exchange, introspection, OBO consent/tokens      │ Ting: subscriptions, tings
 ```
 
 - **Library (stateless)** — `silicon-spotify-client`: models, parsers, AppleScript builders and
@@ -46,9 +46,9 @@ playback triggers delivered over Ting) and the ecosystem rules every IAM app fol
 | Managed queue in the daemon | Neither the Web API nor AppleScript can remove or reorder Spotify's queue, and spotify_player's CLI cannot even append. "CRUD queue" is only possible with our own queue; Spotify's upcoming list is shown read-only. Automatic starts, managed `next` and resuming the interrupted context use the same verified controller as `play`, honoring the configured strategy (Web API first under `auto`). |
 | Trigger engine as pure code | Every rule (plays, completion, expiry, no retroactive fires, restart-safe play ids) is unit-tested without Spotify. |
 | Current-scope triggers expire loudly (`spotify.trigger.expired`) | A Silicon waiting for "30 s left" on a song that got skipped must not wait forever. |
-| Custody: the Silicon's session stays in its home; the daemon borrows it under the same lock | Matches IAM's guidance (session storage in the app's daemon) and the DM precedent; the backend holds no IAM tokens (not a credential vault). Refresh keys are derived from the refresh token so any process can replay an uncertain refresh safely. |
-| Backend mints a fresh OBO proof per Ting send, bound to exact bytes; `for`/`org_id` come from the verified session | Ting's contract; a Silicon can only notify itself. |
-| Ting registration at explicit login only | Re-registering re-activates a grant the recipient may have revoked; `spotify ting register` is the explicit retry. |
+| Custody: the Silicon's session stays in its home; the daemon borrows it under the same lock | Matches IAM's guidance (session storage in the app's daemon) and the DM precedent; ordinary login tokens stay local; the backend encrypts separately approved OBO root tokens. Refresh keys are derived from the refresh token so any process can replay an uncertain refresh safely. |
+| Backend stores each approved OBO root separately, encrypted; Ting verifies its reusable access token on every operation | Feature consent selects provider context. Stable notification keys deduplicate writes. |
+| Ting consent and registration are separate from login | `spotify ting authorize` requests feature permission; `spotify ting complete` stores it and registers. Ordinary logout preserves consent. |
 | Durable outbox with stable keys `<recipient>/<trigger>/<play>/<outcome>` | Retries never duplicate a notification (Ting dedupes keys for 14 days). |
 | Controls work without IAM login; triggers need it | Playing music is local; notifying someone needs an identity. `--local` triggers work without Ting. |
 | Auto-start the Spotify sign-in when a Silicon needs it (rate-limited) | The spec: "if not authenticated, run the authentication script when silicon tries to use it". A Carbon must click Agree, so the error says a browser tab was opened and to retry. |

@@ -32,7 +32,7 @@ pub struct Actor {
     pub public_id: String,
 }
 
-/// Ting recipient registration result, reported at login.
+/// Ting recipient registration result, separate from ordinary login.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TingRegistration {
     /// Whether Ting holds an active grant for this app to notify this actor.
@@ -62,12 +62,15 @@ pub struct Session {
     pub actor: Actor,
     /// Selected organization.
     pub org_id: String,
-    /// Every organization the token reaches.
+    /// Compatibility field; may contain only the selected organization.
     #[serde(default)]
     pub org_ids: Vec<String>,
     /// Testing environment, when logged into a testing plane.
     #[serde(default)]
     pub testing_environment_id: Option<String>,
+    /// Opaque testing cleaning/key generation binding; absent in production.
+    #[serde(default)]
+    pub testing_generation: Option<String>,
     /// Ting registration (login only).
     #[serde(default)]
     pub ting: Option<TingRegistration>,
@@ -343,6 +346,70 @@ impl Api {
             .1)
     }
 
+    /// Start feature-level Ting consent; retry with the same persisted key.
+    ///
+    /// # Errors
+    /// Backend or IAM errors.
+    pub async fn authorize_ting(&self, token: &str, org: &str, key: &str) -> Result<Value> {
+        Ok(self
+            .call(
+                Method::POST,
+                "/api/v1/ting/authorizations",
+                Some((token, org)),
+                Some(key),
+                Some(&json!({})),
+            )
+            .await?
+            .1)
+    }
+
+    /// Inspect an authorization bound to the current account and organization.
+    ///
+    /// # Errors
+    /// Backend or IAM errors.
+    pub async fn ting_authorization(
+        &self,
+        token: &str,
+        org: &str,
+        request_id: &str,
+    ) -> Result<Value> {
+        check_request_id(request_id)?;
+        Ok(self
+            .call(
+                Method::GET,
+                &format!("/api/v1/ting/authorizations/{request_id}"),
+                Some((token, org)),
+                None,
+                None,
+            )
+            .await?
+            .1)
+    }
+
+    /// Redeem the approved one-use code. Credentials stay on the backend.
+    ///
+    /// # Errors
+    /// Backend or IAM errors.
+    pub async fn complete_ting(
+        &self,
+        token: &str,
+        org: &str,
+        request_id: &str,
+        code: &str,
+    ) -> Result<Value> {
+        check_request_id(request_id)?;
+        Ok(self
+            .call(
+                Method::POST,
+                &format!("/api/v1/ting/authorizations/{request_id}/complete"),
+                Some((token, org)),
+                None,
+                Some(&json!({"authorization_code": code})),
+            )
+            .await?
+            .1)
+    }
+
     /// `POST /api/v1/tings`: delivers one notification to the calling Silicon through Ting.
     ///
     /// # Errors
@@ -398,6 +465,21 @@ impl Api {
             .await
             .map(drop)
     }
+}
+
+fn check_request_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        return Err(Error::invalid(
+            "Invalid authorization request ID.",
+            "Use the request_id returned by `spotify ting authorize`.",
+        ));
+    }
+    Ok(())
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T> {

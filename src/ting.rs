@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::error::{AppError, AppResult};
-use crate::identity::{AuthContext, Identity, Proof, TingEndpoint};
+use crate::identity::{AuthContext, Identity, TingAccess, TingEndpoint};
 
 /// Largest Ting send body.
 pub const MAX_SEND_BYTES: usize = 256 * 1024;
@@ -16,8 +16,8 @@ pub const MAX_SEND_BYTES: usize = 256 * 1024;
 /// HTTP transport to Ting (a trait so tests can fake it).
 #[async_trait]
 pub trait TingApi: Send + Sync {
-    /// POSTs exact bytes with a proof; returns (status, JSON body).
-    async fn post(&self, path: &str, body: Vec<u8>, proof: &Proof) -> AppResult<(u16, Value)>;
+    /// POSTs exact bytes with an OBO access token; returns (status, JSON body).
+    async fn post(&self, path: &str, body: Vec<u8>, proof: &TingAccess) -> AppResult<(u16, Value)>;
 }
 
 /// The real transport.
@@ -45,7 +45,7 @@ impl TingHttp {
 
 #[async_trait]
 impl TingApi for TingHttp {
-    async fn post(&self, path: &str, body: Vec<u8>, proof: &Proof) -> AppResult<(u16, Value)> {
+    async fn post(&self, path: &str, body: Vec<u8>, proof: &TingAccess) -> AppResult<(u16, Value)> {
         let url = self.base.join(path).map_err(AppError::internal)?;
         let mut request = self
             .client
@@ -85,15 +85,18 @@ fn ting_error(status: u16, body: &Value) -> AppError {
         .pointer("/error/code")
         .and_then(Value::as_str)
         .unwrap_or("ting_error");
+    if matches!(
+        code,
+        "invalid_obo_token" | "invalid_proof" | "obo_grant_revoked" | "obo_grant_expired"
+    ) {
+        return crate::obo::required().with_details(json!({"ting_code": code}));
+    }
     let message = body
         .pointer("/error/message")
         .and_then(Value::as_str)
         .unwrap_or("Ting refused the request.");
     let (http, hint) = match code {
-        "recipient_not_registered" => (
-            403,
-            "Register again with `spotify ting register` (or log in again).",
-        ),
+        "recipient_not_registered" => (403, "Register again with `spotify ting register`."),
         "not_found" => (
             404,
             "The Ting type is not registered for this app yet; operators run deploy/ting-types.sh.",
@@ -107,15 +110,9 @@ fn ting_error(status: u16, body: &Value) -> AppError {
         "permission_denied" | "test_context_mismatch" => {
             (403, "Check the app's Ting approval and testing plane.")
         }
-        "invalid_proof"
-        | "proof_expired"
-        | "proof_consumed"
-        | "proof_verification_uncertain"
-        | "dependency_unavailable"
-        | "storage_unavailable" => (
-            503,
-            "Temporary: retry with the same key (a fresh proof is minted per attempt).",
-        ),
+        "proof_verification_uncertain" | "dependency_unavailable" | "storage_unavailable" => {
+            (503, "Temporary: retry the same pending action and key.")
+        }
         _ if status >= 500 => (503, "Retry later."),
         _ => (502, "Report it with `spotify report`."),
     };
@@ -137,22 +134,23 @@ pub async fn register(
     ting: &dyn TingApi,
     context: &AuthContext,
     app_id: &str,
+    attempt: &str,
 ) -> AppResult<Value> {
     let body = serde_json::to_vec(
         &json!({"org_id": context.org_id, "app_id": app_id, "for": context.actor.public_id}),
     )
     .map_err(AppError::internal)?;
-    let attempt = uuid::Uuid::now_v7().to_string();
     let proof = identity
-        .ting_proof(context, TingEndpoint::Register, &body, &attempt)
+        .ting_access(context, TingEndpoint::Register, &body, attempt)
         .await?;
+    let body = provider_body(&body, &proof)?;
     let (status, value) = ting
         .post(TingEndpoint::Register.path(), body, &proof)
         .await?;
     if !matches!(status, 200 | 201) {
         return Err(ting_error(status, &value));
     }
-    if value.get("for").and_then(Value::as_str) != Some(context.actor.public_id.as_str())
+    if value.get("for").and_then(Value::as_str) != Some(proof.actor.public_id.as_str())
         || value.get("active") != Some(&Value::Bool(true))
     {
         return Err(AppError::dependency("ting"));
@@ -236,10 +234,14 @@ pub async fn send(
     context: &AuthContext,
     body: Vec<u8>,
 ) -> AppResult<Value> {
-    let attempt = uuid::Uuid::now_v7().to_string();
+    let value: Value = serde_json::from_slice(&body).map_err(AppError::internal)?;
+    let attempt = value["key"]
+        .as_str()
+        .ok_or_else(|| AppError::internal("missing operation key"))?;
     let proof = identity
-        .ting_proof(context, TingEndpoint::Send, &body, &attempt)
+        .ting_access(context, TingEndpoint::Send, &body, attempt)
         .await?;
+    let body = provider_body(&body, &proof)?;
     let (status, value) = ting.post(TingEndpoint::Send.path(), body, &proof).await?;
     if !matches!(status, 200 | 202) {
         return Err(ting_error(status, &value));
@@ -254,4 +256,11 @@ pub async fn send(
         "silent": value.get("silent"),
         "replayed": status == 200,
     }))
+}
+
+fn provider_body(body: &[u8], proof: &TingAccess) -> AppResult<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(body).map_err(AppError::internal)?;
+    value["org_id"] = json!(proof.org_id);
+    value["for"] = json!(proof.actor.public_id);
+    serde_json::to_vec(&value).map_err(AppError::internal)
 }

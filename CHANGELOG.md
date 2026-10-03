@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0
+
+- Migrate to IAM 5 with one account and organization per session. Preserve separate saved
+  contexts and keep existing trigger deliveries bound to their originating context.
+- Request Ting permission when enabling notifications, with recoverable authorization and
+  code completion commands. Ordinary login and logout no longer grant or erase OBO consent.
+- Replace consumed proofs with encrypted, rotating root access/refresh credentials and
+  reusable token verification at Ting.
+
 ## 0.1.7 — 2026-10-01
 
 - Managed-queue transitions, `next` and resuming the interrupted context now use the same

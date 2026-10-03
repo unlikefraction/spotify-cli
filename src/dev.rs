@@ -17,14 +17,13 @@ use uuid::Uuid;
 use crate::api::{AppState, TestingPlanes};
 use crate::config::{Settings, TableKeys};
 use crate::error::{AppError, AppResult};
-use crate::identity::{Actor, AppSession, AuthContext, Identity, Proof, TingEndpoint};
+use crate::identity::{Actor, AppSession, AuthContext, Identity, TingAccess, TingEndpoint};
 use crate::store::Store;
 use crate::telemetry::Recorder;
 use crate::ting::TingApi;
 
 /// Scopes a full consent grants.
-pub const SCOPES: &str =
-    "obo:ting:subscriptions.register obo:ting:tings.send self.identity.read self.profile.read";
+pub const SCOPES: &str = "self.identity.read self.profile.read";
 
 #[derive(Clone)]
 struct Grant {
@@ -38,7 +37,9 @@ struct Grant {
 pub struct FakeIam {
     access: Mutex<HashMap<String, Grant>>,
     refresh: Mutex<HashMap<String, Grant>>,
-    /// Scopes to grant (tests can remove Ting scopes).
+    /// Simulates independently denied Ting feature consent.
+    pub denied_ting: std::sync::atomic::AtomicBool,
+    /// Ordinary IAM login scopes.
     pub scopes: Mutex<Option<String>>,
 }
 
@@ -82,6 +83,7 @@ impl FakeIam {
             org_id: grant.org.clone(),
             org_ids: vec![grant.org],
             testing_environment_id: None,
+            testing_generation: None,
         }
     }
 }
@@ -156,23 +158,25 @@ impl Identity for FakeIam {
         })
     }
 
-    async fn ting_proof(
+    async fn ting_access(
         &self,
         context: &AuthContext,
-        endpoint: TingEndpoint,
+        _endpoint: TingEndpoint,
         _body: &[u8],
         _attempt_key: &str,
-    ) -> AppResult<Proof> {
-        if !context.has(&endpoint.scope()) || !context.has("self.identity.read") {
+    ) -> AppResult<TingAccess> {
+        if self.denied_ting.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(AppError::new(
                 axum::http::StatusCode::FORBIDDEN,
                 "reconsent_required",
-                "missing Ting scopes",
-                "log in again",
+                "Ting feature consent missing",
+                "spotify ting authorize",
             ));
         }
-        Ok(Proof {
-            token: SecretString::from(format!("proof_{}", Uuid::now_v7().simple())),
+        Ok(TingAccess {
+            actor: context.actor.clone(),
+            org_id: context.org_id.clone(),
+            token: SecretString::from(format!("oba_{}", Uuid::now_v7().simple())),
             testing: None,
         })
     }
@@ -207,8 +211,8 @@ pub struct FakeTing {
 
 #[async_trait]
 impl TingApi for FakeTing {
-    async fn post(&self, path: &str, body: Vec<u8>, proof: &Proof) -> AppResult<(u16, Value)> {
-        if !proof.token.expose_secret().starts_with("proof_") {
+    async fn post(&self, path: &str, body: Vec<u8>, proof: &TingAccess) -> AppResult<(u16, Value)> {
+        if !proof.token.expose_secret().starts_with("oba_") {
             return Ok((
                 401,
                 json!({"error": {"code": "invalid_proof", "message": "bad proof"}}),
@@ -295,6 +299,7 @@ pub fn settings() -> Settings {
         public_origin: "http://127.0.0.1:8787".into(),
         iam_url: url::Url::parse("http://127.0.0.1:1").expect("url"),
         app_id: "spotify".into(),
+        encryption_key: SecretString::from("11".repeat(32)),
         app_secret: SecretString::from(format!("ask_{}", "x".repeat(43))),
         webhook_secret: SecretString::from("w".repeat(32)),
         webhook_key_version: 1,

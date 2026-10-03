@@ -19,7 +19,7 @@ ids).
 | 0 | success |
 | 1 | the operation failed (see `code`); every code not listed below |
 | 2 | usage: bad arguments or input (`invalid_input`, `usage`, `threshold_passed`) |
-| 3 | not signed in (`not_authenticated`, `spotify_auth_required`, `reconsent_required`) |
+| 3 | not signed in (`not_authenticated`, `spotify_auth_required`) |
 | 4 | refused (`automation_permission_denied`, `permission_denied`, `forbidden`, `recipient_not_registered`) |
 | 5 | unavailable (`daemon_unavailable`, `backend_unavailable`, `dependency_unavailable`, `transport`, `rate_limited`, `timeout`) |
 
@@ -68,7 +68,7 @@ accepts but the command cannot use are `invalid_input`. Examples:
 | `invalid_input` / `usage` | 2 | arguments or values are wrong: a malformed Spotify id or link, a reference of the wrong kind, search words given to `lyrics`, a limit out of range, a config value of the wrong type, a `config set` given `key=value` instead of JSON, an empty `docs --search`, a `report --attach` file that is not text, an unknown subcommand, or Spotify answering 400 Bad Request | the hint shows the accepted forms or the command meant; `<command> --help` |
 | `not_authenticated` | 3 | no IAM session in this home, or it was revoked or expired (the backend's `unauthenticated`) | `spotify login '<SLT>'`, with an SLT from `iam`, Silicon IAM's own CLI (`cargo install silicon-iam-cli`; `spotify docs auth`) |
 | `slt_rejected` | 1 | the SLT expired (~2 min), was used, or is for another app | mint a fresh one for `spotify` and log in right away (`spotify docs auth`) |
-| `reconsent_required` | 3 | the session lacks Ting scopes | log in again approving all scopes |
+| `reconsent_required` | 4 | Ting feature consent is missing, revoked or changed | `spotify ting authorize --new`, review in IAM and complete the request; ordinary login remains signed in |
 | `forbidden` | 4 | IAM refused the request (scopes, consent, organization) | log in again; check the organization (`--org`) |
 | `permission_denied` | 4 | Spotify refused (403: a playlist you neither own nor collaborate on), or a daemon socket, home or trigger belongs to another user or home | edit only your own playlists; use your own OS user and home |
 
@@ -112,7 +112,7 @@ accepts but the command cannot use are `invalid_input`. Examples:
 | Code | Exit | Meaning | Fix |
 | --- | --- | --- | --- |
 | `threshold_passed` | 2 | a `current` trigger's checkpoint is already behind | later checkpoint or `--scope every` |
-| `recipient_not_registered` | 4 | Ting has no grant for this app to notify you | `spotify ting register` |
+| `recipient_not_registered` | 4 | Ting needs feature permission or recipient registration | `spotify ting authorize`, complete approval, then retry |
 | `recipient_changed` | 1 | the trigger's home now holds another Silicon's session (in `spotify trigger history`) | remove the trigger and create it again as the right Silicon |
 | `testing_selection_changed` | 1 | a trigger's home now selects another plane | re-select it (`spotify testing use`) or recreate the trigger |
 | `testing_selection_missing` | 1 | a trigger made in a testing plane, but the home no longer selects one | `spotify testing use --app-secret-file -`, or remove the trigger |

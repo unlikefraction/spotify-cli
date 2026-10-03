@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Online SQLite snapshot of the backend database (reports, webhook dedupe) to encrypted S3."""
+"""Online SQLite snapshot of the backend database (reports, webhook dedupe, encrypted OBO credentials) to encrypted S3."""
 import datetime, os, pathlib, sqlite3, subprocess, tempfile
 bucket = os.environ['SPOTIFY_BACKUP_BUCKET']
 source = pathlib.Path('/var/lib/spotify/spotify.sqlite')

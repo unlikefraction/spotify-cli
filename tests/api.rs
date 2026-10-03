@@ -123,7 +123,7 @@ async fn health_and_discovery() {
 }
 
 #[tokio::test]
-async fn login_registers_the_ting_recipient() {
+async fn login_never_registers_or_requests_feature_consent() {
     let app = app();
     let (status, value) = call(
         &app,
@@ -148,10 +148,10 @@ async fn login_registers_the_ting_recipient() {
             .expect("token")
             .starts_with("oat_")
     );
-    assert_eq!(session["ting"]["subscribed"], true);
+    assert_eq!(session["ting"]["subscribed"], false);
     assert_eq!(
         app.ting.recipients.lock().expect("lock").as_slice(),
-        ["si:alice"]
+        Vec::<String>::new()
     );
     let (status, value) = call(
         &app,
@@ -268,7 +268,7 @@ async fn me_checks_bearer_and_org() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["authenticated"], true);
-    assert_eq!(value["ting_ready"], true);
+    assert_eq!(value["feature_consent"], "separate");
     let (status, value) = call(
         &app,
         "GET",
@@ -319,6 +319,19 @@ async fn tings_are_sent_for_the_verified_actor_only() {
     let session = login(&app, "si:carol").await;
     let bearer = format!("Bearer {}", session["access_token"].as_str().expect("t"));
     let headers = [("authorization", bearer.as_str()), ("x-org-id", "tos")];
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/v1/ting/subscription",
+        &[
+            ("authorization", bearer.as_str()),
+            ("x-org-id", "tos"),
+            ("idempotency-key", KEY),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     let body = json!({"type": "spotify.trigger.fired", "key": "si:carol/trg_1/1/fired", "data": {"trigger": {"id": "trg_1"}}, "metadata": {"isi": "planner"}});
     let (status, accepted) =
         call(&app, "POST", "/api/v1/tings", &headers, Some(body.clone())).await;
@@ -384,12 +397,12 @@ async fn ting_refusals_pass_through_with_hints() {
 }
 
 #[tokio::test]
-async fn sessions_without_ting_scopes_need_reconsent() {
+async fn missing_feature_consent_does_not_fail_login() {
     let app = app();
-    *app.iam.scopes.lock().expect("lock") = Some("self.identity.read".into());
+    app.iam.denied_ting.store(true, Ordering::SeqCst);
     let session = login(&app, "si:erin").await;
     assert_eq!(session["ting"]["subscribed"], false);
-    assert_eq!(session["ting"]["error"]["code"], "reconsent_required");
+    assert!(session["ting"]["error"].is_null());
     let bearer = format!("Bearer {}", session["access_token"].as_str().expect("t"));
     let (status, value) = call(
         &app,

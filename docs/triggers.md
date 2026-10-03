@@ -138,5 +138,5 @@ the trigger finishes without firing (expired silently, removed).
 | `threshold_passed` | the checkpoint is already behind the current song | later checkpoint, `--end`, `--scope every` |
 | `nothing_playing` | `current` scope needs a song | start one, or use `--scope every` |
 | `not_authenticated` | no login in this home | `spotify login '<SLT>'`, or `--local` |
-| `recipient_not_registered` | Ting has no grant for you | `spotify ting register` |
-| `reconsent_required` | your session lacks Ting scopes | log in again approving all scopes |
+| `recipient_not_registered` | Ting needs feature permission or recipient registration | `spotify ting authorize`, complete approval, then retry |
+| `reconsent_required` | Ting consent is missing, revoked or changed | `spotify ting authorize --new`, approve and complete; retry the preserved firing with `spotify trigger retry` |

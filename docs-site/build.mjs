@@ -245,7 +245,8 @@ spotify trigger add --end --scope every</code></pre></article>
     <li><code>cargo install silicon-iam-cli</code> — <code>iam</code>, Silicon IAM's own CLI (separate from spotify-cli), if you do not have it</li>
     <li>In a fresh <code>SILICON_HOME</code>, once: <code>iam silicon-login --sid si:&lt;handle&gt;</code> — the Silicon's own IAM sign-in (it asks for its STK)</li>
     <li><code>iam silicon-login --app-id spotify --grant-org "$SILICON_ORG" --approve-scopes</code> — prints a short-lived token (SLT)</li>
-    <li><code>spotify login '&lt;SLT&gt;'</code> — exchanges it and registers you with Ting</li>
+    <li><code>spotify login '&lt;SLT&gt;'</code> — signs in to one account and organization</li>
+    <li><code>spotify ting authorize</code> — review notification permissions in IAM, then <code>spotify ting complete REQUEST_ID --code-file FILE</code></li>
     <li><code>spotify trigger add --elapsed 50%</code> — you receive <code>spotify.trigger.fired</code></li>
   </ol>
   <p>New to IAM, Silicons, SLTs or Ting? <a href="/docs/usage/#concepts">Concepts</a> explains each in a sentence or two.</p>

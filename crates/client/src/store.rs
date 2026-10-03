@@ -6,7 +6,7 @@
 //! ```text
 //! $SILICON_HOME/.spotify/        (falls back to $HOME/.spotify)
 //!   config.json                  settings from `spotify config set '<json>'`
-//!   session.json                 IAM app sessions, one slot per backend origin + environment
+//!   session.json                 IAM app sessions, separate backend/environment/account/org slots
 //!   session.lock                 exclusive lock for session.json (kept forever)
 //!   testing.json                 selected testing application secret (optional)
 //! ```
@@ -255,12 +255,15 @@ pub struct Lock {
     _file: File,
 }
 
-/// Saved sessions keyed by [`slot_key`].
+/// Saved sessions keyed by [`context_key`], with legacy plane-only slots supported.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Sessions {
     /// Slots.
     #[serde(default)]
     pub slots: BTreeMap<String, Slot>,
+    /// Selected account/organization slot for each backend and testing plane.
+    #[serde(default)]
+    pub active: BTreeMap<String, String>,
 }
 
 /// One saved IAM application session.
@@ -280,6 +283,85 @@ pub struct Slot {
     /// When that refresh started (unix seconds).
     #[serde(default)]
     pub refresh_started_at: Option<i64>,
+    /// Recoverable Ting consent request; no provider credentials are stored here.
+    #[serde(default)]
+    pub ting_authorization: Option<TingAuthorization>,
+    /// Retry identity for an uncertain recipient registration.
+    #[serde(default)]
+    pub ting_registration_key: Option<String>,
+}
+
+/// A feature consent request, bound to the containing session context.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TingAuthorization {
+    /// Persisted before starting the request, reused after uncertain responses.
+    pub idempotency_key: String,
+    /// Returned backend request identity.
+    pub request_id: Option<String>,
+    /// Safe status and authorization URL from the backend.
+    pub response: Option<Value>,
+}
+
+/// Stable account and organization context within one backend/testing plane.
+#[must_use]
+pub fn context_key(base: &str, session: &Session) -> String {
+    let binding = format!(
+        "{}\n{}\n{}\n{}",
+        session.actor.kind,
+        session.actor.public_id,
+        session.org_id,
+        session.testing_generation.as_deref().unwrap_or("")
+    );
+    format!(
+        "{base}#context:{}",
+        blake3::hash(binding.as_bytes()).to_hex()
+    )
+}
+
+/// Whether a saved context belongs to a backend and testing plane.
+#[must_use]
+pub fn slot_in_plane(key: &str, base: &str) -> bool {
+    key == base
+        || key
+            .strip_prefix(base)
+            .is_some_and(|tail| tail.starts_with("#context:"))
+}
+
+/// Select the active context, optionally requiring an exact organization.
+///
+/// # Errors
+/// A corrupt store or an ambiguous organization selection.
+pub fn selected_slot(home: &Home, base: &str, org: Option<&str>) -> Result<String> {
+    let sessions = home.sessions()?;
+    if let Some(key) = sessions.active.get(base)
+        && org.is_none()
+        && !sessions.slots.contains_key(key)
+    {
+        // Logging out must not silently select another saved identity.
+        return Ok(key.clone());
+    }
+    if let Some(key) = sessions.active.get(base)
+        && let Some(slot) = sessions.slots.get(key)
+        && slot_in_plane(key, base)
+        && org.is_none_or(|org| slot.session.org_id == org)
+    {
+        return Ok(key.clone());
+    }
+    let mut matching = sessions.slots.iter().filter(|(key, slot)| {
+        slot_in_plane(key, base) && org.is_none_or(|org| slot.session.org_id == org)
+    });
+    let first = matching.next();
+    if matching.next().is_some() {
+        return Err(Error::invalid(
+            "Several saved account contexts match.",
+            "Run `spotify login contexts`, then `spotify login use ACCOUNT --organization ORG`.",
+        ));
+    }
+    // A missing selection must never borrow a session from another organization.
+    Ok(first.map_or_else(
+        || format!("{base}#missing:{}", org.unwrap_or("default")),
+        |(key, _)| key.clone(),
+    ))
 }
 
 /// `<origin>#production` or `<origin>#test:<sha-prefix>`.
@@ -319,8 +401,19 @@ fn now() -> i64 {
 /// # Errors
 /// Filesystem errors.
 pub fn save_login(home: &Home, key: &str, api_url: &str, session: Session) -> Result<Slot> {
+    validate_session_context(&session)?;
+    if key.ends_with("#production") == session.testing_environment_id.is_some() {
+        return Err(Error::not_authenticated(
+            "The login returned a different production/testing context. Select the original environment and sign in again.",
+        ));
+    }
     let lock = home.lock()?;
     let mut sessions = home.sessions()?;
+    let context = context_key(key, &session);
+    let pending = sessions
+        .slots
+        .get(&context)
+        .and_then(|slot| slot.ting_authorization.clone());
     let slot = Slot {
         api_url: api_url.to_owned(),
         expires_at: now() + session.expires_in.max(0),
@@ -328,10 +421,27 @@ pub fn save_login(home: &Home, key: &str, api_url: &str, session: Session) -> Re
         session,
         pending_refresh_key: None,
         refresh_started_at: None,
+        ting_authorization: pending,
+        ting_registration_key: None,
     };
-    sessions.slots.insert(key.to_owned(), slot.clone());
+    sessions.slots.insert(context.clone(), slot.clone());
+    sessions.active.insert(key.to_owned(), context);
     home.save_sessions(&sessions, &lock)?;
     Ok(slot)
+}
+
+fn validate_session_context(session: &Session) -> Result<()> {
+    if session.org_id.is_empty()
+        || session.actor.public_id.is_empty()
+        || !matches!(session.actor.kind.as_str(), "carbon" | "silicon")
+        || session.org_ids.iter().any(|org| org != &session.org_id)
+        || session.testing_environment_id.is_some() != session.testing_generation.is_some()
+    {
+        return Err(Error::not_authenticated(
+            "IAM login must select exactly one account and organization. Sign in again for one organization.",
+        ));
+    }
+    Ok(())
 }
 
 /// Removes a slot. Returns it when present.
@@ -364,6 +474,7 @@ pub async fn fresh_session(home: &Home, api: &Api, key: &str, force: bool) -> Re
             home.dir.display(),
         )));
     };
+    validate_session_context(&slot.session)?;
     if !force && slot.pending_refresh_key.is_none() && slot.expires_at > now() + REFRESH_MARGIN_SECS
     {
         return Ok(slot);
@@ -381,6 +492,16 @@ pub async fn fresh_session(home: &Home, api: &Api, key: &str, force: bool) -> Re
     }
     match api.refresh(&slot.session.refresh_token, &refresh_key).await {
         Ok(mut session) => {
+            validate_session_context(&session)?;
+            if session.actor != slot.session.actor
+                || session.org_id != slot.session.org_id
+                || session.testing_environment_id != slot.session.testing_environment_id
+                || session.testing_generation != slot.session.testing_generation
+            {
+                return Err(Error::not_authenticated(
+                    "The refreshed session changed account, organization or testing environment. Sign in again for the original context.",
+                ));
+            }
             // Refresh responses never carry the login-time Ting registration; keep it.
             if session.ting.is_none() {
                 session.ting.clone_from(&slot.session.ting);
@@ -392,6 +513,8 @@ pub async fn fresh_session(home: &Home, api: &Api, key: &str, force: bool) -> Re
                 session,
                 pending_refresh_key: None,
                 refresh_started_at: None,
+                ting_authorization: slot.ting_authorization.clone(),
+                ting_registration_key: slot.ting_registration_key.clone(),
             };
             sessions.slots.insert(key.to_owned(), updated.clone());
             home.save_sessions(&sessions, &lock)?;
@@ -1108,6 +1231,64 @@ mod tests {
         assert_eq!(prod, "https://x#production");
         assert!(test.starts_with("https://x#test:"));
         assert_ne!(login_key("a"), login_key("b"));
+    }
+
+    #[test]
+    fn account_contexts_do_not_overwrite_or_cross_organizations() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = Home::from_root(dir.path().to_path_buf());
+        let base = slot_key("https://api.test", None);
+        let session = |actor: &str, org: &str| Session {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            token_type: "Bearer".into(),
+            expires_in: 1800,
+            scope: String::new(),
+            actor: crate::api::Actor {
+                kind: "silicon".into(),
+                public_id: actor.into(),
+            },
+            org_id: org.into(),
+            org_ids: vec![org.into()],
+            testing_environment_id: None,
+            testing_generation: None,
+            ting: None,
+        };
+        let first = session("si:first", "one");
+        let first_key = context_key(&base, &first);
+        save_login(&home, &base, "https://api.test", first).expect("first");
+        let second = session("si:second", "two");
+        let second_key = context_key(&base, &second);
+        save_login(&home, &base, "https://api.test", second).expect("second");
+        assert_eq!(home.sessions().expect("sessions").slots.len(), 2);
+        assert_eq!(
+            selected_slot(&home, &base, None).expect("active"),
+            second_key
+        );
+        assert_eq!(
+            selected_slot(&home, &base, Some("one")).expect("org"),
+            first_key
+        );
+        let missing = selected_slot(&home, &base, Some("three")).expect("no fallback");
+        assert!(
+            !home
+                .sessions()
+                .expect("sessions")
+                .slots
+                .contains_key(&missing)
+        );
+        assert!(!slot_in_plane(
+            &first_key,
+            &slot_key("https://other.test", None)
+        ));
+        let mut unscoped = session("si:first", "one");
+        unscoped.org_ids.push("two".into());
+        assert!(save_login(&home, &base, "https://api.test", unscoped).is_err());
+        remove_slot(&home, &second_key).expect("logout selected");
+        assert_eq!(
+            selected_slot(&home, &base, None).expect("signed out"),
+            second_key
+        );
     }
 
     #[test]

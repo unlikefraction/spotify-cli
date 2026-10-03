@@ -63,13 +63,38 @@ What happens:
    from the SLT, so a retry after a network error replays instead of burning the single-use token.
 2. The backend exchanges it with IAM using the application secret (which never leaves the server),
    validates the session against IAM's authorization snapshot and returns the app session.
-3. The backend registers you as a **Ting recipient** for this app (`subscriptions.register`), so
-   triggers can notify you. `spotify ting register` repeats that step explicitly.
-4. The CLI saves the session (0600) under `$SILICON_HOME/.spotify/`.
+3. The CLI saves the session (0600) under `$SILICON_HOME/.spotify/`, in a separate slot for
+   this backend, testing environment, account and organization. Ordinary login does not request
+   Ting permission or register a notification recipient.
 
-Scopes requested: `self.identity.read` (Ting checks your public id), `self.profile.read`,
-`obo:ting:subscriptions.register`, `obo:ting:tings.send`. Refresh never adds scopes: if a login
-predates a scope, log in again (`reconsent_required`).
+Login requests `self.identity.read` and `self.profile.read`. IAM 5 selects exactly one account and
+one organization; old unscoped sessions require a fresh login. Each account/org session stays
+separate. `spotify login contexts` lists saved sessions and
+`spotify login use si:planner --organization tos` selects one. `--org`, `SILICON_ORG` or config
+`org` can select an existing session for that organization, but never change a token’s authority.
+Existing triggers keep their originating context after a switch.
+
+### Enable Ting notifications when needed
+
+```sh
+spotify ting authorize
+# Open authorization.authorization_url as the represented user and approve in IAM.
+spotify ting complete REQUEST_ID --code-file /secure/consent-code
+spotify trigger test
+```
+
+The request covers the declared `subscriptions.register` and `tings.send` roots. IAM lets you
+review the graph and select the provider account and organization. Only the represented user
+can approve it. The backend redeems the code and stores each root’s encrypted access/refresh
+pair separately from login. Completion registers the recipient; `spotify ting register` retries
+registration after a transport failure.
+
+Repeat `spotify ting authorize` without `--new` after an interrupted start: its saved operation
+key prevents a duplicate request. Keep the code file until completion succeeds and retry the
+same completion command after a lost response. Use `spotify ting status --json` for live request
+status, and `spotify ting authorize --new` only to replace an expired, denied or revoked request.
+Denial leaves ordinary login and existing work intact. An OBO `reconsent_required` error asks for
+this feature flow again, without signing you out. Ordinary logout preserves durable consent.
 
 `spotify login status --json` checks **live**: it refreshes a near-expiry token (rotation-safe:
 the idempotency key is derived from the refresh token, and the refresh runs under an exclusive
@@ -138,4 +163,5 @@ spotify testing exit
 `SPOTIFY_TEST_APP_SECRET` selects a plane for one process. Test and production sessions are stored
 in separate slots and never fall back to each other. The backend validates the secret with IAM
 (`X-Testing-Environment-Key` → `with_testing_application`) and forwards only *Ting's* test
-credentials (from the OBO proof's testing context) to Ting.
+credentials bound to the OBO token’s testing context to Ting. Provider verification and local
+session selection never fall back to production or another testing generation.

@@ -336,8 +336,8 @@ pub enum Command {
     #[command(
         args_conflicts_with_subcommands = true,
         subcommand_precedence_over_arg = true,
-        long_about = "Exchanges an IAM short-lived token (SLT, ~2 minutes, single use) through the spotify-cli backend for an app session, saved in $SILICON_HOME/.spotify/session.json (0600), and registers you as a Ting recipient so triggers can notify you. The CLI never asks for passwords, OTPs or SID/STK: only the SLT.\n\nMint the SLT with `iam`, Silicon IAM's own CLI (a separate program, not part of spotify-cli; get it with `cargo install silicon-iam-cli`), or with the web consent screen:\n  Silicon: iam silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes\n  Carbon:  iam login --app-id spotify --grant-org <org>\n\n`iam` keeps its own session in $SILICON_HOME/.silicon-iam and mints for the Silicon whose SILICON_HOME it runs with. In a fresh SILICON_HOME it has no session and refuses to mint: first sign that Silicon in to IAM once with its own credential, `iam silicon-login --sid si:<handle>` (it asks for the Silicon's STK), then mint as above. Details: spotify docs auth.",
-        after_help = "Examples:\n  cargo install silicon-iam-cli        Once: the iam CLI (Silicon IAM's, separate)\n  iam silicon-login --sid si:<handle>  Once per SILICON_HOME: the Silicon's own IAM sign-in\n  spotify login 'oac_…'\n  iam -o json silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes \\\n    | jq -r .slt | spotify login --token-file -\n  spotify login status --json\n\nThe exchange uses an idempotency key derived from the SLT, so retrying after a network error replays instead of burning the token.\n\nNext: spotify trigger test"
+        long_about = "Exchanges an IAM short-lived token (SLT, ~2 minutes, single use) through the spotify-cli backend for an app session, saved in $SILICON_HOME/.spotify/session.json (0600), for exactly one account and organization. Ting notifications require separate feature consent (`spotify ting authorize`). The CLI never asks for passwords, OTPs or SID/STK: only the SLT.\n\nMint the SLT with `iam`, Silicon IAM's own CLI (a separate program, not part of spotify-cli; get it with `cargo install silicon-iam-cli`), or with the web consent screen:\n  Silicon: iam silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes\n  Carbon:  iam login --app-id spotify --grant-org <org>\n\n`iam` keeps its own session in $SILICON_HOME/.silicon-iam and mints for the Silicon whose SILICON_HOME it runs with. In a fresh SILICON_HOME it has no session and refuses to mint: first sign that Silicon in to IAM once with its own credential, `iam silicon-login --sid si:<handle>` (it asks for the Silicon's STK), then mint as above. Details: spotify docs auth.",
+        after_help = "Examples:\n  cargo install silicon-iam-cli        Once: the iam CLI (Silicon IAM's, separate)\n  iam silicon-login --sid si:<handle>  Once per SILICON_HOME: the Silicon's own IAM sign-in\n  spotify login 'oac_…'\n  iam -o json silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes \\\n    | jq -r .slt | spotify login --token-file -\n  spotify login status --json\n\nThe exchange uses an idempotency key derived from the SLT, so retrying after a network error replays instead of burning the token.\n\nNext: spotify ting authorize"
     )]
     Login(LoginArgs),
     /// Log out: revoke the session in IAM and delete it locally.
@@ -345,9 +345,9 @@ pub enum Command {
         after_help = "Examples:\n  spotify logout\n  spotify logout --json | jq .revoked\n\nLogging out when not logged in succeeds too."
     )]
     Logout,
-    /// Ting recipient registration (triggers need it; login does it automatically).
+    /// Ting notification permission and recipient registration (separate from login).
     #[command(
-        after_help = "Examples:\n  spotify ting status\n  spotify ting register       After login, when the registration failed"
+        after_help = "Examples:\n  spotify ting status\n  spotify ting authorize      Review permission when enabling notifications"
     )]
     Ting {
         #[command(subcommand)]
@@ -963,14 +963,44 @@ pub enum LoginCommand {
         after_help = "Examples:\n  spotify login status\n  spotify login status --json | jq .authenticated"
     )]
     Status,
+    /// List saved account and organization contexts for this backend and testing plane.
+    #[command(after_help = "Examples:\n  spotify login contexts\n  spotify login contexts --json")]
+    Contexts,
+    /// Select a saved account and organization without changing existing triggers.
+    #[command(after_help = "Examples:\n  spotify login use si:planner --organization tos")]
+    Use {
+        /// IAM public account ID, such as si:planner or c:alice.
+        account: String,
+        /// Exact organization selected during this account's login.
+        #[arg(long)]
+        organization: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum TingCommand {
+    /// Request separate IAM consent for Ting notifications; prints the approval URL.
+    #[command(
+        after_help = "Examples:\n  spotify ting authorize\n  spotify ting authorize --new\n\nRepeat without --new to recover an interrupted request. Only the represented user can approve in IAM."
+    )]
+    Authorize {
+        /// Explicitly replace an expired, rejected or revoked request.
+        #[arg(long)]
+        new: bool,
+    },
+    /// Complete an approved request with its one-use code, then register as a recipient.
+    #[command(
+        after_help = "Examples:\n  spotify ting complete REQUEST_ID --code-file /secure/consent-code\n\nKeep the code file until success. Repeating this exact command safely recovers a lost response."
+    )]
+    Complete {
+        request_id: String,
+        #[arg(long, value_name = "PATH|-")]
+        code_file: PathBuf,
+    },
     /// Register (or re-activate) this Silicon as a Ting recipient for spotify-cli.
     #[command(after_help = "Examples:\n  spotify ting register")]
     Register,
-    /// Show the saved registration.
+    /// Show the registration and live status of any saved consent request.
     #[command(after_help = "Examples:\n  spotify ting status\n  spotify ting status --json")]
     Status,
 }

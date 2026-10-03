@@ -125,15 +125,22 @@ async fn add(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
     let (recipient, org, ting_state) = {
         let sessions = home.sessions()?;
         match sessions.slots.get(&a.target.slot) {
-            Some(slot) => (
-                Some(slot.session.actor.public_id.clone()),
-                a.target
+            Some(slot)
+                if a.target
                     .org
-                    .clone()
-                    .or_else(|| Some(slot.session.org_id.clone())),
-                slot.session.ting.clone(),
-            ),
-            None if a.ting => {
+                    .as_ref()
+                    .is_none_or(|org| org == &slot.session.org_id) =>
+            {
+                (
+                    Some(slot.session.actor.public_id.clone()),
+                    a.target
+                        .org
+                        .clone()
+                        .or_else(|| Some(slot.session.org_id.clone())),
+                    slot.session.ting.clone(),
+                )
+            }
+            _ if a.ting => {
                 return Err(Error::not_authenticated(format!(
                     "Triggers notify you through Ting, which needs a spotify-cli login, and {} has none for {}.",
                     home.dir.display(),
@@ -141,7 +148,7 @@ async fn add(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
                 ))
                 .with_details(json!({"alternative": "Add --local to record firings only locally (see `spotify trigger history` / `spotify trigger wait`)."})));
             }
-            None => (None, a.target.org.clone(), None),
+            _ => (None, a.target.org.clone(), None),
         }
     };
     if a.ting && ting_state.as_ref().is_some_and(|t| !t.subscribed) {
@@ -149,7 +156,7 @@ async fn add(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
         return Err(Error::new(
             "recipient_not_registered",
             "This Silicon is not registered as a Ting recipient for spotify-cli, so trigger notifications would be refused.",
-            "Run `spotify ting register` (re-registers with your current session). If it keeps failing, log in again: `spotify login '<SLT>'`.",
+            "Run `spotify ting authorize`, approve in IAM, and complete the request. Then retry the trigger command; your ordinary login stays signed in.",
         )
         .with_details(json!({"registration_error": reason})));
     }
@@ -623,6 +630,7 @@ async fn deliver_one(daemon: &Arc<Daemon>, mut row: FiringRow) {
                         | "reconsent_required"
                         | "test_context_mismatch"
                         | "recipient_changed"
+                        | "organization_changed"
                         | "testing_selection_missing"
                         | "testing_selection_changed"
                         | "forbidden"
@@ -673,7 +681,10 @@ async fn send(row: &FiringRow) -> Result<Value> {
             "Re-select it with `spotify testing use --app-secret-file -`, or remove the trigger.",
         ));
     }
-    if store::slot_key(&row.delivery.api_url, testing.as_ref()) != row.delivery.slot {
+    if !store::slot_in_plane(
+        &row.delivery.slot,
+        &store::slot_key(&row.delivery.api_url, testing.as_ref()),
+    ) {
         return Err(Error::new(
             "testing_selection_changed",
             "The home now selects a different testing plane (or production) than when this trigger was created, so its session is not the one to use.",
@@ -703,6 +714,13 @@ async fn send(row: &FiringRow) -> Result<Value> {
         .org
         .clone()
         .unwrap_or_else(|| slot.session.org_id.clone());
+    if org != slot.session.org_id {
+        return Err(Error::new(
+            "organization_changed",
+            "This trigger belongs to a different organization than the saved session.",
+            "Select or sign in to the original account and organization. The pending delivery has been preserved.",
+        ));
+    }
     let delivery = TingDelivery {
         event_type: row.ting_type.clone(),
         key: format!("{recipient}/{}", row.key_suffix),

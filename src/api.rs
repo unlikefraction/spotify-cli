@@ -1,12 +1,11 @@
 //! HTTP API (`/api/v1/*`, health, IAM webhook).
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::body::Bytes;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -30,49 +29,21 @@ pub trait TestingPlanes: Send + Sync {
     async fn resolve(&self, secret: &str) -> AppResult<Arc<dyn Identity>>;
 }
 
-/// A resolved testing-plane adapter and when it was resolved.
-type CachedPlane = (Arc<dyn Identity>, Instant);
-
-/// IAM-backed resolver with a 10-minute cache.
+/// Resolves testing credentials on every request so cleanup is never hidden by a cached plane.
 pub struct IamTestingPlanes {
     settings: Settings,
-    cache: Mutex<HashMap<String, CachedPlane>>,
 }
-
 impl IamTestingPlanes {
     /// New resolver.
     #[must_use]
     pub fn new(settings: Settings) -> Self {
-        Self {
-            settings,
-            cache: Mutex::new(HashMap::new()),
-        }
+        Self { settings }
     }
 }
-
 #[async_trait]
 impl TestingPlanes for IamTestingPlanes {
     async fn resolve(&self, secret: &str) -> AppResult<Arc<dyn Identity>> {
-        let key = blake3::hash(secret.as_bytes()).to_hex().to_string();
-        if let Some((identity, at)) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            && at.elapsed() < Duration::from_secs(600)
-        {
-            return Ok(Arc::clone(identity));
-        }
-        let identity: Arc<dyn Identity> = Arc::new(Iam::discover(&self.settings, secret).await?);
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cache.len() > 256 {
-            cache.clear();
-        }
-        cache.insert(key, (Arc::clone(&identity), Instant::now()));
-        Ok(identity)
+        Ok(Arc::new(Iam::discover(&self.settings, secret).await?))
     }
 }
 
@@ -108,6 +79,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/ting/subscription", post(subscribe))
+        .route("/api/v1/ting/authorizations", post(ting_authorize))
+        .route("/api/v1/ting/authorizations/{id}", get(ting_authorization))
+        .route("/api/v1/ting/authorizations/{id}/complete", post(ting_complete))
         .route("/api/v1/tings", post(send_ting))
         .route("/api/v1/reports", post(report))
         .route("/api/v1/telemetry", post(telemetry).options(preflight))
@@ -258,7 +232,7 @@ async fn readyz(State(state): Shared) -> Response {
 }
 
 async fn version() -> Json<Value> {
-    Json(json!({"version": env!("CARGO_PKG_VERSION"), "api_versions": ["v1"], "min_cli": "0.1.0"}))
+    Json(json!({"version": env!("CARGO_PKG_VERSION"), "api_versions": ["v1"], "min_cli": "0.2.0"}))
 }
 
 fn no_store(value: Value) -> Response {
@@ -337,36 +311,8 @@ async fn login(State(state): Shared, headers: HeaderMap, body: Bytes) -> AppResu
     let input: LoginInput = parse(&body)?;
     let identity = identity_for(&state, &headers).await?;
     let session = identity.login(&input.slt, &key).await?;
-    // Register the Silicon as a Ting recipient right away (explicit login only: re-registering
-    // re-activates a grant the recipient may have revoked). Failure does not fail login.
-    let context = identity
-        .authenticate(
-            &SecretString::from(session.access_token.clone()),
-            &session.org_id,
-        )
-        .await?;
-    let registration = match ting::register(
-        identity.as_ref(),
-        state.ting.as_ref(),
-        &context,
-        &state.settings.app_id,
-    )
-    .await
-    {
-        Ok(subscription) => json!({"subscribed": true, "subscription_id": subscription["id"]}),
-        Err(error) => {
-            state.telemetry.backend(
-                "ting.register.failed",
-                "login",
-                "error",
-                Some(&error.code),
-                json!({"status": error.status.as_u16()}),
-            );
-            json!({"subscribed": false, "error": {"code": error.code, "message": error.message, "hint": error.hint, "retryable": matches!(error.status.as_u16(), 429 | 503)}})
-        }
-    };
     let mut value = serde_json::to_value(&session).map_err(AppError::internal)?;
-    value["ting"] = registration;
+    value["ting"] = json!({"subscribed": false});
     state.telemetry.backend("auth.login.completed", "login", "ok", None, json!({"actor_type": session.actor.kind, "testing": session.testing_environment_id.is_some()}));
     Ok(no_store(value))
 }
@@ -440,18 +386,54 @@ async fn me(State(state): Shared, headers: HeaderMap) -> AppResult<Response> {
         "membership_id": context.membership_id,
         "session_id": context.session_id,
         "scopes": context.scopes,
-        "ting_ready": context.has("obo:ting:tings.send") && context.has("self.identity.read"),
+        "feature_consent": "separate",
+        "ting_authorization": "/api/v1/ting/authorizations",
         "testing_environment_id": identity.environment_id(),
     })))
 }
 
+async fn ting_authorize(State(state): Shared, headers: HeaderMap) -> AppResult<Response> {
+    let key = idempotency_key(&headers)?;
+    let (identity, context) = bearer(&state, &headers).await?;
+    Ok(no_store(identity.ting_authorize(&context, &key).await?))
+}
+async fn ting_authorization(
+    State(state): Shared,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    let (identity, context) = bearer(&state, &headers).await?;
+    Ok(no_store(identity.ting_authorization(&context, &id).await?))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TingCode {
+    authorization_code: SecretString,
+}
+async fn ting_complete(
+    State(state): Shared,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    let input: TingCode = parse(&body)?;
+    let (identity, context) = bearer(&state, &headers).await?;
+    Ok(no_store(
+        identity
+            .ting_complete(&context, &id, input.authorization_code.expose_secret())
+            .await?,
+    ))
+}
+
 async fn subscribe(State(state): Shared, headers: HeaderMap) -> AppResult<Response> {
+    let key = idempotency_key(&headers)?;
     let (identity, context) = bearer(&state, &headers).await?;
     let subscription = ting::register(
         identity.as_ref(),
         state.ting.as_ref(),
         &context,
         &state.settings.app_id,
+        &key,
     )
     .await?;
     Ok(no_store(subscription))

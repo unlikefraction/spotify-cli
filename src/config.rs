@@ -22,6 +22,8 @@ pub struct Settings {
     pub app_id: String,
     /// Application secret (`SPOTIFY_IAM_APP_SECRET`, `ask_…`).
     pub app_secret: SecretString,
+    /// AES-256 key for durable OBO credentials (SPOTIFY_ENCRYPTION_KEY, 64 hex characters).
+    pub encryption_key: SecretString,
     /// IAM webhook signing secret (`SPOTIFY_IAM_WEBHOOK_SECRET`).
     pub webhook_secret: SecretString,
     /// Its key version (`SPOTIFY_IAM_WEBHOOK_KEY_VERSION`, default 1).
@@ -118,6 +120,11 @@ impl Settings {
             app_secret.starts_with("ask_") && app_secret.len() == 47,
             "SPOTIFY_IAM_APP_SECRET must be the 47-character ask_… application secret"
         );
+        let encryption_key = required("SPOTIFY_ENCRYPTION_KEY")?;
+        anyhow::ensure!(
+            encryption_key.len() == 64 && encryption_key.bytes().all(|b| b.is_ascii_hexdigit()),
+            "SPOTIFY_ENCRYPTION_KEY must be 64 hex characters"
+        );
         let webhook_secret = required("SPOTIFY_IAM_WEBHOOK_SECRET")?;
         anyhow::ensure!(
             (32..=512).contains(&webhook_secret.len()),
@@ -141,6 +148,7 @@ impl Settings {
             iam_url: origin("SPOTIFY_IAM_URL", "https://backend.iam.teamofsilicons.com")?,
             app_id,
             app_secret: SecretString::from(app_secret),
+            encryption_key: SecretString::from(encryption_key),
             webhook_secret: SecretString::from(webhook_secret),
             webhook_key_version: var("SPOTIFY_IAM_WEBHOOK_KEY_VERSION")
                 .map_or(Ok(1), |v| v.parse())

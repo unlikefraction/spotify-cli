@@ -285,8 +285,8 @@ pub fn after_trigger_list(v: &Value) -> Vec<String> {
 #[must_use]
 pub fn after_login() -> Vec<String> {
     vec![
-        "spotify trigger test".into(),
-        "spotify trigger add --remaining 30s --note '<what to do>'".into(),
+        "spotify ting authorize".into(),
+        "spotify login contexts".into(),
     ]
 }
 

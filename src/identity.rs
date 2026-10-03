@@ -1,8 +1,7 @@
-//! Silicon IAM integration (official SDK, `silicon-iam-client` 4.0.0).
+//! Silicon IAM integration (official SDK, `silicon-iam-client` 5.2.1).
 //!
 //! Mirrors the reviewed patterns of other IAM apps: sessions are validated against IAM's own
-//! authorization snapshot, every bearer is introspected live with its organization, OBO proofs are
-//! minted per request and bound to the exact body bytes, and testing planes are selected only by a
+//! authorization snapshot, every bearer is introspected live with its organization, Ting uses separately approved, encrypted reusable OBO credentials, and testing planes are selected only by a
 //! verified testing application secret, never by falling back to production.
 
 use std::collections::BTreeSet;
@@ -55,6 +54,8 @@ pub struct AppSession {
     pub org_ids: Vec<String>,
     /// Testing plane, when any.
     pub testing_environment_id: Option<Uuid>,
+    /// Opaque testing cleaning/key generation binding; absent in production.
+    pub testing_generation: Option<String>,
 }
 
 /// A verified bearer for one organization.
@@ -109,17 +110,15 @@ impl TingEndpoint {
             Self::Send => "/v1/tings",
         }
     }
-
-    /// Delegated scope that must be in the user's token.
-    #[must_use]
-    pub fn scope(self) -> String {
-        format!("obo:ting:{}", self.id())
-    }
 }
 
-/// A single-use OBO proof plus Ting's testing headers (testing planes only).
-pub struct Proof {
-    /// `Authorization: Bearer <proof>`.
+/// A reusable OBO access token plus its selected provider destination.
+pub struct TingAccess {
+    /// Provider account selected during feature consent.
+    pub actor: Actor,
+    /// Provider organization selected during feature consent.
+    pub org_id: String,
+    /// `Authorization: Bearer <obo_access_token>`.
     pub token: SecretString,
     /// (`IAM_TEST_APP_SECRET`, `X-Testing-Environment-Key`) for Ting's own test plane.
     pub testing: Option<(SecretString, SecretString)>,
@@ -136,14 +135,31 @@ pub trait Identity: Send + Sync {
     async fn logout(&self, token: &SecretString, key: &str) -> AppResult<()>;
     /// Verifies a bearer live for one organization.
     async fn authenticate(&self, token: &SecretString, org_id: &str) -> AppResult<AuthContext>;
-    /// Mints a Ting proof bound to `body`.
-    async fn ting_proof(
+    /// Loads or refreshes a reusable Ting token and pins the operation destination.
+    async fn ting_access(
         &self,
         context: &AuthContext,
         endpoint: TingEndpoint,
         body: &[u8],
         attempt_key: &str,
-    ) -> AppResult<Proof>;
+    ) -> AppResult<TingAccess>;
+    /// Starts feature-specific Ting authorization.
+    async fn ting_authorize(&self, _context: &AuthContext, _key: &str) -> AppResult<Value> {
+        Err(crate::obo::required())
+    }
+    /// Reads a context-bound feature authorization.
+    async fn ting_authorization(&self, _context: &AuthContext, _id: &str) -> AppResult<Value> {
+        Err(crate::obo::required())
+    }
+    /// Redeems the one-use IAM code and durably stores each root family.
+    async fn ting_complete(
+        &self,
+        _context: &AuthContext,
+        _id: &str,
+        _code: &str,
+    ) -> AppResult<Value> {
+        Err(crate::obo::required())
+    }
     /// Verifies an IAM webhook delivery.
     fn verify_webhook(
         &self,
@@ -156,10 +172,12 @@ pub trait Identity: Send + Sync {
 
 /// The real adapter.
 pub struct Iam {
-    client: Client,
-    app_id: String,
-    environment_id: Option<Uuid>,
+    pub(crate) client: Client,
+    pub(crate) app_id: String,
+    pub(crate) environment_id: Option<Uuid>,
     verifier: Arc<WebhookVerifier>,
+    pub(crate) obo: crate::obo::Store,
+    pub(crate) generation: String,
 }
 
 fn dependency() -> AppError {
@@ -194,7 +212,7 @@ fn refused_by_iam(refused: AppError, api: &ApiError) -> AppError {
     refused.with_details(json!({"iam_code": api.code, "request_id": api.request_id}))
 }
 
-fn map_error(error: &silicon_iam_client::Error) -> AppError {
+pub(crate) fn map_error(error: &silicon_iam_client::Error) -> AppError {
     if let Some(api) = error.api() {
         if client_rejected(api) {
             tracing::error!(
@@ -394,6 +412,8 @@ impl Iam {
         .map_err(|e| anyhow::anyhow!("webhook key version: {e}"))?;
         Ok(Self {
             client: builder.build()?,
+            obo: crate::obo::Store::open(&settings.database_path, &settings.encryption_key)?,
+            generation: "production".into(),
             app_id: settings.app_id.clone(),
             environment_id,
             verifier: Arc::new(WebhookVerifier::new(keyring)),
@@ -429,6 +449,9 @@ impl Iam {
             return Err(AppError::unauthenticated());
         }
         adapter.environment_id = Some(context.environment_id);
+        let environment = context.environment.ok_or_else(dependency)?;
+        adapter.generation =
+            json!([environment.key_generation, environment.cleaned_at]).to_string();
         Ok(adapter)
     }
 
@@ -470,7 +493,11 @@ impl Iam {
                 .public_id
                 .as_ref()
                 .is_some_and(|id| *id != public_id)
-            || !(public_id.starts_with("si:") || public_id.starts_with("c:"))
+            || !(if kind == "silicon" {
+                public_id.starts_with("si:")
+            } else {
+                public_id.starts_with("c:")
+            })
         {
             return Err(AppError::unauthenticated());
         }
@@ -500,33 +527,25 @@ impl Iam {
             .await
             .map_err(|e| map_error(&e))?
             .ok_or_else(AppError::unauthenticated)?;
-        let mut org_ids: Vec<String> = Vec::new();
-        for grant in &grants {
-            if grant.audience != self.app_id || grant.testing_environment_id != self.environment_id
-            {
-                return Err(AppError::unauthenticated());
-            }
-            if !org_ids.contains(&grant.org_id) {
-                org_ids.push(grant.org_id.clone());
-            }
-        }
-        org_ids.sort();
         let org_id = response
             .org_id
             .clone()
-            .filter(|o| org_ids.contains(o))
-            .or_else(|| org_ids.first().cloned())
-            .ok_or_else(|| {
-                AppError::forbidden(
-                    "The login shared no organization with spotify-cli.",
-                    "Mint the SLT with --grant-org <org> (for Silicons: --grant-org \"$SILICON_ORG\").",
-                )
-            })?;
+            .filter(|o| !o.is_empty())
+            .ok_or_else(AppError::unauthenticated)?;
+        if grants.len() != 1
+            || grants[0].org_id != org_id
+            || grants[0].audience != self.app_id
+            || grants[0].testing_environment_id != self.environment_id
+        {
+            return Err(AppError::unauthenticated());
+        }
+        let org_ids = vec![org_id.clone()];
         let context = self
             .bearer_context(&SecretString::from(response.access_token.clone()), &org_id)
             .await?;
         if let Some(actor) = &response.actor
-            && actor.public_id != context.actor.public_id
+            && (actor.public_id != context.actor.public_id
+                || serde_json::to_value(&actor.type_field).ok() != Some(json!(context.actor.kind)))
         {
             return Err(AppError::unauthenticated());
         }
@@ -540,6 +559,7 @@ impl Iam {
             org_id,
             org_ids,
             testing_environment_id: self.environment_id,
+            testing_generation: self.environment_id.map(|_| self.generation.clone()),
         })
     }
 }
@@ -609,95 +629,26 @@ impl Identity for Iam {
         self.bearer_context(token, org_id).await
     }
 
-    async fn ting_proof(
+    async fn ting_access(
         &self,
         context: &AuthContext,
         endpoint: TingEndpoint,
         body: &[u8],
         attempt_key: &str,
-    ) -> AppResult<Proof> {
-        if !context.has(&endpoint.scope()) || !context.has("self.identity.read") {
-            return Err(AppError::new(
-                axum::http::StatusCode::FORBIDDEN,
-                "reconsent_required",
-                format!(
-                    "Your spotify-cli session lacks the `{}` and `self.identity.read` scopes Ting needs.",
-                    endpoint.scope()
-                ),
-                "Log in again approving all scopes: iam silicon-login --app-id spotify --grant-org <org> --approve-scopes, then spotify login '<SLT>'. (Refresh never adds scopes.)",
-            ));
-        }
-        let catalog = self
-            .client
-            .obo()
-            .endpoints(TING)
-            .await
-            .map_err(|e| map_error(&e))?;
-        let definition = catalog
-            .endpoints
-            .iter()
-            .find(|e| e.endpoint_id == endpoint.id())
-            .ok_or_else(|| {
-                AppError::forbidden(
-                    format!("Ting does not publish `{}` to this app.", endpoint.id()),
-                    "The app's external scopes may not be approved yet.",
-                )
-            })?;
-        if definition.path != endpoint.path()
-            || !definition
-                .metadata
-                .as_object()
-                .is_some_and(serde_json::Map::is_empty)
-        {
-            return Err(dependency());
-        }
-        let key = IdempotencyKey::parse(attempt_key)
-            .map_err(|_| AppError::internal("bad OBO attempt key"))?;
-        let proof = self
-            .client
-            .obo()
-            .exchange_signed(
-                &models::OboExchangeRequest {
-                    org_id: Some(context.org_id.clone()),
-                    subject_token: context.token.expose_secret().to_owned(),
-                    audience: TING.to_owned(),
-                    endpoint_id: endpoint.id().to_owned(),
-                    metadata: json!({}),
-                    request: models::OboExchangeRequestBinding {
-                        method: "POST".to_owned(),
-                        body_sha256: silicon_iam_client::api::obo::body_sha256(body),
-                    },
-                },
-                &catalog,
-                &Mutation::with_key(key),
-            )
-            .await
-            .map_err(|e| map_error(&e))?;
-        if !(1..=60).contains(&proof.expires_in)
-            || proof.access_proof.is_empty()
-            || proof.access_proof.len() > 16_384
-        {
-            return Err(dependency());
-        }
-        let testing = match (self.environment_id, proof.testing_context) {
-            (None, None) => None,
-            (Some(_), Some(testing)) if testing.app_id == TING => Some((
-                SecretString::from(testing.app_secret),
-                SecretString::from(testing.iam_test_key),
-            )),
-            // A production request must never receive test credentials, and a test request never
-            // falls back to production Ting.
-            _ => {
-                return Err(AppError::forbidden(
-                    "IAM returned a testing context that does not match this plane.",
-                    "Report it with `spotify report`.",
-                ));
-            }
-        };
-        Ok(Proof {
-            token: SecretString::from(proof.access_proof),
-            testing,
-        })
+    ) -> AppResult<TingAccess> {
+        crate::obo::access(self, context, endpoint, body, attempt_key).await
+    }
+
+    async fn ting_authorize(&self, context: &AuthContext, key: &str) -> AppResult<Value> {
+        crate::obo::start(self, context, key).await
+    }
+
+    async fn ting_authorization(&self, context: &AuthContext, id: &str) -> AppResult<Value> {
+        crate::obo::status(self, context, id).await
+    }
+
+    async fn ting_complete(&self, context: &AuthContext, id: &str, code: &str) -> AppResult<Value> {
+        crate::obo::complete(self, context, id, code).await
     }
 
     fn verify_webhook(

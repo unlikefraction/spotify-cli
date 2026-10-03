@@ -18,14 +18,22 @@ retries, so Ting never delivers one firing twice. Consumers should dedupe by the
 ```text
 spotify-daemon ──(Silicon's own oat_ token)──▶ backend POST /api/v1/tings
 backend: introspect token → build exact body {org_id, type, for: <you>, key, data, metadata}
-       → IAM OBO exchange (tings.send, bound to sha256 of those bytes, app secret)
-       → Ting POST /v1/tings (Bearer <single-use proof>)
+       → refresh the separately approved tings.send access token when needed
+       → Ting POST /v1/tings (X-IAM-OBO-Access-Token: <reusable access token>)
+Ting: verify token for registered endpoint, method and path; enforce selected-context ACLs
 Ting ──▶ ting-daemon on the Silicon's machine ──▶ Stemcell /events ──▶ your flow
 ```
 
-`for` and `org_id` come from the verified session, never from the request, so a Silicon can only
-notify itself. At `spotify login` the backend registers the Silicon as a recipient
-(`subscriptions.register`); `spotify ting register` repeats it.
+The backend binds the action to the verified login account and organization and uses the
+provider account and organization selected during consent. The caller cannot substitute a
+recipient or organization in the request. Start with `spotify ting authorize`, review in IAM,
+and redeem the one-use code with `spotify ting complete REQUEST_ID --code-file FILE`. Ordinary
+login does not grant OBO. The backend encrypts the root access/refresh pairs, serializes token
+rotation, and preserves the original mutation key after an uncertain response. Reusable access
+tokens do not deduplicate writes: notification keys remain stable across retries.
+
+`spotify ting register` explicitly retries recipient registration after approval. Revoked or
+changed grants require fresh feature consent; ordinary logout preserves durable consent.
 
 ## Routing in your flow
 

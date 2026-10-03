@@ -70,9 +70,12 @@ impl Ctx {
     }
 
     /// This home's session slot for the current backend and plane.
-    #[must_use]
-    pub fn slot(&self) -> String {
-        slot_key(&self.api_url, self.testing.as_ref())
+    pub fn slot(&self) -> Result<String> {
+        silicon_spotify_client::store::selected_slot(
+            &self.home,
+            &slot_key(&self.api_url, self.testing.as_ref()),
+            self.org(None).as_deref(),
+        )
     }
 
     /// Org precedence: --org, SILICON_ORG, config org, then the session's.

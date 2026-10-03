@@ -39,7 +39,8 @@ pub fn iam(ctx: &Ctx) -> Result<()> {
         "login": format!("Mint an SLT with `iam silicon-login --app-id {APP_ID} --grant-org \"$SILICON_ORG\" --approve-scopes` (Silicon; in a fresh SILICON_HOME, first `iam silicon-login --sid si:<handle>` with the Silicon's own credential) or `iam login --app-id {APP_ID} --grant-org <org>` (Carbon), then run `spotify login '<SLT>'`."),
         "iam_session": IAM_SESSION_NOTE,
         "credential_issuer": false,
-        "scopes": ["self.identity.read", "self.profile.read", "obo:ting:subscriptions.register", "obo:ting:tings.send"],
+        "scopes": ["self.identity.read", "self.profile.read"],
+        "feature_permissions": {"ting": ["subscriptions.register", "tings.send"], "start": "spotify ting authorize"},
         "ting_types": TING_TYPES.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
         "docs": DOCS_URL,
         "website": WEBSITE,
@@ -103,6 +104,7 @@ fn session_view(ctx: &Ctx, slot: &Slot) -> Value {
         "access_expires_at": expires,
         "ting": slot.session.ting,
         "testing_environment_id": slot.session.testing_environment_id,
+        "testing_generation": slot.session.testing_generation,
         "api_url": slot.api_url,
         "store": ctx.home.dir,
     })
@@ -110,8 +112,14 @@ fn session_view(ctx: &Ctx, slot: &Slot) -> Value {
 
 /// `spotify login …`.
 pub async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
-    if matches!(args.command, Some(LoginCommand::Status)) {
-        return status(ctx).await;
+    match args.command {
+        Some(LoginCommand::Status) => return status(ctx).await,
+        Some(LoginCommand::Contexts) => return login_contexts(ctx),
+        Some(LoginCommand::Use {
+            account,
+            organization,
+        }) => return use_context(ctx, &account, &organization),
+        None => {}
     }
     let slt = match (&args.slt, &args.token_file) {
         (Some(_), Some(_)) => {
@@ -124,7 +132,7 @@ pub async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
         (None, Some(path)) => read_token(path)?,
         (None, None) => {
             return Err(Error::invalid(
-                "`spotify login` needs an IAM short-lived token (SLT). The CLI never asks for passwords or codes.",
+                "`spotify login` needs an IAM short-lived token (SLT). The CLI accepts an IAM SLT for login.",
                 "Silicon: iam silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes (in a fresh SILICON_HOME, first iam silicon-login --sid si:<handle> with the Silicon's own credential), then spotify login '<SLT>'. Carbon: iam login --app-id spotify --grant-org <org>.",
             ));
         }
@@ -162,13 +170,20 @@ pub async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
             error
         }
     })?;
-    let slot = store::save_login(&ctx.home, &ctx.slot(), &ctx.api_url, session)?;
+    if ctx.org(None).is_some_and(|org| org != session.org_id) {
+        return Err(Error::invalid(
+            "The IAM login selected a different organization.",
+            "Mint an SLT for the selected --org, or change the explicit organization before logging in.",
+        ));
+    }
+    let base = store::slot_key(&ctx.api_url, ctx.testing.as_ref());
+    let slot = store::save_login(&ctx.home, &base, &ctx.api_url, session)?;
     let view = session_view(ctx, &slot);
     ctx.emit(&view, |v| {
         let ting = if v.pointer("/ting/subscribed") == Some(&Value::Bool(true)) {
             "registered as a Ting recipient ✓".to_owned()
         } else {
-            format!("Ting registration failed: {} (triggers need it; retry with `spotify ting register`)", v.pointer("/ting/error/message").and_then(Value::as_str).unwrap_or("unknown reason"))
+            "Ting notifications need separate permission: run `spotify ting authorize` when you want to use triggers.".to_owned()
         };
         format!("Logged in as {} (org {}).\n  {ting}", v["actor"]["public_id"].as_str().unwrap_or("?"), v["org_id"].as_str().unwrap_or("?"))
     });
@@ -176,9 +191,55 @@ pub async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
     Ok(())
 }
 
+fn login_contexts(ctx: &Ctx) -> Result<()> {
+    let sessions = ctx.home.sessions()?;
+    let base = store::slot_key(&ctx.api_url, ctx.testing.as_ref());
+    let selected = ctx.slot().ok();
+    let items: Vec<Value> = sessions.slots.iter().filter(|(key, _)| store::slot_in_plane(key, &base)).map(|(key, slot)| {
+        json!({"account":slot.session.actor.public_id,"identity_kind":slot.session.actor.kind,"org_id":slot.session.org_id,"selected":selected.as_ref()==Some(key),"testing_environment_id":slot.session.testing_environment_id})
+    }).collect();
+    ctx.emit(&json!({"contexts": items}), |v| {
+        v["contexts"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} {} / {}",
+                    if item["selected"] == true { "*" } else { " " },
+                    item["account"].as_str().unwrap_or("?"),
+                    item["org_id"].as_str().unwrap_or("?")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    Ok(())
+}
+
+fn use_context(ctx: &Ctx, account: &str, org: &str) -> Result<()> {
+    if ctx.org(None).is_some_and(|selected| selected != org) {
+        return Err(Error::invalid(
+            "An explicit organization setting selects another context.",
+            "Set --org, SILICON_ORG or config org to the desired organization before switching.",
+        ));
+    }
+    let base = store::slot_key(&ctx.api_url, ctx.testing.as_ref());
+    let lock = ctx.home.lock()?;
+    let mut sessions = ctx.home.sessions()?;
+    let key = sessions.slots.iter().filter(|(key, slot)| store::slot_in_plane(key, &base) && slot.session.actor.public_id == account && slot.session.org_id == org).max_by_key(|(key, slot)| (sessions.active.get(&base) == Some(*key), slot.logged_in_at)).map(|(key, _)| key.clone()).ok_or_else(|| Error::not_authenticated("That account and organization have no saved session. Sign in to that context first."))?;
+    sessions.active.insert(base, key);
+    ctx.home.save_sessions(&sessions, &lock)?;
+    ctx.emit(
+        &json!({"account": account, "org_id": org, "selected": true}),
+        |_| format!("Selected {account} / {org}. Existing triggers retain their original context."),
+    );
+    Ok(())
+}
+
 /// `spotify login status`: live check.
 async fn status(ctx: &Ctx) -> Result<()> {
-    let key = ctx.slot();
+    let key = ctx.slot()?;
     let unauthenticated = |reason: &str| json!({"authenticated": false, "api_url": ctx.api_url, "store": ctx.home.dir, "reason": reason, "testing": ctx.testing.is_some()});
     if !ctx.home.sessions()?.slots.contains_key(&key) {
         let value = unauthenticated("no session saved");
@@ -255,7 +316,7 @@ async fn status(ctx: &Ctx) -> Result<()> {
 
 /// `spotify logout`: idempotent.
 pub async fn logout(ctx: &Ctx) -> Result<()> {
-    let key = ctx.slot();
+    let key = ctx.slot()?;
     let Some(slot) = ctx.home.sessions()?.slots.get(&key).cloned() else {
         let value = json!({"authenticated": false, "revoked": false, "note": "was not logged in"});
         ctx.emit(&value, |_| "Not logged in; nothing to do.".into());
@@ -287,63 +348,183 @@ pub async fn logout(ctx: &Ctx) -> Result<()> {
 
 /// `spotify ting …`.
 pub async fn ting(ctx: &Ctx, action: TingCommand) -> Result<()> {
-    let key = ctx.slot();
+    let key = ctx.slot()?;
+    let api = ctx.api()?;
+    let slot = store::fresh_session(&ctx.home, &api, &key, false).await?;
+    let token = &slot.session.access_token;
+    let org = &slot.session.org_id;
     match action {
+        TingCommand::Authorize { new } => {
+            let pending = {
+                let lock = ctx.home.lock()?;
+                let mut sessions = ctx.home.sessions()?;
+                let saved = sessions
+                    .slots
+                    .get_mut(&key)
+                    .ok_or_else(|| Error::not_authenticated("The selected session was removed."))?;
+                if new || saved.ting_authorization.is_none() {
+                    saved.ting_authorization = Some(store::TingAuthorization {
+                        idempotency_key: format!(
+                            "spotify-ting-consent-{}",
+                            uuid::Uuid::now_v7().simple()
+                        ),
+                        request_id: None,
+                        response: None,
+                    });
+                }
+                let pending = saved.ting_authorization.clone().expect("created above");
+                ctx.home.save_sessions(&sessions, &lock)?;
+                pending
+            };
+            let value = if let Some(id) = &pending.request_id {
+                api.ting_authorization(token, org, id).await?
+            } else {
+                api.authorize_ting(token, org, &pending.idempotency_key)
+                    .await?
+            };
+            save_authorization(ctx, &key, &pending.idempotency_key, &value)?;
+            emit_authorization(ctx, &value);
+        }
+        TingCommand::Complete {
+            request_id,
+            code_file,
+        } => {
+            let pending = slot.ting_authorization.as_ref().filter(|pending| pending.request_id.as_deref() == Some(&request_id)).ok_or_else(|| Error::invalid("This request does not belong to the selected account, organization and testing context.", "Select the original context with `spotify login use`, or run `spotify ting authorize` to inspect its request."))?;
+            let code = read_token(&code_file)?;
+            if code.is_empty() || code.len() > 8192 || !code.bytes().all(|c| c.is_ascii_graphic()) {
+                return Err(Error::invalid(
+                    "The consent code is empty or malformed.",
+                    "Write only the one-use code returned by IAM to the code file.",
+                ));
+            }
+            let value = api.complete_ting(token, org, &request_id, &code).await?;
+            save_authorization(ctx, &key, &pending.idempotency_key, &value)?;
+            if value["completed"] != true {
+                emit_authorization(ctx, &value);
+                return Ok(());
+            }
+            register_ting(ctx, &key, &slot).await?;
+        }
         TingCommand::Status => {
-            let sessions = ctx.home.sessions()?;
-            let slot = sessions.slots.get(&key).ok_or_else(|| {
-                Error::not_authenticated("Not logged in, so there is no Ting registration.")
-            })?;
-            let value = json!({"actor": slot.session.actor, "org_id": slot.session.org_id, "ting": slot.session.ting});
+            let authorization = if let Some(id) = slot
+                .ting_authorization
+                .as_ref()
+                .and_then(|pending| pending.request_id.as_deref())
+            {
+                Some(api.ting_authorization(token, org, id).await?)
+            } else {
+                None
+            };
+            let value = json!({"actor": slot.session.actor, "org_id": org, "ting": slot.session.ting, "authorization": authorization});
             ctx.emit(&value, |v| {
                 format!(
-                    "{}: {}",
+                    "{} / {}: {}",
                     v["actor"]["public_id"].as_str().unwrap_or("?"),
+                    org,
                     if v.pointer("/ting/subscribed") == Some(&Value::Bool(true)) {
                         "registered"
                     } else {
-                        "not registered"
+                        "permission/registration needed; spotify ting authorize"
                     }
                 )
             });
         }
-        TingCommand::Register => {
-            let api = ctx.api()?;
-            let slot = store::fresh_session(&ctx.home, &api, &key, false).await?;
-            let org = ctx
-                .org(Some(&slot.session.org_id))
-                .unwrap_or_else(|| slot.session.org_id.clone());
-            let attempt = format!("spotify-ting-register-{}", uuid::Uuid::now_v7().simple());
-            let result = api
-                .register_ting(&slot.session.access_token, &org, &attempt)
-                .await;
-            let registration = match &result {
-                Ok(value) => silicon_spotify_client::api::TingRegistration {
-                    subscribed: true,
-                    subscription_id: value.get("id").and_then(Value::as_str).map(str::to_owned),
-                    error: None,
-                },
-                Err(error) => silicon_spotify_client::api::TingRegistration {
-                    subscribed: false,
-                    subscription_id: None,
-                    error: Some(error.clone()),
-                },
-            };
-            {
-                let lock = ctx.home.lock()?;
-                let mut sessions = ctx.home.sessions()?;
-                if let Some(saved) = sessions.slots.get_mut(&key) {
-                    saved.session.ting = Some(registration.clone());
-                }
-                ctx.home.save_sessions(&sessions, &lock)?;
-            }
-            let value = result?;
-            ctx.emit(
-                &json!({"ting": registration, "subscription": value}),
-                |_| "Registered as a Ting recipient for spotify-cli.".into(),
-            );
-        }
+        TingCommand::Register => register_ting(ctx, &key, &slot).await?,
     }
+    Ok(())
+}
+
+fn save_authorization(ctx: &Ctx, key: &str, operation: &str, value: &Value) -> Result<()> {
+    let lock = ctx.home.lock()?;
+    let mut sessions = ctx.home.sessions()?;
+    let pending = sessions
+        .slots
+        .get_mut(key)
+        .and_then(|slot| slot.ting_authorization.as_mut())
+        .filter(|pending| pending.idempotency_key == operation)
+        .ok_or_else(|| {
+            Error::invalid(
+                "The consent request changed while this operation was running.",
+                "Run `spotify ting authorize` to inspect the current request.",
+            )
+        })?;
+    let id = value["request_id"]
+        .as_str()
+        .ok_or_else(|| Error::internal("The backend omitted the consent request ID."))?;
+    if pending
+        .request_id
+        .as_deref()
+        .is_some_and(|existing| existing != id)
+    {
+        return Err(Error::internal(
+            "The backend changed the consent request ID.",
+        ));
+    }
+    pending.request_id = Some(id.to_owned());
+    pending.response = Some(value.clone());
+    ctx.home.save_sessions(&sessions, &lock)
+}
+
+fn emit_authorization(ctx: &Ctx, value: &Value) {
+    ctx.emit(value, |v| {
+        let id = v["request_id"].as_str().unwrap_or("?");
+        if v["completed"] == true {
+            return format!("Ting consent {id} is complete. Run `spotify ting register` to enable notifications.");
+        }
+        let url = v.pointer("/authorization/authorization_url").or_else(|| v.pointer("/authorization/consent_url")).and_then(Value::as_str).unwrap_or("No approval URL is available; inspect `spotify ting status --json`.");
+        format!("Ting consent request {id}\nReview and approve as the represented user in IAM:\n{url}\nThen: spotify ting complete {id} --code-file /secure/consent-code\nDeclining keeps your login and existing work. Repeat `spotify ting authorize` to recover this request.")
+    });
+}
+
+async fn register_ting(ctx: &Ctx, key: &str, slot: &Slot) -> Result<()> {
+    let api = ctx.api()?;
+    let attempt = {
+        let lock = ctx.home.lock()?;
+        let mut sessions = ctx.home.sessions()?;
+        let saved = sessions
+            .slots
+            .get_mut(key)
+            .ok_or_else(|| Error::not_authenticated("The selected session was removed."))?;
+        let operation = saved
+            .ting_registration_key
+            .get_or_insert_with(|| {
+                format!("spotify-ting-register-{}", uuid::Uuid::now_v7().simple())
+            })
+            .clone();
+        ctx.home.save_sessions(&sessions, &lock)?;
+        operation
+    };
+    let result = api
+        .register_ting(&slot.session.access_token, &slot.session.org_id, &attempt)
+        .await;
+    let registration = match &result {
+        Ok(value) => silicon_spotify_client::api::TingRegistration {
+            subscribed: true,
+            subscription_id: value.get("id").and_then(Value::as_str).map(str::to_owned),
+            error: None,
+        },
+        Err(error) => silicon_spotify_client::api::TingRegistration {
+            subscribed: false,
+            subscription_id: None,
+            error: Some(error.clone()),
+        },
+    };
+    {
+        let lock = ctx.home.lock()?;
+        let mut sessions = ctx.home.sessions()?;
+        if let Some(saved) = sessions.slots.get_mut(key) {
+            saved.session.ting = Some(registration.clone());
+            if result.is_ok() || result.as_ref().is_err_and(|error| !error.retryable) {
+                saved.ting_registration_key = None;
+            }
+        }
+        ctx.home.save_sessions(&sessions, &lock)?;
+    }
+    let value = result?;
+    ctx.emit(
+        &json!({"ting": registration, "subscription": value}),
+        |_| "Registered as a Ting recipient for spotify-cli.".into(),
+    );
     Ok(())
 }
 
@@ -520,7 +701,7 @@ pub async fn report(ctx: &Ctx, message: &str, pr: Option<&str>, attach: &[PathBu
         .home
         .sessions()
         .ok()
-        .and_then(|s| s.slots.get(&ctx.slot()).cloned());
+        .and_then(|s| ctx.slot().ok().and_then(|key| s.slots.get(&key).cloned()));
     let key = format!("spotify-report-{}", uuid::Uuid::now_v7().simple());
     let api = ctx.api()?;
     let sent = api
@@ -726,7 +907,7 @@ pub async fn doctor(ctx: &Ctx) -> Result<()> {
         }
         (Err(error), _) => checks.push(json!({"check": "backend_reachable", "ok": false, "detail": {"api_url": ctx.api_url, "error": error}, "fix": "Check the network and `spotify config get api_url`."})),
     }
-    let logged_in = ctx.home.sessions()?.slots.get(&ctx.slot()).cloned();
+    let logged_in = ctx.home.sessions()?.slots.get(&ctx.slot()?).cloned();
     let ting_ok = logged_in
         .as_ref()
         .and_then(|s| s.session.ting.as_ref())

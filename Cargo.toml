@@ -4,7 +4,7 @@ default-members = [".", "crates/client", "crates/cli", "crates/daemon"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.7"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -27,7 +27,7 @@ semver = "1.0.27"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
-silicon-iam-client = "4.0.0"
+silicon-iam-client = "5.2.1"
 space-station = "=0.1.1"
 thiserror = "2.0.17"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
@@ -37,7 +37,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2.5.7"
 uuid = { version = "1.26.0", features = ["serde", "v4", "v7"] }
-silicon-spotify-client = { path = "crates/client", version = "0.1.7" }
+silicon-spotify-client = { path = "crates/client", version = "0.2.0" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -66,6 +66,7 @@ name = "spotify-api"
 path = "src/bin/spotify_api.rs"
 
 [dependencies]
+aes-gcm = "0.10"
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true

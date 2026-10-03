@@ -22,7 +22,10 @@ Common headers: `Idempotency-Key` (16–255 visible ASCII; required on auth muta
 | `POST /api/v1/auth/login` | key | `{"slt"}` → session (below) + `"ting":{"subscribed","subscription_id"?,"error"?}`; a refused SLT → 401 `slt_rejected` |
 | `POST /api/v1/auth/refresh` | key | `{"refresh_token"}` → session; a refused refresh token → 401 `unauthenticated` |
 | `POST /api/v1/auth/logout` | key | `{"token"}` → 204 (revokes the refresh family; unknown, expired or malformed tokens also 204) |
-| `GET /api/v1/auth/me` | bearer | `{"authenticated":true,"actor","org_id","membership_id","session_id","scopes","ting_ready","testing_environment_id"}` |
+| `GET /api/v1/auth/me` | bearer | `{"authenticated":true,"actor","org_id","membership_id","session_id","scopes","feature_consent":"separate","testing_environment_id"}` |
+| `POST /api/v1/ting/authorizations` | bearer + key | `{}` → `{request_id,authorization,completed,roots}`; persist the key before sending |
+| `GET /api/v1/ting/authorizations/{request_id}` | bearer | live request status, bound to the same account/org/environment |
+| `POST /api/v1/ting/authorizations/{request_id}/complete` | bearer | `{authorization_code}` → completed request; backend persists root credentials and safely retries the identical code |
 | `POST /api/v1/ting/subscription` | bearer | `{}` → `{"id":"sub_…","app_id","for","active":true}` |
 | `POST /api/v1/tings` | bearer | `{"type","key","data","metadata"?}` → `{"id":"msg_…","created_at","key","silent","replayed"}` |
 | `POST /api/v1/reports` | key, bearer optional | `{"message","pr"?,"attachments"?,"context"?}` (at most 5 attachments) → `{"id":"rep_…","status","issue_url"?}`, `status` is `"stored"` or `"filed"` |
@@ -33,7 +36,7 @@ Session:
 
 ```json
 {"access_token":"oat_…","refresh_token":"ort_…","token_type":"Bearer","expires_in":1800,
- "scope":"obo:ting:subscriptions.register obo:ting:tings.send self.identity.read self.profile.read",
+ "scope":"self.identity.read self.profile.read",
  "actor":{"type":"silicon","public_id":"si:you"},"org_id":"unlikefraction","org_ids":["unlikefraction"],"testing_environment_id":null}
 ```
 
@@ -48,5 +51,5 @@ within 10 minutes (IAM replays it); a consumed token under a new key revokes the
 ## Configuration (operators)
 
 See `.env.example`: `SPOTIFY_IAM_APP_SECRET`, `SPOTIFY_IAM_WEBHOOK_SECRET`, `SPOTIFY_IAM_URL`,
-`SPOTIFY_TING_URL`, `SPOTIFY_DATABASE_PATH`, Space Station table keys, optional
+`SPOTIFY_TING_URL`, `SPOTIFY_ENCRYPTION_KEY` (64 hexadecimal characters; keep stable to decrypt stored OBO grants), `SPOTIFY_DATABASE_PATH`, Space Station table keys, optional
 `SPOTIFY_GITHUB_TOKEN` to file reports as GitHub issues. Deployment: `deploy/README.md`.
