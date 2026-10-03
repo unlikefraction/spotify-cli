@@ -334,7 +334,6 @@ pub fn slot_in_plane(key: &str, base: &str) -> bool {
 pub fn selected_slot(home: &Home, base: &str, org: Option<&str>) -> Result<String> {
     let sessions = home.sessions()?;
     if let Some(key) = sessions.active.get(base)
-        && org.is_none()
         && !sessions.slots.contains_key(key)
     {
         // Logging out must not silently select another saved identity.
@@ -1284,9 +1283,22 @@ mod tests {
         let mut unscoped = session("si:first", "one");
         unscoped.org_ids.push("two".into());
         assert!(save_login(&home, &base, "https://api.test", unscoped).is_err());
+        save_login(&home, &base, "https://api.test", session("si:third", "two"))
+            .expect("same-org other account");
+        save_login(
+            &home,
+            &base,
+            "https://api.test",
+            session("si:second", "two"),
+        )
+        .expect("select second");
         remove_slot(&home, &second_key).expect("logout selected");
         assert_eq!(
             selected_slot(&home, &base, None).expect("signed out"),
+            second_key
+        );
+        assert_eq!(
+            selected_slot(&home, &base, Some("two")).expect("org does not switch account"),
             second_key
         );
     }
