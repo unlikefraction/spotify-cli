@@ -13,10 +13,10 @@ use crate::identity::{AuthContext, Identity, TingAccess, TingEndpoint};
 /// Largest Ting send body.
 pub const MAX_SEND_BYTES: usize = 256 * 1024;
 
-/// HTTP transport to Ting (a trait so tests can fake it).
+/// HTTP transport to Ting.
 #[async_trait]
 pub trait TingApi: Send + Sync {
-    /// POSTs exact bytes with an OBO access token; returns (status, JSON body).
+    /// POSTs exact bytes with a Silicon Accounts user verification proof; returns (status, JSON body).
     async fn post(&self, path: &str, body: Vec<u8>, proof: &TingAccess) -> AppResult<(u16, Value)>;
 }
 
@@ -47,18 +47,16 @@ impl TingHttp {
 impl TingApi for TingHttp {
     async fn post(&self, path: &str, body: Vec<u8>, proof: &TingAccess) -> AppResult<(u16, Value)> {
         let url = self.base.join(path).map_err(AppError::internal)?;
-        let mut request = self
+        let request = self
             .client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header("Ting-Client-Version", env!("CARGO_PKG_VERSION"))
-            .bearer_auth(proof.token.expose_secret())
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Proof {}", proof.token.expose_secret()),
+            )
             .body(body);
-        if let Some((secret, key)) = &proof.testing {
-            request = request
-                .header("IAM_TEST_APP_SECRET", secret.expose_secret())
-                .header("X-Testing-Environment-Key", key.expose_secret());
-        }
         let response = request
             .send()
             .await
@@ -81,6 +79,18 @@ impl TingApi for TingHttp {
 }
 
 fn ting_error(status: u16, body: &Value) -> AppError {
+    if body
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .is_some_and(|message| message.contains("org_id"))
+    {
+        return AppError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "dependency_unavailable",
+            "Ting has not migrated to Silicon Accounts yet.",
+            "Your login and pending work are preserved. Retry after Ting supports Carbon and Silicon user verification.",
+        );
+    }
     let code = body
         .pointer("/error/code")
         .and_then(Value::as_str)
@@ -89,7 +99,7 @@ fn ting_error(status: u16, body: &Value) -> AppError {
         code,
         "invalid_obo_token" | "invalid_proof" | "obo_grant_revoked" | "obo_grant_expired"
     ) {
-        return crate::obo::required().with_details(json!({"ting_code": code}));
+        return crate::auth_cache::required().with_details(json!({"ting_code": code}));
     }
     let message = body
         .pointer("/error/message")
@@ -107,9 +117,7 @@ fn ting_error(status: u16, body: &Value) -> AppError {
         ),
         "payload_too_large" => (413, "Shorten the note."),
         "temporarily_rate_limited" => (429, "Retry later."),
-        "permission_denied" | "test_context_mismatch" => {
-            (403, "Check the app's Ting approval and testing plane.")
-        }
+        "permission_denied" | "test_context_mismatch" => (403, "Check the app's Ting approval."),
         "proof_verification_uncertain" | "dependency_unavailable" | "storage_unavailable" => {
             (503, "Temporary: retry the same pending action and key.")
         }
@@ -128,7 +136,7 @@ fn ting_error(status: u16, body: &Value) -> AppError {
 /// Registers the actor as a recipient for this app (`POST /v1/subscriptions`).
 ///
 /// # Errors
-/// IAM or Ting refusals, mapped.
+/// Silicon Accounts or Ting refusals, mapped.
 pub async fn register(
     identity: &dyn Identity,
     ting: &dyn TingApi,
@@ -136,10 +144,8 @@ pub async fn register(
     app_id: &str,
     attempt: &str,
 ) -> AppResult<Value> {
-    let body = serde_json::to_vec(
-        &json!({"org_id": context.org_id, "app_id": app_id, "for": context.actor.public_id}),
-    )
-    .map_err(AppError::internal)?;
+    let body = serde_json::to_vec(&json!({"app_id": app_id, "for": context.actor.public_id}))
+        .map_err(AppError::internal)?;
     let proof = identity
         .ting_access(context, TingEndpoint::Register, &body, attempt)
         .await?;
@@ -160,7 +166,7 @@ pub async fn register(
     )
 }
 
-/// Builds the exact send bytes. `for` and `org_id` come from the verified session, never the caller.
+/// Builds the exact send bytes. `for` comes from the verified session, never the caller.
 ///
 /// # Errors
 /// `invalid_input` for bad fields.
@@ -205,7 +211,6 @@ pub fn send_body(
         ));
     }
     let body = serde_json::to_vec(&json!({
-        "org_id": context.org_id,
         "type": event_type,
         "for": context.actor.public_id,
         "key": key,
@@ -227,7 +232,7 @@ pub fn send_body(
 /// Sends one Ting to the calling actor (`POST /v1/tings`) and returns Ting's acceptance.
 ///
 /// # Errors
-/// IAM or Ting refusals, mapped.
+/// Silicon Accounts or Ting refusals, mapped.
 pub async fn send(
     identity: &dyn Identity,
     ting: &dyn TingApi,
@@ -260,7 +265,6 @@ pub async fn send(
 
 fn provider_body(body: &[u8], proof: &TingAccess) -> AppResult<Vec<u8>> {
     let mut value: Value = serde_json::from_slice(body).map_err(AppError::internal)?;
-    value["org_id"] = json!(proof.org_id);
     value["for"] = json!(proof.actor.public_id);
     serde_json::to_vec(&value).map_err(AppError::internal)
 }

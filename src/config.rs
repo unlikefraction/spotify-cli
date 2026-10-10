@@ -16,20 +16,16 @@ pub struct Settings {
     pub database_path: PathBuf,
     /// Public origin (`SPOTIFY_PUBLIC_ORIGIN`).
     pub public_origin: String,
-    /// IAM API origin (`SPOTIFY_IAM_URL`).
-    pub iam_url: Url,
-    /// Bare application id (`SPOTIFY_IAM_APP_ID`, default `spotify`).
+    /// Silicon Accounts API origin (`SPOTIFY_ACCOUNTS_URL`).
+    pub accounts_url: Url,
+    /// Bare application id (`SPOTIFY_APP_ID`, default `spotify`).
     pub app_id: String,
-    /// Application secret (`SPOTIFY_IAM_APP_SECRET`, `ask_…`).
+    /// Application secret (`SPOTIFY_APP_SECRET`).
     pub app_secret: SecretString,
-    /// AES-256 key for durable OBO credentials (SPOTIFY_ENCRYPTION_KEY, 64 hex characters).
+    /// AES-256 key for encrypted Accounts exchange recovery (SPOTIFY_ENCRYPTION_KEY, 64 hex characters).
     pub encryption_key: SecretString,
-    /// IAM webhook signing secret (`SPOTIFY_IAM_WEBHOOK_SECRET`).
-    pub webhook_secret: SecretString,
-    /// Its key version (`SPOTIFY_IAM_WEBHOOK_KEY_VERSION`, default 1).
-    pub webhook_key_version: i64,
-    /// IAM timeout.
-    pub iam_timeout: Duration,
+    /// Silicon Accounts timeout.
+    pub accounts_timeout: Duration,
     /// Ting API origin (`SPOTIFY_TING_URL`).
     pub ting_url: Url,
     /// Ting timeout.
@@ -46,7 +42,7 @@ pub struct Settings {
     pub github_token: Option<SecretString>,
     /// `owner/repo` for issues.
     pub github_repository: String,
-    /// Browser origins allowed to post web telemetry.
+    /// Browser origins allowed to use sign-in and telemetry APIs.
     pub web_origins: Vec<String>,
 }
 
@@ -115,25 +111,20 @@ impl Settings {
     /// # Errors
     /// A message naming the bad or missing variable.
     pub fn from_env() -> anyhow::Result<Self> {
-        let app_secret = required("SPOTIFY_IAM_APP_SECRET")?;
+        let app_secret = required("SPOTIFY_APP_SECRET")?;
         anyhow::ensure!(
-            app_secret.starts_with("ask_") && app_secret.len() == 47,
-            "SPOTIFY_IAM_APP_SECRET must be the 47-character ask_… application secret"
+            app_secret.len() >= 20 && app_secret.bytes().all(|b| b.is_ascii_graphic()),
+            "SPOTIFY_APP_SECRET is malformed"
         );
         let encryption_key = required("SPOTIFY_ENCRYPTION_KEY")?;
         anyhow::ensure!(
             encryption_key.len() == 64 && encryption_key.bytes().all(|b| b.is_ascii_hexdigit()),
             "SPOTIFY_ENCRYPTION_KEY must be 64 hex characters"
         );
-        let webhook_secret = required("SPOTIFY_IAM_WEBHOOK_SECRET")?;
-        anyhow::ensure!(
-            (32..=512).contains(&webhook_secret.len()),
-            "SPOTIFY_IAM_WEBHOOK_SECRET must be 32-512 characters"
-        );
-        let app_id = var("SPOTIFY_IAM_APP_ID").unwrap_or_else(|| "spotify".into());
+        let app_id = var("SPOTIFY_APP_ID").unwrap_or_else(|| "spotify".into());
         anyhow::ensure!(
             silicon_spotify_client::valid_handle(&app_id, 1, 80),
-            "SPOTIFY_IAM_APP_ID must be a bare app id"
+            "SPOTIFY_APP_ID must be a bare app id"
         );
         Ok(Self {
             bind: var("SPOTIFY_BIND")
@@ -145,17 +136,14 @@ impl Settings {
             ),
             public_origin: var("SPOTIFY_PUBLIC_ORIGIN")
                 .unwrap_or_else(|| silicon_spotify_client::DEFAULT_API_URL.into()),
-            iam_url: origin("SPOTIFY_IAM_URL", "https://backend.iam.teamofsilicons.com")?,
+            accounts_url: origin(
+                "SPOTIFY_ACCOUNTS_URL",
+                "https://accounts.teamofsilicons.com",
+            )?,
             app_id,
             app_secret: SecretString::from(app_secret),
             encryption_key: SecretString::from(encryption_key),
-            webhook_secret: SecretString::from(webhook_secret),
-            webhook_key_version: var("SPOTIFY_IAM_WEBHOOK_KEY_VERSION")
-                .map_or(Ok(1), |v| v.parse())
-                .map_err(|_| {
-                    anyhow::anyhow!("SPOTIFY_IAM_WEBHOOK_KEY_VERSION must be an integer")
-                })?,
-            iam_timeout: seconds("SPOTIFY_IAM_TIMEOUT_SECONDS", 8)?,
+            accounts_timeout: seconds("SPOTIFY_ACCOUNTS_TIMEOUT_SECONDS", 8)?,
             ting_url: origin(
                 "SPOTIFY_TING_URL",
                 "https://backend.ting.teamofsilicons.com",

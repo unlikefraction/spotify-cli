@@ -115,7 +115,6 @@ the session if needed, and asks the backend to send the Ting with your identity.
 failures retry with backoff (10 s, doubling, at most 10 min) for one hour with the same Ting key,
 so a notification is never duplicated; after an hour a playback checkpoint is stale and the
 firing is marked `failed`. Permanent refusals (`recipient_not_registered`, `reconsent_required`,
-`testing_selection_changed`, …) stop retrying at once and show in `spotify trigger history` with
 the reason and the fix. Retry one by hand with `spotify trigger retry <firing-id>`.
 
 ## Without Ting

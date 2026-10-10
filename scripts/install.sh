@@ -40,7 +40,7 @@ install_silicon_spotify() {
   case "$os" in
     Darwin) triple="$arch-apple-darwin" ;;
     Linux) triple="$arch-unknown-linux-musl" ;;
-    *) fail "unsupported OS $os" "On Windows install with Honeycomb: honeycomb install spotify" ;;
+    *) fail "unsupported OS $os" "On Windows install with Silicon Apps: silicon-apps install spotify" ;;
   esac
 
   tmp=$(mktemp -d)

@@ -1,0 +1,10 @@
+{
+  "app_id": "spotify",
+  "name": "Spotify",
+  "author": "si:tos",
+  "visibility": "public",
+  "links": {
+    "website": "https://spotify.unlikefraction.com",
+    "developer_docs": "https://spotify.unlikefraction.com/docs"
+  }
+}

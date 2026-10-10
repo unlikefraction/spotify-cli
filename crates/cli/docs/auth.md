@@ -1,167 +1,44 @@
 # Authentication
 
-Two separate sign-ins, for two different things.
+Spotify uses Silicon Accounts for Carbon and Silicon identity. Spotify's own music account is a separate sign-in handled by spotify_player.
 
-| | IAM login (`spotify login`) | Spotify sign-in (`spotify auth login`) |
-| --- | --- | --- |
-| Who you are in IAM | ✓ | |
-| Needed for | triggers (Ting notifications) | Web API features: search, lyrics, playlists, library, devices, queue reads, repeat-one, likes, and every start that keeps Spotify.app in the background |
-| Stored in | `$SILICON_HOME/.spotify/session.json` | spotify_player's cache (`~/.cache/spotify-player`) |
-| Per | Silicon home | Mac user |
+## Sign in to Silicon Accounts
 
-Playback control through AppleScript needs neither (without the Spotify sign-in, every start goes
-through AppleScript, which brings Spotify.app forward for a moment).
-
-## IAM login (Silicons and Carbons)
-
-The CLI never asks for passwords, OTPs, SID or STK. It takes one short-lived token (SLT) minted by
-`iam` or IAM's consent screen (https://auth.iam.teamofsilicons.com). `iam` is Silicon IAM's own
-CLI, a separate program from spotify-cli: get it with `cargo install silicon-iam-cli` (crate
-`silicon-iam-cli`, binary `iam`). It talks to IAM at https://backend.iam.teamofsilicons.com, and
-`iam iam --json` shows where everything is. `spotify login --help`, `spotify iam` and the
-Authentication lines of `spotify --help` say the same, and `spotify iam --json` names it under
-`iam_cli` (`{name, description, install}`).
+Install Silicon Accounts from [Silicon Apps](https://apps.teamofsilicons.com). Sign in there as your Carbon (`c:id`) or Silicon (`si:id`), then request a one-use token for Spotify:
 
 ```sh
-cargo install silicon-iam-cli           # once: the iam CLI (Silicon IAM's, separate)
-spotify iam --json                      # {"app_id": "spotify", "org_id": "unlikefraction", …} (offline)
-# Silicon (in a fresh SILICON_HOME, first once: iam silicon-login --sid si:<handle>)
-iam silicon-login --app-id spotify --grant-org "$SILICON_ORG" --approve-scopes
-# Carbon
-iam login --app-id spotify --grant-org <org>
-spotify login '<SLT>'
+spotify accounts --json
+silicon-accounts login --app spotify --json | jq -r .slt | spotify login --token-file -
 spotify login status --json
+```
+
+The SLT is valid for two minutes and only for this app. The backend exchanges it using the app secret; the CLI never receives that secret or your Silicon's STK. Every session belongs to one account's immutable UUID. Public `c:id` and `si:id` handles are labels and may change.
+
+Sessions are saved privately in the selected Silicon home and reused across CLI invocations. Access tokens rotate using the saved refresh token. Refresh is serialized with the daemon and retried with the same idempotency key after a lost response. A network outage keeps the session saved. Expiry, revocation, or explicit logout ends sign-in.
+
+```sh
+spotify login contexts
+spotify login use si:planner
 spotify logout
 ```
 
-Or pipe the SLT straight in, so it never lands in shell history:
+Changing a backend requires a session for that backend. Changing the selected account does not move existing triggers to another account.
+
+## Browser sign-in
+
+Use **Sign in** on [spotify.unlikefraction.com](https://spotify.unlikefraction.com). The browser opens Silicon Accounts and returns using an authorization code bound to this browser with state and PKCE. The backend exchanges the code; no application secret enters the browser.
+
+The browser saves its own session across reloads and restarts, refreshes while it remains valid, and keeps it through temporary network failures. **Sign out** revokes that browser session. Browser and CLI sessions are independent, so signing into one does not overwrite the other.
+
+## Spotify music sign-in
 
 ```sh
-iam -o json silicon-login --app-id spotify --grant-org "$SILICON_ORG" --approve-scopes \
-  | jq -r .slt | spotify login --token-file -
+spotify auth login
+spotify auth status
 ```
 
-An SLT lasts about 2 minutes and works once; if it expired, was used, or was minted for another
-app, `spotify login` fails with `slt_rejected`: mint a fresh one and log in right away.
+This opens Spotify's own authorization flow for spotify_player. It enables Web API search, playlists, lyrics, devices, and playback while keeping Spotify.app in the background. Its cache belongs to the Mac user. AppleScript playback needs Spotify.app but not a Silicon Accounts login.
 
-**Which `iam` session mints it.** The SLT logs in whoever the minting `iam` session belongs to.
-`iam` honours `SILICON_HOME` too: it keeps its own session in `$SILICON_HOME/.silicon-iam`. So
-mint a Silicon's SLT with that Silicon's `SILICON_HOME`, where the Silicon has signed in to IAM
-once with its own credential (`iam silicon-login --sid si:<handle>`, which asks for the Silicon's
-STK); in a fresh home `iam` has no session and refuses to mint. `spotify --help`, `spotify iam`
-and `spotify login --help` say the same. A Carbon operator minting from their own `iam` session
-unsets `SILICON_HOME` for `iam` only; the session saved in the Silicon home is then the Carbon's,
-and Tings go to the Carbon:
+## Ting notifications
 
-```sh
-env -u SILICON_HOME iam -o json login --app-id spotify --grant-org <org> \
-  | jq -r .slt | spotify login --token-file -
-```
-
-What happens:
-1. The CLI sends the SLT to the backend (`POST /api/v1/auth/login`) with an idempotency key derived
-   from the SLT, so a retry after a network error replays instead of burning the single-use token.
-2. The backend exchanges it with IAM using the application secret (which never leaves the server),
-   validates the session against IAM's authorization snapshot and returns the app session.
-3. The CLI saves the session (0600) under `$SILICON_HOME/.spotify/`, in a separate slot for
-   this backend, testing environment, account and organization. Ordinary login does not request
-   Ting permission or register a notification recipient.
-
-Login requests `self.identity.read` and `self.profile.read`. IAM 5 selects exactly one account and
-one organization; old unscoped sessions require a fresh login. Each account/org session stays
-separate. `spotify login contexts` lists saved sessions and
-`spotify login use si:planner --organization tos` selects one. `--org`, `SILICON_ORG` or config
-`org` can select an existing session for that organization, but never change a token’s authority.
-Existing triggers keep their originating context after a switch.
-
-### Enable Ting notifications when needed
-
-```sh
-spotify ting authorize
-# Open authorization.authorization_url as the represented user and approve in IAM.
-spotify ting complete REQUEST_ID --code-file /secure/consent-code
-spotify trigger test
-```
-
-The request covers the declared `subscriptions.register` and `tings.send` roots. IAM lets you
-review the graph and select the provider account and organization. Only the represented user
-can approve it. The backend redeems the code and stores each root’s encrypted access/refresh
-pair separately from login. Completion registers the recipient; `spotify ting register` retries
-registration after a transport failure.
-
-Repeat `spotify ting authorize` without `--new` after an interrupted start: its saved operation
-key prevents a duplicate request. Keep the code file until completion succeeds and retry the
-same completion command after a lost response. Use `spotify ting status --json` for live request
-status, and `spotify ting authorize --new` only to replace an expired, denied or revoked request.
-Denial leaves ordinary login and existing work intact. An OBO `reconsent_required` error asks for
-this feature flow again, without signing you out. Ordinary logout preserves durable consent.
-
-`spotify login status --json` checks **live**: it refreshes a near-expiry token (rotation-safe:
-the idempotency key is derived from the refresh token, and the refresh runs under an exclusive
-lock shared with the daemon) and asks the backend `GET /api/v1/auth/me`. No saved session or a
-revoked session prints `{"authenticated": false, …}` with exit 0; network failures are errors
-(exit 5) so outages are never mistaken for logouts.
-
-Organization: `--org`, then `SILICON_ORG`, then config `org`, then the session's organization.
-
-## Spotify sign-in (spotify_player)
-
-```sh
-spotify auth status                             # signed in? (spotify_player's version, or what is missing)
-spotify auth status --json | jq .authenticated
-spotify auth login     # opens Spotify's consent page in the browser on this Mac
-```
-
-`spotify auth login` asks the daemon to start `spotify_player authenticate`, which opens Spotify's
-consent page in the default browser on this Mac (its output goes to
-`~/.silicon-spotify/spotify-auth.log`). A Carbon clicks **Agree** once; the page then returns to a
-local address on this Mac (`127.0.0.1:8989`), and spotify_player caches and refreshes the tokens.
-The sign-in is per macOS user, so every Silicon home on the Mac shares it. If commands fail with
-`spotify_auth_required`, run it again. Bring your own Spotify client id: see
-`spotify docs config`.
-
-**A headless Silicon** cannot click Agree, and the consent completes only in a browser on this
-Mac. Ask a Carbon at the Mac to run `spotify auth login` once (or run it yourself and ask them to
-click Agree in the tab it opens), then check with `spotify auth status`. Until then playback
-still works through AppleScript (Spotify.app comes forward for a moment at each start); search,
-lyrics, playlists, library, devices and queue reads fail with `spotify_auth_required`.
-
-spotify-cli also reads two things from that cache. The Spotify user id in `credentials.json` names
-your Liked Songs list, so `spotify play --liked` can play the list itself. The cached access
-tokens (read for each request, never kept) serve what spotify_player has no command for, or
-cannot do:
-
-- starting a song, an episode, a show or Liked Songs without bringing Spotify.app forward
-  (`spotify play <track|episode|show>`, `spotify play --liked`): `GET /v1/tracks/{id}` or
-  `/v1/episodes/{id}`, `GET /v1/me/tracks?limit=1` (Liked Songs' size and first song),
-  `GET /v1/me/player/devices` (at every start), `GET /v1/albums/{id}/tracks` when a start is
-  retried by position, `PUT /v1/me/player/play`, and `PUT /v1/me/player/shuffle` for Liked Songs
-  (`spotify docs playback`: Web API first);
-- searching when spotify_player's own search fails (`GET /v1/search`; the result says
-  `via: web_api`);
-- whether a song is in Liked Songs (`liked` in `spotify track`);
-- an episode's name, show and length (`spotify queue add`, and later `spotify queue` or the
-  daemon in the background when a first lookup failed).
-
-Those requests go only to `https://api.spotify.com` (HTTPS, no redirects), with a stale token
-replaced by the next cached one. Tokens are never logged or stored anywhere else, and after a 429
-nothing is sent (lookups, searches and starts share one pause) until Spotify's `Retry-After` has
-passed (30 s when it gives none, at most 10 minutes).
-
-## Testing planes
-
-IAM testing environments are isolated planes that use the same code paths as production. Select
-one with the spotify-cli **test application secret** of that environment:
-
-```sh
-printf %s "$SPOTIFY_TEST_APP_SECRET" | spotify testing use --app-secret-file -
-spotify login si:test-silicon            # in a testing plane an SLT may be a test public id
-spotify trigger test
-spotify testing exit
-```
-
-`SPOTIFY_TEST_APP_SECRET` selects a plane for one process. Test and production sessions are stored
-in separate slots and never fall back to each other. The backend validates the secret with IAM
-(`X-Testing-Environment-Key` → `with_testing_application`) and forwards only *Ting's* test
-credentials bound to the OBO token’s testing context to Ting. Provider verification and local
-session selection never fall back to production or another testing generation.
+Ting requests use Silicon Accounts App verification and User verification, bound to the signed-in account. See [Ting integration](ting.md). Local triggers can be used without remote delivery.

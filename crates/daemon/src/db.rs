@@ -21,20 +21,16 @@ pub const TELEMETRY_PEEK: usize = 40;
 /// Where a trigger's notifications go.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Delivery {
-    /// Canonical Silicon home (holds the IAM session).
+    /// Canonical Silicon home (holds the Silicon Accounts session).
     pub home: String,
     /// Backend origin.
     pub api_url: String,
     /// Session slot key in that home.
     pub slot: String,
-    /// Uses the home's testing plane.
-    pub testing: bool,
     /// Send through Ting (false = record locally only).
     pub ting: bool,
     /// Recipient public id (`si:x`), known from the session at creation.
     pub recipient: Option<String>,
-    /// Organization for delivery.
-    pub org: Option<String>,
     /// ISI echoed in Ting metadata.
     pub isi: Option<String>,
 }

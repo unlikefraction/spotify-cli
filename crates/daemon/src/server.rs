@@ -207,21 +207,15 @@ async fn dispatch(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
             daemon.db.clear_telemetry()?;
             Ok(json!({"cleared": true}))
         }
-        "update.check" | "update.apply" => {
-            let auto_update =
-                crate::updater::auto_update(&settings_of(daemon, request), &daemon.settings());
-            crate::updater::check(daemon, request.op == "update.apply", auto_update)
-                .await
-                .inspect(|status| {
-                    if status.get("restarting").and_then(Value::as_bool) == Some(true) {
-                        let d = Arc::clone(daemon);
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                            crate::shutdown(&d, 0);
-                        });
-                    }
-                })
-        }
+        "update.check" | "update.apply" => crate::updater::check(daemon).await.inspect(|status| {
+            if status.get("restarting").and_then(Value::as_bool) == Some(true) {
+                let d = Arc::clone(daemon);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    crate::shutdown(&d, 0);
+                });
+            }
+        }),
         _ => {
             if let Some(result) = service::handle(daemon, request).await {
                 return result;

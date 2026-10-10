@@ -1,19 +1,23 @@
 # spotify-cli
 
 Spotify from the command line, for Carbons and Silicons on macOS, with playback triggers
-delivered through Ting. New to Carbons, Silicons, IAM, SLTs or Ting? See
-[Concepts](https://spotify.unlikefraction.com/docs/usage/#concepts).
+delivered through Ting. New to Carbons, Silicons, Silicon Accounts, SLTs or Ting? See
+[Concepts](docs/usage.md#concepts).
 
 ```sh
 curl -fsSL https://spotify.unlikefraction.com/install.sh | sh
 spotify doctor
 spotify play --search 'arctic monkeys 505'
 spotify lyrics spotify:track:0BxE4FqsDD1Ot4YuBXwAPp     # any song's lyrics; nothing has to play
-spotify trigger add --remaining 30s --note 'wrap up'
+spotify trigger add --remaining 30s --note 'wrap up' --local
 ```
 
+For Ting notifications, sign in with `spotify login`, then run `spotify ting authorize` and
+complete the Silicon Accounts approval with `spotify ting complete REQUEST_ID --code-file FILE`. Login and
+notification consent are separate. See [Authentication](docs/auth.md).
+
 Installer options, where state lives and how to uninstall:
-[Install options](https://spotify.unlikefraction.com/docs/usage/#install-options).
+[Install options](docs/usage.md#install-options).
 
 - **Every control:** play (URIs, links, search, Liked Songs, radio), pause, next/previous, seek,
   volume, shuffle, repeat, like, track details, search, library, devices, playlists
@@ -37,8 +41,8 @@ Installer options, where state lives and how to uninstall:
   (`spotify commands --json`), offline guides (`spotify docs`), `spotify report --pr`.
 
 Docs: https://spotify.unlikefraction.com/docs (or `spotify docs`). Start with
-[`docs/usage.md`](https://spotify.unlikefraction.com/docs/usage/); architecture and decisions: [`ARCHITECTURE.md`](https://github.com/unlikefraction/spotify-cli/blob/main/ARCHITECTURE.md);
-going live: [`deploy/README.md`](https://github.com/unlikefraction/spotify-cli/blob/main/deploy/README.md).
+[`docs/usage.md`](docs/usage.md); architecture and decisions: [`ARCHITECTURE.md`](ARCHITECTURE.md);
+going live: [`deploy/README.md`](deploy/README.md).
 
 ## Find anything
 
@@ -68,7 +72,7 @@ spotify completions fish > ~/.config/fish/completions/spotify.fish
 
 Then open a new shell. `spotify completions --help` shows the same lines, and PowerShell's.
 
-More: [Find anything](https://spotify.unlikefraction.com/docs/usage/#2-find-anything).
+More: [Find anything](docs/usage.md#2-find-anything).
 
 ## Components
 
@@ -83,11 +87,12 @@ More: [Find anything](https://spotify.unlikefraction.com/docs/usage/#2-find-anyt
 ## Develop
 
 ```sh
-cargo test --workspace
-cargo run --example dev_backend --features dev -- 127.0.0.1:8787 /tmp/tings.jsonl   # fake IAM + Ting
-SPOTIFY_API_URL=http://127.0.0.1:8787 cargo run -p silicon-spotify-cli -- login si:dev
-SPOTIFY_API_URL=http://127.0.0.1:8787 cargo run -p silicon-spotify-cli -- trigger test
-scripts/package-release.sh      # all six targets + Honeycomb package
+cargo check --workspace --locked
+cp .env.example .env                 # configure your Silicon Accounts app
+cargo run -p silicon-spotify --bin spotify-api
+node docs-site/build.mjs
+node docs-site/check.mjs
+scripts/package-release.sh      # all six targets + Silicon Apps package
 ```
 
 Found a bug? Patch it, open a PR, then `spotify report '<what>' --pr <url>`.

@@ -11,7 +11,7 @@
   // Code blocks come with a header strip (build.mjs); the button goes there, never over the code.
   document.querySelectorAll(".article .codeblock").forEach((block) => {
     const b = document.createElement("button");
-    b.type = "button"; b.className = "copy"; b.textContent = "Copy";
+    b.type = "button"; b.className = "copy button secondary sm"; b.textContent = "Copy";
     b.addEventListener("click", () => copy(block.querySelector("pre").textContent.replace(/\n$/, ""), b));
     block.querySelector(".codeblock-head").append(b);
   });

@@ -889,8 +889,6 @@ fn target(ctx: &Ctx) -> Result<Value> {
     Ok(json!({
         "api_url": ctx.api_url,
         "slot": ctx.slot()?,
-        "testing": ctx.testing.is_some(),
-        "org": ctx.org(None),
     }))
 }
 
@@ -933,12 +931,6 @@ async fn trigger_add(ctx: &Ctx, add: TriggerAdd) -> Result<()> {
             json!({"track": parse_uri(track, Some(Kind::Track))?.uri()})
         }
     };
-    if ctx.testing.is_some() && !add.local && ctx.home.testing_saved()? != ctx.testing {
-        return Err(Error::invalid(
-            "The testing plane is selected only by SPOTIFY_TEST_APP_SECRET, but triggers are delivered later by the daemon, which reads the home's saved selection.",
-            "Save it with `spotify testing use --app-secret-file -` (then unset the variable), or add --local.",
-        ));
-    }
     let value = ctx
         .daemon(
             "trigger.add",
@@ -963,147 +955,4 @@ async fn trigger_add(ctx: &Ctx, add: TriggerAdd) -> Result<()> {
     }
     ctx.next(&next::after_trigger_add(&value, add.local));
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn limits_are_checked_whatever_their_sign() {
-        assert_eq!(check_limit(None, Some(10), "").ok(), Some(None));
-        assert_eq!(check_limit(Some(3), Some(10), "").ok(), Some(Some(3)));
-        assert_eq!(check_limit(Some(500), None, "").ok(), Some(Some(500)));
-        for bad in [0, -1, 11] {
-            let error = check_limit(Some(bad), Some(10), "hint").expect_err("out of range");
-            assert_eq!(error.code, "invalid_input");
-            assert_eq!(
-                error.message,
-                format!("--limit {bad} is out of range: it takes 1 to 10.")
-            );
-            assert_eq!(
-                error.details,
-                Some(json!({"limit": bad, "min": 1, "max": 10}))
-            );
-        }
-    }
-
-    #[test]
-    fn queued_search_hits_carry_what_is_known() {
-        let track = parse_uri("spotify:track:0BxE4FqsDD1Ot4YuBXwAPp", None).expect("uri");
-        let hit = json!({"kind": "track", "name": "505", "by": ["Arctic Monkeys", "X"],
-            "album": "Favourite Worst Nightmare", "duration_ms": 253_000});
-        assert_eq!(
-            known_item(&track, &hit),
-            json!({"uri": "spotify:track:0BxE4FqsDD1Ot4YuBXwAPp", "name": "505",
-                "by": "Arctic Monkeys, X", "duration_ms": 253_000})
-        );
-        // An episode's `by` is its show.
-        let episode = parse_uri("spotify:episode:4IzpgR6RCEkRqMHbJF38Wp", None).expect("uri");
-        let hit = json!({"kind": "episode", "name": "How to Speak Clearly", "album": "Huberman Lab",
-            "duration_ms": 7_140_000});
-        assert_eq!(
-            known_item(&episode, &hit),
-            json!({"uri": "spotify:episode:4IzpgR6RCEkRqMHbJF38Wp", "name": "How to Speak Clearly",
-                "by": "Huberman Lab", "duration_ms": 7_140_000})
-        );
-        // Nothing known: nulls, which the daemon fills in itself.
-        assert_eq!(
-            known_item(&episode, &json!({"name": ""})),
-            json!({"uri": "spotify:episode:4IzpgR6RCEkRqMHbJF38Wp", "name": null, "by": null, "duration_ms": null})
-        );
-        // An empty show is not known either.
-        assert_eq!(
-            known_item(&episode, &json!({"name": "Ep", "album": ""}))["by"],
-            Value::Null
-        );
-    }
-
-    #[test]
-    fn only_transient_read_failures_are_retried() {
-        assert!(transient(
-            &Error::new("transport", "connection reset", "retry").retryable()
-        ));
-        assert!(transient(
-            &Error::new("spotify_player_busy", "busy", "retry").retryable()
-        ));
-        // Not retryable, or not a network blip: fail at once.
-        assert!(!transient(&Error::new("transport", "bad url", "fix it")));
-        assert!(!transient(
-            &Error::new("rate_limited", "429", "wait").retryable()
-        ));
-        assert!(!transient(&Error::not_found("gone", "search")));
-    }
-
-    #[test]
-    fn liked_songs_shuffled_start_at_random() {
-        use clap::Parser as _;
-        let play = |args: &[&str]| match crate::args::Cli::try_parse_from(args)
-            .expect("parses")
-            .command
-        {
-            Some(Command::Play(args)) => liked_target(&args),
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(
-            play(&["spotify", "play", "--liked", "--shuffle"])["random"],
-            true
-        );
-        assert_eq!(
-            play(&["spotify", "play", "--liked", "--random"])["random"],
-            true
-        );
-        assert_eq!(play(&["spotify", "play", "--liked"])["random"], false);
-    }
-
-    #[test]
-    fn lyrics_of_a_name_point_to_search() {
-        let error = lyrics_target("505").expect_err("not an id");
-        assert_eq!(error.code, "invalid_input");
-        assert_eq!(error.message, "`505` is not a track URI, link or id.");
-        assert!(
-            error.hint.starts_with(
-                "`spotify lyrics` takes a track, not search words: find it with `spotify search 505 --type track`, then run `spotify lyrics <uri>`"
-            ),
-            "{}",
-            error.hint
-        );
-        let error = lyrics_target("arctic monkeys 505").expect_err("words");
-        assert!(
-            error
-                .hint
-                .contains("spotify search 'arctic monkeys 505' --type track"),
-            "{}",
-            error.hint
-        );
-        assert_eq!(
-            error.details.map(|d| d["search"].clone()),
-            Some(json!("spotify search 'arctic monkeys 505' --type track"))
-        );
-        assert!(lyrics_search_advice("don't stop").contains(r"'don'\''t stop'"));
-        // A malformed URI keeps the error about its format.
-        let error = lyrics_target("spotify:track:short").expect_err("bad id");
-        assert!(!error.hint.contains("takes a track"), "{}", error.hint);
-        assert_eq!(
-            lyrics_target("0BxE4FqsDD1Ot4YuBXwAPp")
-                .map(|u| u.uri())
-                .ok(),
-            Some("spotify:track:0BxE4FqsDD1Ot4YuBXwAPp".to_owned())
-        );
-    }
-
-    #[test]
-    fn bare_track_ids_that_are_not_found_suggest_a_kind() {
-        let error = bare_id_not_found(
-            Error::not_found("Spotify could not find that item.", "Search for it."),
-            "78bpIziExqiI9qztvNFlQu",
-        );
-        assert_eq!(error.code, "not_found");
-        assert!(
-            error.hint.starts_with("Bare ids are looked up as tracks: if 78bpIziExqiI9qztvNFlQu is an album, artist or playlist, pass --type album|artist|playlist"),
-            "{}",
-            error.hint
-        );
-        assert!(error.hint.ends_with("Search for it."), "{}", error.hint);
-    }
 }

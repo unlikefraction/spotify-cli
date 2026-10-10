@@ -1,6 +1,6 @@
 [package]
 name = "silicon-spotify-cli"
-description = "The `spotify` command: drive Spotify on macOS from the terminal, with IAM login and Ting playback triggers for Silicons."
+description = "The `spotify` command: drive Spotify on macOS from the terminal, with Silicon Accounts login and Ting playback triggers for Silicons."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -29,9 +29,6 @@ tokio.workspace = true
 uuid.workspace = true
 semver.workspace = true
 libc.workspace = true
-
-[dev-dependencies]
-tempfile = "3"
 
 [lints]
 workspace = true

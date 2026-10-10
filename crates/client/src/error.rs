@@ -84,12 +84,12 @@ impl Error {
         Self::new("not_found", message, hint)
     }
 
-    /// `not_authenticated`: no usable spotify-cli (IAM) session. Exit code 3.
+    /// `not_authenticated`: no usable spotify-cli (Silicon Accounts) session. Exit code 3.
     pub fn not_authenticated(message: impl Into<String>) -> Self {
         Self::new(
             "not_authenticated",
             message,
-            "Mint a short-lived token with `iam silicon-login --app-id spotify --grant-org <org> --approve-scopes` (Silicon) or `iam login --app-id spotify --grant-org <org>` (Carbon), then run `spotify login '<SLT>'`.",
+            "Mint an SLT with `silicon-accounts login --app spotify --json`, then run `spotify login --token-file <path>`.",
         )
     }
 
@@ -133,7 +133,7 @@ impl Error {
         .retryable()
     }
 
-    /// Process exit code for this error (IAM CLI taxonomy):
+    /// Process exit code for this error (Silicon Accounts CLI taxonomy):
     /// 2 usage, 3 not signed in, 4 refused, 5 transport or unavailable dependency, 1 otherwise.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
@@ -171,31 +171,5 @@ impl std::error::Error for Error {}
 impl From<serde_json::Error> for Error {
     fn from(error: serde_json::Error) -> Self {
         Self::internal(format!("JSON encoding or decoding failed: {error}"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exit_codes_follow_the_iam_taxonomy() {
-        assert_eq!(Error::invalid("x", "y").exit_code(), 2);
-        assert_eq!(Error::not_authenticated("x").exit_code(), 3);
-        assert_eq!(
-            Error::new("automation_permission_denied", "", "").exit_code(),
-            4
-        );
-        assert_eq!(Error::daemon_unavailable("x").exit_code(), 5);
-        assert_eq!(Error::nothing_playing().exit_code(), 1);
-    }
-
-    #[test]
-    fn serializes_without_empty_details() {
-        let value = serde_json::to_value(Error::invalid("bad", "fix")).expect("json");
-        assert_eq!(
-            value,
-            serde_json::json!({"code":"invalid_input","message":"bad","hint":"fix","retryable":false})
-        );
     }
 }

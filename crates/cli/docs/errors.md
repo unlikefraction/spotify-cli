@@ -66,10 +66,10 @@ accepts but the command cannot use are `invalid_input`. Examples:
 | Code | Exit | Meaning | Fix |
 | --- | --- | --- | --- |
 | `invalid_input` / `usage` | 2 | arguments or values are wrong: a malformed Spotify id or link, a reference of the wrong kind, search words given to `lyrics`, a limit out of range, a config value of the wrong type, a `config set` given `key=value` instead of JSON, an empty `docs --search`, a `report --attach` file that is not text, an unknown subcommand, or Spotify answering 400 Bad Request | the hint shows the accepted forms or the command meant; `<command> --help` |
-| `not_authenticated` | 3 | no IAM session in this home, or it was revoked or expired (the backend's `unauthenticated`) | `spotify login '<SLT>'`, with an SLT from `iam`, Silicon IAM's own CLI (`cargo install silicon-iam-cli`; `spotify docs auth`) |
+| `not_authenticated` | 3 | no Silicon Accounts session in this home, or it was revoked or expired (the backend's `unauthenticated`) | `spotify login '<SLT>'`, with an SLT from `silicon-accounts`, Silicon Silicon Accounts's own CLI (`silicon-apps install silicon-accounts`; `spotify docs auth`) |
 | `slt_rejected` | 1 | the SLT expired (~2 min), was used, or is for another app | mint a fresh one for `spotify` and log in right away (`spotify docs auth`) |
-| `reconsent_required` | 4 | Ting feature consent is missing, revoked or changed | `spotify ting authorize --new`, review in IAM and complete the request; ordinary login remains signed in |
-| `forbidden` | 4 | IAM refused the request (scopes, consent, organization) | log in again; check the organization (`--org`) |
+| `reconsent_required` | 4 | Ting feature consent is missing, revoked or changed | `spotify ting authorize --new`, review in Silicon Accounts and complete the request; ordinary login remains signed in |
+| `forbidden` | 4 | Silicon Accounts refused the request (account authorization) | check the selected account and sign in again |
 | `permission_denied` | 4 | Spotify refused (403: a playlist you neither own nor collaborate on), or a daemon socket, home or trigger belongs to another user or home | edit only your own playlists; use your own OS user and home |
 
 ### Spotify and playback
@@ -114,8 +114,6 @@ accepts but the command cannot use are `invalid_input`. Examples:
 | `threshold_passed` | 2 | a `current` trigger's checkpoint is already behind | later checkpoint or `--scope every` |
 | `recipient_not_registered` | 4 | Ting needs feature permission or recipient registration | `spotify ting authorize`, complete approval, then retry |
 | `recipient_changed` | 1 | the trigger's home now holds another Silicon's session (in `spotify trigger history`) | remove the trigger and create it again as the right Silicon |
-| `testing_selection_changed` | 1 | a trigger's home now selects another plane | re-select it (`spotify testing use`) or recreate the trigger |
-| `testing_selection_missing` | 1 | a trigger made in a testing plane, but the home no longer selects one | `spotify testing use --app-secret-file -`, or remove the trigger |
 
 The managed queue has no codes of its own: items that cannot be queued are `invalid_input`, an
 unknown position, id or URI is `not_found`, and `spotify next` with an empty managed queue is not
@@ -138,7 +136,7 @@ an error (it runs Spotify's own next).
 | `homebrew_missing` | 1 | `spotify setup` needs Homebrew to install Spotify.app or spotify_player | install Homebrew (https://brew.sh), or `cargo install spotify_player` |
 | `install_failed` | 1 | a `brew install` run by `spotify setup` failed | run the `brew` command yourself to see why |
 | `no_release` / `download_failed` / `checksum_missing` / `checksum_mismatch` / `unpack_failed` | 1 | `spotify update` (or the hourly update) found no usable release, or the download did not verify; nothing was installed | retry later; report it if it persists |
-| `update_not_writable` | 1 | the update cannot replace the binaries in their directory | re-run the installer (`spotify docs usage`), or install with Honeycomb |
+| `update_not_writable` | 1 | the update cannot replace the binaries in their directory | re-run the installer (`spotify docs usage`), or install with Silicon Apps |
 
 ### Files, backend and bugs
 
@@ -146,7 +144,7 @@ an error (it runs Spotify's own next).
 | --- | --- | --- | --- |
 | `store_io` / `corrupt_store` / `unsafe_store` | 1 | a file under `$SILICON_HOME/.spotify` cannot be read or written, is not valid JSON, or the directory is a symlink | fix or delete the named file (deleting `session.json` logs you out); use a real directory owned by you |
 | `backend_unavailable` | 5 | the backend could not be reached | network; `spotify config get api_url` |
-| `dependency_unavailable` | 5 | the backend could not reach IAM or Ting (retryable) | retry later |
+| `dependency_unavailable` | 5 | the backend could not reach Silicon Accounts or Ting (retryable) | retry later |
 | `backend_unexpected_response` / `backend_error` | 1 | the backend answered in a shape this CLI does not know | `spotify update`, then retry |
 | `internal` | 1 | a bug | `spotify report` |
 
@@ -158,19 +156,18 @@ by HTTP status:
 
 | HTTP | Code | Meaning |
 | --- | --- | --- |
-| 400 | `invalid_input` | the request is malformed (missing header, bad JSON, bad field); also a request IAM rejected as malformed |
+| 400 | `invalid_input` | the request is malformed (missing header, bad JSON, bad field); also a request Silicon Accounts rejected as malformed |
 | 401 | `unauthenticated` | the bearer or refresh token is missing, malformed, expired or revoked. The CLI shows it as `not_authenticated` |
-| 401 | `slt_rejected` | `POST /api/v1/auth/login`: IAM refused the SLT (expired, used, or minted for another app) |
-| 401 | `invalid_testing_secret` | `X-Testing-Environment-Key` is not this app's 47-character `ask_…` test secret; select a plane with `spotify testing use --app-secret-file -` |
-| 401 | `webhook_unverified` | an `/webhook/` delivery failed IAM signature, timestamp or header checks (nothing for users to do; the backend logs the reason) |
-| 403 | `forbidden`, `reconsent_required`, `recipient_not_registered` | IAM or Ting refused; see the tables above |
+| 401 | `slt_rejected` | `POST /api/v1/auth/login`: Silicon Accounts refused the SLT (expired, used, or minted for another app) |
+| 401 | `webhook_unverified` | an `/webhook/` delivery failed Silicon Accounts signature, timestamp or header checks (nothing for users to do; the backend logs the reason) |
+| 403 | `forbidden`, `reconsent_required`, `recipient_not_registered` | Silicon Accounts or Ting refused; see the tables above |
 | 404 | `not_found` | no such route, or Ting does not know the type |
 | 405 | `method_not_allowed` | the route exists but not for this method; the `Allow` header lists the methods it accepts |
 | 409 | `conflict` | an `Idempotency-Key` was reused with a different request; retry the original request with its original key |
 | 413 | `payload_too_large` | the body is over 512 KiB, or a telemetry batch is over 64 KiB; send less or split it |
 | 429 | `rate_limited` | slow down; `retryable: true` |
 | 500 | `internal` | a bug; report it with the `X-Request-Id` |
-| 503 | `dependency_unavailable` | IAM or Ting is unreachable or refused the backend's own credentials; `retryable: true` |
+| 503 | `dependency_unavailable` | Silicon Accounts or Ting is unreachable or refused the backend's own credentials; `retryable: true` |
 
 Through the CLI, every 401 is reported as `not_authenticated` (exit 3), except that
 `spotify login` reports a refused SLT as `slt_rejected` (exit 1). `conflict`, `payload_too_large`

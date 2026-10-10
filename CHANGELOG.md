@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0
+
+- Use Silicon Accounts for Carbon and Silicon sign-in, with immutable account ownership and persistent, renewable browser and CLI sessions.
+- Replace package publishing and network updates with Silicon Apps, authored by `si:tos`.
+- Remove organizations, testing environments, and test suites.
+- Use Silicon UI on the website and add browser sign-in.
+- Use Accounts Proof for Ting; queue deliveries through upstream outages.
+
+
 ## 0.2.0
 
 - Migrate to IAM 5 with one account and organization per session. Preserve separate saved

@@ -1,31 +1,16 @@
+/* Layout colors and radii come from Silicon UI's source registry. */
 :root {
-  --paper: #fffdf9;
-  --surface: #f6f5f0;
-  --line: #e7e5dd;
-  --ink: #1f2421;
-  --muted: #6d726c;
-  --accent: #1d6b45;
-  --accent-pale: #e9f3ec;
-  --code: #f1f0ea;
-  --shadow: 0 1px 2px #1f24210a, 0 8px 24px #1f242108;
-  --radius: 10px;
-  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
-  --serif: "Iowan Old Style", "Source Serif 4", Georgia, "Times New Roman", serif;
-  --mono: ui-monospace, "SF Mono", SFMono-Regular, "IBM Plex Mono", Menlo, Consolas, monospace;
-  color-scheme: light dark;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --paper: #141715;
-    --surface: #1b1f1c;
-    --line: #2b312d;
-    --ink: #e9ece8;
-    --muted: #9aa39c;
-    --accent: #6fcf97;
-    --accent-pale: #1e2f25;
-    --code: #1f2521;
-    --shadow: none;
-  }
+  --paper: var(--background);
+  --line: var(--border);
+  --ink: var(--foreground);
+  --muted: var(--text-secondary);
+  --accent-pale: var(--accent-subtle);
+  --code: var(--surface-muted);
+  --shadow: var(--shadow-raised);
+  --radius: var(--radius-container);
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --serif: "Iowan Old Style", Georgia, serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
@@ -137,3 +122,7 @@ h1 { font-weight: 600; font-size: clamp(2.1rem, 5vw, 3.4rem); line-height: 1.08;
   .copy { align-self: flex-end; }
 }
 .note code, td code, th code { white-space: nowrap; }
+
+.account-panel { max-width: 1440px; margin: 0 auto; padding: 12px 28px; display: flex; gap: 16px; align-items: center; justify-content: flex-end; border-bottom: 1px solid var(--border); font-size: var(--text-sm); color: var(--text-secondary); }
+[hidden] { display: none !important; }
+@media (max-width: 600px) { .account-panel { padding: 12px 20px; flex-wrap: wrap; justify-content: flex-start; } }

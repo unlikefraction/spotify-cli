@@ -13,10 +13,10 @@ crates/client   silicon-spotify-client   stateless library: models, URI/time par
                                          used by the CLI and daemon
 crates/cli      silicon-spotify-cli      the `spotify` command
 crates/daemon   silicon-spotify-daemon   `spotify-daemon` (macOS: objc2 NSAppleScript + notifications)
-src/            silicon-spotify          backend (`spotify-api`): IAM exchange, Ting, reports, telemetry
+src/            silicon-spotify          backend (`spotify-api`): Silicon Accounts exchange, Ting, reports, telemetry
 docs/           these guides (bundled into the CLI by scripts/sync-cli-docs.sh)
 docs-site/      static site generator for spotify.unlikefraction.com (+ install.sh)
-deploy/         backend deployment (systemd, Caddy, CloudFormation), Honeycomb and Ting setup
+deploy/         backend deployment (systemd, Caddy, CloudFormation), Silicon Apps and Ting setup
 ```
 
 ## Use the library
@@ -60,7 +60,7 @@ start emptied) are in `spotify docs playback`.
 `web` and `focus` are new in 0.1.6 (a `Controller` built for 0.1.5 needs them added).
 `web: Err(error)` makes AppleScript start songs, episodes, shows and Liked Songs, as before, and
 the controller then reports `fallback: {from: "web_api", reason: error}`; `focus: None` leaves
-the focus where it lands. `webapi::WebApi` needs one method (`send`), so tests and other HTTP
+the focus where it lands. `webapi::WebApi` needs one method (`send`), so other HTTP
 stacks can supply their own. The `webapi` module has the steps without the verification:
 `start` (a track or episode: item lookup, device, `PUT /me/player/play`, position retry),
 `start_list` (Liked Songs or a show), `choose_device` and `target` (where a start goes:
@@ -121,7 +121,7 @@ Ops: `daemon.status`, `daemon.shutdown`, `doctor`, `player.{status,play,pause,to
 `spotify.{launch,auth.status,auth.login}`, `track.info`, `lyrics`, `search`, `library.get`,
 `devices.{list,connect}`, `queue.{list,add,remove,move,clear}`, `playlist.{list,show,create,delete,add,remove,rename,import,fork,sync}`,
 `podcast.saved`, `trigger.{add,list,get,remove,clear,history,test,wait,retry}`,
-`telemetry.{record,clear}`, `update.{check,apply}`. Argument shapes: `crates/cli/src/ops.rs` (the
+`telemetry.{record,clear}`. Argument shapes: `crates/cli/src/ops.rs` (the
 CLI is the reference client) and `crates/daemon/src/*.rs`. Unknown ops fail with `unknown_op`.
 The socket accepts only the same OS user. Some fields a client may rely on:
 
@@ -153,31 +153,17 @@ The socket accepts only the same OS user. Some fields a client may rely on:
   Spotify.app's song under another id); `player.like` then refuses with a non-retryable
   `track_mismatch` whose `details` carry `relinked: true` and `matched_by`.
 
-## Build and test
+## Build and release
 
 ```sh
-cargo test --workspace                        # unit + backend contract tests (fake IAM and Ting)
-cargo run --example dev_backend --features dev -- 127.0.0.1:8787 /tmp/tings.jsonl
-SPOTIFY_API_URL=http://127.0.0.1:8787 cargo run -p silicon-spotify-cli -- login si:dev-silicon
-SPOTIFY_API_URL=http://127.0.0.1:8787 cargo run -p silicon-spotify-cli -- trigger test
+cargo fmt --all -- --check
+cargo check --locked --workspace
+cargo build --release --workspace
 ```
 
-The dev backend serves the real router with in-process IAM and Ting fakes and appends every
-"sent" Ting to the JSONL file, so the whole path (CLI → daemon → session → backend → Ting) can be
-exercised on a Mac without an IAM application secret.
+The backend uses `SPOTIFY_ACCOUNTS_URL`, `SPOTIFY_APP_ID`, and `SPOTIFY_APP_SECRET`; keep its encryption key stable. See `.env.example`.
 
-Release artifacts: `scripts/package-release.sh` (all six targets). macOS binaries are ad-hoc
-signed unless `SPOTIFY_CODESIGN_IDENTITY` is set; releases set it and the notary profile:
-
-```sh
-SPOTIFY_CODESIGN_IDENTITY="Developer ID Application: …" \
-SPOTIFY_NOTARY_PROFILE=spotify-cli \
-  scripts/package-release.sh     # Developer ID + hardened runtime, then Apple notarization
-```
-
-`scripts/macos-sign.sh <dir>` does the signing for one architecture; the release steps are in
-`deploy/README.md`. On macOS, `crates/daemon/build.rs` embeds `crates/daemon/Info.plist` in
-`spotify-daemon`; keep its `CFBundleIdentifier` equal to the codesign identifier.
+`scripts/package-release.sh` builds native clients and the Silicon Apps package. `apps.yaml` declares the binary and installation script for each target. macOS release binaries use Developer ID signing and Apple notarization. The operator steps are in `deploy/README.md`.
 
 ## Conventions
 

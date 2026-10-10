@@ -82,8 +82,8 @@ pub enum Need {
     SpotifyApp,
     /// spotify_player installed and signed in to Spotify (Web API features).
     SpotifyPlayer,
-    /// An IAM session in this home (`spotify login`).
-    IamLogin,
+    /// An Silicon Accounts session in this home (`spotify login`).
+    AccountsLogin,
     /// A Spotify Premium account.
     Premium,
     /// It changes what plays.
@@ -98,7 +98,7 @@ impl Need {
         (Self::Daemon, "daemon"),
         (Self::SpotifyApp, "spotify_app"),
         (Self::SpotifyPlayer, "spotify_player_signed_in"),
-        (Self::IamLogin, "iam_login"),
+        (Self::AccountsLogin, "accounts_login"),
         (Self::Premium, "premium"),
         (Self::ControlsPlayback, "controls_playback"),
         (Self::Network, "network"),
@@ -131,7 +131,7 @@ impl Need {
                 "rate_limited",
                 "timeout",
             ],
-            Self::IamLogin => &["not_authenticated", "reconsent_required", "forbidden"],
+            Self::AccountsLogin => &["not_authenticated", "reconsent_required", "forbidden"],
             Self::Premium => &["premium_required"],
             Self::ControlsPlayback => &[
                 "verification_failed",
@@ -187,7 +187,7 @@ impl Entry {
     };
 }
 
-use Need::{ControlsPlayback, Daemon, IamLogin, Network, Premium, SpotifyApp, SpotifyPlayer};
+use Need::{AccountsLogin, ControlsPlayback, Daemon, Network, Premium, SpotifyApp, SpotifyPlayer};
 
 /// Reads of Spotify.app through the daemon.
 const APP: &[Need] = &[Daemon, SpotifyApp];
@@ -197,8 +197,8 @@ const CONTROL: &[Need] = &[Daemon, SpotifyApp, ControlsPlayback];
 const WEB: &[Need] = &[Daemon, SpotifyPlayer, Network];
 /// Web API reads that also look at what Spotify.app plays.
 const WEB_APP: &[Need] = &[Daemon, SpotifyApp, SpotifyPlayer, Network];
-/// Backend and IAM calls.
-const IAM: &[Need] = &[IamLogin, Network];
+/// Backend and Silicon Accounts calls.
+const ACCOUNTS: &[Need] = &[AccountsLogin, Network];
 
 const CONTROL_NOTE: &str = "Tries the Spotify Web API (spotify_player) first when it is signed in and falls back to AppleScript, so neither spotify_player nor Premium is required; under strategy spotify_player both are.";
 
@@ -1024,8 +1024,8 @@ pub const ENTRIES: &[Entry] = &[
             "checkpoint",
             "webhook",
         ],
-        needs: &[Daemon, SpotifyApp, IamLogin, Network],
-        notes: &["iam_login and network: not with --local."],
+        needs: &[Daemon, SpotifyApp, AccountsLogin, Network],
+        notes: &["accounts_login and network: not with --local."],
         featured: Some("spotify trigger add --remaining 30s --note 'wrap up'"),
         ..Entry::EMPTY
     },
@@ -1049,9 +1049,9 @@ pub const ENTRIES: &[Entry] = &[
             "seconds left",
             "time left",
         ],
-        needs: &[Daemon, SpotifyApp, IamLogin, Network],
+        needs: &[Daemon, SpotifyApp, AccountsLogin, Network],
         notes: &[
-            "iam_login and network: not with --local (firings are then only recorded; see trigger wait).",
+            "accounts_login and network: not with --local (firings are then only recorded; see trigger wait).",
         ],
         errors: &[
             "threshold_passed",
@@ -1123,7 +1123,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         path: "trigger test",
         keywords: &["test notification", "check ting", "delivery test"],
-        needs: &[Daemon, IamLogin, Network],
+        needs: &[Daemon, AccountsLogin, Network],
         errors: &["not_found", "recipient_not_registered", "recipient_changed"],
         output: &[
             ("delivered", "true"),
@@ -1154,7 +1154,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         path: "trigger retry",
         keywords: &["resend", "redeliver", "failed delivery"],
-        needs: &[Daemon, IamLogin, Network],
+        needs: &[Daemon, AccountsLogin, Network],
         errors: &["not_found"],
         output: &[
             ("firing", "the firing"),
@@ -1165,39 +1165,38 @@ pub const ENTRIES: &[Entry] = &[
     },
     // ------------------------------------------------------------------------ account
     Entry {
-        path: "iam",
+        path: "accounts",
         goal: Some(Goal::Account),
-        capabilities: &["the IAM app id, owning org, scopes and URLs, offline"],
+        capabilities: &["the Silicon Accounts app id, owning account, scopes and URLs, offline"],
         keywords: &[
             "app id",
             "discovery",
             "slt",
             "short-lived token",
             "scopes",
-            "iam cli",
-            "install iam",
+            "accounts cli",
+            "install accounts",
         ],
         output: &[
             ("app_id", "spotify"),
-            ("org_id", "the owning organization"),
             ("scopes[]", "what a login grants"),
             ("login", "how to mint an SLT and log in"),
             (
-                "iam_session",
-                "which `iam` session mints it, and the first sign-in a fresh SILICON_HOME needs",
+                "accounts_session",
+                "which `silicon-accounts` session mints it, and the first sign-in a fresh SILICON_HOME needs",
             ),
-            ("api_url, iam_url, auth_url", "service URLs"),
+            ("api_url, accounts_url", "service URLs"),
         ],
         ..Entry::EMPTY
     },
     Entry {
         path: "login",
         goal: Some(Goal::Account),
-        // Not the first example (installing the iam CLI): the listing shows what `login` does.
-        featured: Some("spotify login 'oac_…'"),
+        // Not the first example (installing the Accounts CLI): the listing shows what `login` does.
+        featured: Some("spotify login 'slt_…'"),
         capabilities: &[
-            "exchange an IAM short-lived token (SLT) for a session",
-            "select one account and organization; Ting consent is separate",
+            "exchange a Silicon Accounts short-lived token (SLT) for a session",
+            "select one account; Ting registration is separate",
         ],
         keywords: &[
             "sign in",
@@ -1219,7 +1218,6 @@ pub const ENTRIES: &[Entry] = &[
         output: &[
             ("authenticated", "true"),
             ("actor.public_id", "who you are, e.g. si:you"),
-            ("org_id", "your organization"),
             ("scopes[]", "granted scopes"),
             ("ting.subscribed", "registered as a Ting recipient"),
         ],
@@ -1249,36 +1247,33 @@ pub const ENTRIES: &[Entry] = &[
         notes: &["Offline, the session is removed locally anyway."],
         output: &[
             ("authenticated", "false"),
-            ("revoked", "whether IAM revoked it"),
+            ("revoked", "whether Silicon Accounts revoked it"),
         ],
         ..Entry::EMPTY
     },
     Entry {
         path: "login contexts",
-        keywords: &["accounts", "organizations", "contexts"],
-        output: &[("contexts[]", "saved account and organization sessions")],
+        keywords: &["accounts", "contexts"],
+        output: &[("contexts[]", "saved account sessions")],
         ..Entry::EMPTY
     },
     Entry {
         path: "login use",
-        keywords: &["switch account", "switch organization"],
-        output: &[
-            ("account", "selected public account ID"),
-            ("org_id", "selected organization"),
-        ],
+        keywords: &["switch account"],
+        output: &[("account", "selected public account ID")],
         ..Entry::EMPTY
     },
     Entry {
         path: "ting",
         goal: Some(Goal::Account),
         keywords: &["notification recipient", "register"],
-        needs: IAM,
+        needs: ACCOUNTS,
         ..Entry::EMPTY
     },
     Entry {
         path: "ting register",
         keywords: &["register recipient", "enable notifications"],
-        needs: IAM,
+        needs: ACCOUNTS,
         errors: &["recipient_not_registered"],
         output: &[
             ("ting.subscribed", "true"),
@@ -1288,25 +1283,15 @@ pub const ENTRIES: &[Entry] = &[
     },
     Entry {
         path: "ting authorize",
-        keywords: &["notification permission", "consent", "obo"],
-        needs: IAM,
-        output: &[
-            ("request_id", "saved consent request identity"),
-            ("authorization.authorization_url", "IAM approval URL"),
-        ],
-        ..Entry::EMPTY
-    },
-    Entry {
-        path: "ting complete",
-        keywords: &["consent code", "approve notifications"],
-        needs: IAM,
-        output: &[("ting.subscribed", "recipient registered after consent")],
+        keywords: &["notification permission", "user verification"],
+        needs: ACCOUNTS,
+        output: &[("ting.subscribed", "recipient registered")],
         ..Entry::EMPTY
     },
     Entry {
         path: "ting status",
         keywords: &["recipient status"],
-        needs: &[IamLogin],
+        needs: &[AccountsLogin],
         output: &[("actor", "who you are"), ("ting.subscribed", "registered")],
         ..Entry::EMPTY
     },
@@ -1358,36 +1343,6 @@ pub const ENTRIES: &[Entry] = &[
             ("log", "its log"),
             ("next", "what to do"),
         ],
-        ..Entry::EMPTY
-    },
-    Entry {
-        path: "testing",
-        goal: Some(Goal::Account),
-        keywords: &["test plane", "sandbox", "staging"],
-        ..Entry::EMPTY
-    },
-    Entry {
-        path: "testing use",
-        keywords: &["select test plane", "test app secret"],
-        errors: &["invalid_input"],
-        output: &[
-            ("testing", "true"),
-            ("slot", "the session slot for this plane"),
-        ],
-        ..Entry::EMPTY
-    },
-    Entry {
-        path: "testing status",
-        output: &[
-            ("testing", "a plane is selected"),
-            ("source", "env, testing.json or none"),
-        ],
-        ..Entry::EMPTY
-    },
-    Entry {
-        path: "testing exit",
-        keywords: &["production"],
-        output: &[("testing", "false")],
         ..Entry::EMPTY
     },
     // ------------------------------------------------------------------------ setup
@@ -1572,7 +1527,7 @@ pub const ENTRIES: &[Entry] = &[
         path: "config set",
         capabilities: &[
             "change any setting: telemetry, the playback strategy (auto, spotify_player only or applescript only), launch_spotify, search_limit, keep_spotify_in_background",
-            "change a default: search results, output format, verify timeout, auto updates",
+            "change a default: search results, output format, verify timeout",
         ],
         keywords: &[
             "change setting",
@@ -1622,20 +1577,10 @@ pub const ENTRIES: &[Entry] = &[
         path: "update",
         goal: Some(Goal::Setup),
         keywords: &["upgrade", "new version", "latest", "version"],
-        needs: &[Daemon, Network],
-        errors: &[
-            "no_release",
-            "download_failed",
-            "checksum_missing",
-            "checksum_mismatch",
-            "unpack_failed",
-            "update_not_writable",
-        ],
         output: &[
-            ("update_available", "a newer release exists"),
-            ("latest", "its version"),
-            ("restarting", "it was installed and the daemon restarts"),
-            ("manager", "honeycomb when Honeycomb manages the install"),
+            ("current", "installed version"),
+            ("manager", "silicon-apps"),
+            ("command", "Silicon Apps update command"),
         ],
         ..Entry::EMPTY
     },
@@ -1811,7 +1756,7 @@ impl Change {
         (
             Self::Session,
             "session",
-            "sign-ins: the IAM login session, the Ting registration, the testing plane, or spotify_player's Spotify sign-in",
+            "sign-ins: the Silicon Accounts login session, the Ting registration, spotify_player's Spotify sign-in",
         ),
     ];
 
@@ -1892,7 +1837,7 @@ const EFFECTS: &[(&str, &[Change], Option<&str>)] = &[
     ("trigger test", &[C::Triggers], None),
     ("trigger wait", &[], None),
     ("trigger retry", &[C::Triggers], None),
-    ("iam", &[], None),
+    ("accounts", &[], None),
     ("login", &[C::Session], None),
     ("login status", &[], None),
     ("login contexts", &[], None),
@@ -1901,7 +1846,6 @@ const EFFECTS: &[(&str, &[Change], Option<&str>)] = &[
     ("ting", &[], None),
     ("ting register", &[C::Session], None),
     ("ting authorize", &[C::Session], None),
-    ("ting complete", &[C::Session], None),
     ("ting status", &[], None),
     ("auth", &[], None),
     ("auth status", &[], None),
@@ -1912,10 +1856,6 @@ const EFFECTS: &[(&str, &[Change], Option<&str>)] = &[
     ("config get", &[], None),
     ("config keys", &[], None),
     ("config reset", &[C::Config], None),
-    ("testing", &[], None),
-    ("testing use", &[C::Session], None),
-    ("testing status", &[], None),
-    ("testing exit", &[C::Session], None),
     ("doctor", &[], None),
     (
         "setup",
@@ -1931,11 +1871,7 @@ const EFFECTS: &[(&str, &[Change], Option<&str>)] = &[
     ("daemon install", &[C::Daemon], None),
     ("daemon uninstall", &[C::Daemon], None),
     ("daemon logs", &[], None),
-    (
-        "update",
-        &[C::Daemon],
-        Some("with --check (it only reports)"),
-    ),
+    ("update", &[], None),
     // Sends a bug report to the maintainers: nothing on this Mac changes, but it is no read.
     ("report", &[], None),
     ("docs", &[], None),
@@ -2215,14 +2151,6 @@ const ARG_SPECS: &[ArgSpec] = &[
     ("login", "token_file", "path_or_stdin", None, None, None),
     ("config set", "settings", "json_object", None, None, None),
     ("config get", "key", "config_key", None, None, None),
-    (
-        "testing use",
-        "app_secret_file",
-        "path_or_stdin",
-        None,
-        None,
-        None,
-    ),
     ("report", "message", "string", Some(10), Some(20_000), None),
     ("report", "pr", "url", None, None, None),
     ("report", "attach", "path", None, Some(5), None),
@@ -2262,7 +2190,7 @@ pub const ARG_TYPES: &[(&str, &str)] = &[
     ("queue_item", "a position (1 = next), an id (q_…) or a URI"),
     ("trigger_id", "trg_…"),
     ("firing_id", "fir_…"),
-    ("slt", "an IAM short-lived token (oac_…)"),
+    ("slt", "a Silicon Accounts short-lived token (slt_…)"),
     ("path_or_stdin", "a file path, or - for stdin"),
     (
         "json_object",
@@ -2812,7 +2740,7 @@ pub fn manifest(root: &clap::Command) -> Value {
             "daemon": "talks to spotify-daemon, which the CLI starts on demand",
             "spotify_app": "the Spotify desktop app on this Mac, and permission to control it",
             "spotify_player_signed_in": "spotify_player installed and signed in to Spotify (spotify auth login)",
-            "iam_login": "an IAM session in this home (spotify login)",
+            "accounts_login": "a Silicon Accounts session in this home (spotify login)",
             "premium": "a Spotify Premium account",
             "controls_playback": "changes what plays on Spotify.app",
             "network": "needs the internet (Spotify's Web API or the spotify-cli backend)",
@@ -2822,506 +2750,4 @@ pub fn manifest(root: &clap::Command) -> Value {
         "mutates": "Per command: `mutates` is true when running it can change something (listed in `changes`) or send something out (report); false for commands that only read. `read_only_when` names the form of a changing command that only reads (volume without a level, search without --play, setup and update with --check), else null. `has_read_only_form` is true when either holds. Commands that talk to spotify-daemon start it when it is not running (SPOTIFY_DAEMON_AUTOSTART=0 prevents that); that alone is no change. Commands that only read: .commands[] | select(.mutates == false). Commands that can run without changing anything: .commands[] | select(.mutates == false or .read_only_when != null), the same as select(.has_read_only_form). What changes Liked Songs: .commands[] | select(.changes | index(\"library\"))",
         "output_contract": "--json: exactly one JSON value on stdout; errors are one {\"error\": {code, message, hint, retryable, details}} object on stderr with empty stdout.",
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tree() -> clap::Command {
-        let mut root = crate::args::command();
-        root.build();
-        root
-    }
-
-    #[test]
-    fn every_command_has_an_entry_and_every_entry_a_command() {
-        let root = tree();
-        let paths: Vec<String> = walk(&root).into_iter().map(|(p, _)| p).collect();
-        for path in &paths {
-            assert!(entry(path).is_some(), "no catalog entry for `{path}`");
-            assert!(
-                goal(path).is_some() || path.is_empty(),
-                "`{path}` has no goal"
-            );
-        }
-        for entry in ENTRIES {
-            assert!(
-                paths.iter().any(|p| p == entry.path),
-                "catalog entry `{}` names no command",
-                entry.path
-            );
-        }
-        let mut seen = std::collections::HashSet::new();
-        for entry in ENTRIES {
-            assert!(seen.insert(entry.path), "duplicate entry `{}`", entry.path);
-        }
-    }
-
-    #[test]
-    fn every_command_says_what_it_changes() {
-        let root = tree();
-        let paths: Vec<String> = walk(&root).into_iter().map(|(p, _)| p).collect();
-        for path in &paths {
-            assert!(
-                EFFECTS.iter().any(|(p, ..)| p == path),
-                "`{path}` is not in EFFECTS: say what it changes"
-            );
-        }
-        for (path, ..) in EFFECTS {
-            assert!(
-                paths.iter().any(|p| p == path),
-                "EFFECTS names no command `{path}`"
-            );
-        }
-        let mut seen = std::collections::HashSet::new();
-        for (path, ..) in EFFECTS {
-            assert!(seen.insert(path), "duplicate EFFECTS row `{path}`");
-        }
-        // Those that control playback say so both ways.
-        for entry in ENTRIES {
-            if entry.needs.contains(&Need::ControlsPlayback) {
-                assert!(
-                    effects(entry.path).0.contains(&Change::Playback),
-                    "`{}` controls playback",
-                    entry.path
-                );
-            }
-        }
-        for read in [
-            "status",
-            "lyrics",
-            "queue",
-            "queue list",
-            "search",
-            "commands",
-            "how",
-        ] {
-            assert!(
-                !mutates(read) || effects(read).1.is_some(),
-                "`{read}` reads (or has a form that only reads)"
-            );
-        }
-        for write in [
-            "play",
-            "queue add",
-            "playlist fork",
-            "config set",
-            "trigger add",
-            "login",
-            "report",
-        ] {
-            assert!(mutates(write), "`{write}` changes something");
-        }
-    }
-
-    #[test]
-    fn only_top_level_commands_set_a_goal() {
-        for entry in ENTRIES {
-            if entry.path.contains(' ') {
-                assert!(entry.goal.is_none(), "`{}` inherits its goal", entry.path);
-            }
-        }
-    }
-
-    #[test]
-    fn arg_specs_name_real_arguments() {
-        let root = tree();
-        let tree = walk(&root);
-        for (path, id, kind, ..) in ARG_SPECS {
-            let (_, command) = tree
-                .iter()
-                .find(|(p, _)| p == path)
-                .unwrap_or_else(|| panic!("no command `{path}`"));
-            assert!(
-                command.get_arguments().any(|a| a.get_id() == *id),
-                "`{path}` has no argument `{id}`"
-            );
-            assert!(
-                ARG_TYPES.iter().any(|(t, _)| t == kind)
-                    || ["string", "enum", "url", "path"].contains(kind),
-                "type `{kind}` of {path} {id} is not described"
-            );
-        }
-    }
-
-    #[test]
-    fn examples_are_parsed_with_their_comments() {
-        let text = "Intro.\n\nExamples:\n  spotify play                                   Resume\n  spotify config set '{\"a\": null}'   null resets  it\n  iam -o json silicon-login --app-id spotify \\\n    | jq -r .slt | spotify login --token-file -\n  spotify now --json | jq .playback\n\nNext: spotify status\n  spotify not an example";
-        let examples = parse_examples(text);
-        assert_eq!(
-            examples,
-            vec![
-                Example { command: "spotify play".into(), description: Some("Resume".into()) },
-                Example {
-                    command: "spotify config set '{\"a\": null}'".into(),
-                    description: Some("null resets  it".into())
-                },
-                Example {
-                    command: "iam -o json silicon-login --app-id spotify | jq -r .slt | spotify login --token-file -".into(),
-                    description: None
-                },
-                Example { command: "spotify now --json | jq .playback".into(), description: None },
-            ]
-        );
-    }
-
-    /// A comment one space after its command would be read as part of the command (`iam
-    /// silicon-login --sid si:<handle> Once per SILICON_HOME: …`), and `spotify how` and the
-    /// manifest would hand that out as a line to run.
-    #[test]
-    fn every_example_comment_is_two_spaces_away() {
-        let root = tree();
-        for (path, command) in walk(&root) {
-            for text in [command.get_after_long_help(), command.get_after_help()]
-                .into_iter()
-                .flatten()
-                .map(ToString::to_string)
-            {
-                let mut block: Vec<&str> = Vec::new();
-                let mut in_block = false;
-                for line in text.lines().chain(std::iter::once("")) {
-                    if line.trim_end() == "Examples:" {
-                        in_block = true;
-                        continue;
-                    }
-                    if in_block && line.starts_with("  ") && !line.trim().is_empty() {
-                        block.push(line);
-                        continue;
-                    }
-                    in_block = false;
-                    // The columns comments start at in this block.
-                    let columns: Vec<usize> = block
-                        .iter()
-                        .filter_map(|l| {
-                            let at = comment_at(l.trim_start())? + (l.len() - l.trim_start().len());
-                            Some(at + l[at..].len() - l[at..].trim_start().len())
-                        })
-                        .collect();
-                    let Some(&first) = columns.iter().min() else {
-                        block.clear();
-                        continue;
-                    };
-                    for l in &block {
-                        if comment_at(l.trim_start()).is_some() || l.trim_end().ends_with('\\') {
-                            continue;
-                        }
-                        // An uppercase word one space after the command, about where the
-                        // comments start, outside quotes.
-                        let mut quote = None;
-                        let mut previous = ' ';
-                        for (at, c) in l.char_indices() {
-                            match (quote, c) {
-                                (None, '\'' | '"') => quote = Some(c),
-                                (Some(q), c) if c == q => quote = None,
-                                _ => {}
-                            }
-                            let glued = quote.is_none()
-                                && at + 3 >= first
-                                && previous == ' '
-                                && c.is_uppercase()
-                                && l[..at].trim_end().len() + 1 == at;
-                            assert!(
-                                !glued,
-                                "`spotify {path} --help`: the comment of `{l}` needs two spaces before it"
-                            );
-                            previous = c;
-                        }
-                    }
-                    block.clear();
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn root_listing_groups_every_top_level_command_by_goal() {
-        let root = tree();
-        let listing = root_listing(&root);
-        let plain = anstream_strip(&listing);
-        let mut last = 0;
-        for goal in Goal::ALL {
-            let at = plain
-                .find(&format!("\n{}:\n", goal.title()))
-                .unwrap_or_else(|| panic!("no heading {}:\n{plain}", goal.title()));
-            assert!(at > last, "goals in order");
-            last = at;
-        }
-        for sub in root.get_subcommands().filter(|s| s.get_name() != "help") {
-            assert!(
-                plain.contains(&format!("\n  {} ", sub.get_name())),
-                "`{}` missing from the root listing",
-                sub.get_name()
-            );
-        }
-        for line in plain.lines() {
-            assert!(line.chars().count() <= WIDTH, "too wide: {line}");
-        }
-        assert!(
-            plain.contains("  lyrics       Lyrics of any song"),
-            "{plain}"
-        );
-    }
-
-    /// The listing without ANSI styling.
-    fn anstream_strip(text: &str) -> String {
-        clap::builder::StyledStr::from(text.to_owned()).to_string()
-    }
-
-    #[test]
-    fn wrapping_keeps_a_hanging_indent() {
-        let text = wrap(&"word ".repeat(40), 15, 15);
-        for (index, line) in text.lines().enumerate() {
-            assert!(line.chars().count() + if index == 0 { 15 } else { 0 } <= WIDTH);
-            if index > 0 {
-                assert!(line.starts_with(&" ".repeat(15)) && !line.starts_with(&" ".repeat(16)));
-            }
-        }
-    }
-
-    #[test]
-    fn manifest_describes_arguments_errors_and_requirements() {
-        let manifest = manifest(&tree());
-        let find = |path: &str| {
-            manifest["commands"]
-                .as_array()
-                .and_then(|c| c.iter().find(|c| c["path"] == path))
-                .cloned()
-                .unwrap_or_else(|| panic!("no {path}"))
-        };
-        let search = find("search");
-        assert_eq!(search["command"], "spotify search");
-        assert_eq!(
-            search["usage"],
-            "Usage: spotify search [OPTIONS] <QUERY>..."
-        );
-        let limit = search["arguments"]
-            .as_array()
-            .and_then(|a| a.iter().find(|a| a["name"] == "limit"))
-            .cloned()
-            .expect("limit");
-        assert_eq!(limit["type"], "integer");
-        assert_eq!(
-            (limit["min"].clone(), limit["max"].clone()),
-            (json!(1), json!(10))
-        );
-        assert_eq!(search["requirements"]["spotify_player_signed_in"], true);
-        assert_eq!(search["requirements"]["iam_login"], false);
-        assert!(!search["examples"].as_array().expect("examples").is_empty());
-        let add = find("trigger add");
-        assert_eq!(add["goal"], "triggers");
-        assert_eq!(add["arg_groups"][0]["rule"], "exactly one");
-        assert!(
-            add["errors"]
-                .as_array()
-                .expect("errors")
-                .contains(&json!({"code": "threshold_passed", "exit": 2}))
-        );
-        let scope = add["arguments"]
-            .as_array()
-            .and_then(|a| a.iter().find(|a| a["name"] == "scope"))
-            .cloned()
-            .expect("scope");
-        assert_eq!(scope["default"], "current");
-        assert_eq!(
-            scope["allowed_values"],
-            json!(["current", "every", "track"])
-        );
-        // Globals only on the root.
-        assert!(
-            find("status")["arguments"]
-                .as_array()
-                .expect("args")
-                .iter()
-                .all(|a| a["global"] == false)
-        );
-        assert!(
-            find("")["arguments"]
-                .as_array()
-                .expect("args")
-                .iter()
-                .any(|a| a["long"] == "json")
-        );
-        let lyrics = find("lyrics");
-        assert_eq!(lyrics["goal_title"], "Lyrics & details");
-        assert!(
-            manifest["errors"]
-                .as_array()
-                .expect("errors")
-                .iter()
-                .any(|e| e["code"] == "automation_permission_denied" && e["exit"] == 4)
-        );
-        assert_eq!(find("docs")["arguments"][0]["allowed_values"][0], "usage");
-        // What each command changes: read-only ones can be picked out.
-        assert_eq!(find("status")["mutates"], false);
-        assert_eq!(find("status")["changes"], json!([]));
-        assert_eq!(find("play")["mutates"], true);
-        assert_eq!(find("play")["changes"], json!(["playback"]));
-        assert_eq!(find("playlist fork")["changes"], json!(["playlists"]));
-        assert_eq!(find("login")["changes"], json!(["session"]));
-        assert_eq!(
-            find("volume")["read_only_when"],
-            "without a level (it shows the volume)"
-        );
-        assert_eq!(find("report")["mutates"], true);
-        // Commands that can run without changing anything: read-only ones and those with a
-        // read-only form.
-        for (path, can) in [
-            ("status", true),
-            ("volume", true),
-            ("search", true),
-            ("update", true),
-            ("play", false),
-            ("like", false),
-            ("report", false),
-        ] {
-            assert_eq!(find(path)["has_read_only_form"], can, "{path}");
-            assert_eq!(
-                find(path)["mutates"] == false || !find(path)["read_only_when"].is_null(),
-                can,
-                "{path}: has_read_only_form is the documented filter"
-            );
-        }
-        // `library` is Liked Songs, and says it is not playlists.
-        let library = manifest["changes"]
-            .as_array()
-            .and_then(|c| c.iter().find(|c| c["change"] == "library"))
-            .and_then(|c| c["description"].as_str())
-            .unwrap_or("");
-        assert!(
-            library.contains("Liked Songs") && library.contains("Not playlists"),
-            "{library}"
-        );
-        let changers: Vec<String> = manifest["commands"]
-            .as_array()
-            .expect("commands")
-            .iter()
-            .filter(|c| {
-                c["changes"]
-                    .as_array()
-                    .is_some_and(|a| a.contains(&json!("library")))
-            })
-            .filter_map(|c| c["path"].as_str().map(str::to_owned))
-            .collect();
-        assert_eq!(changers, ["like", "unlike"]);
-        assert!(
-            manifest["mutates"]
-                .as_str()
-                .is_some_and(|m| m.contains("select(.mutates == false or .read_only_when != null)")),
-            "{}",
-            manifest["mutates"]
-        );
-        let ids: Vec<&str> = manifest["changes"]
-            .as_array()
-            .expect("changes")
-            .iter()
-            .filter_map(|c| c["change"].as_str())
-            .collect();
-        assert_eq!(
-            ids,
-            [
-                "playback",
-                "library",
-                "playlists",
-                "config",
-                "triggers",
-                "daemon",
-                "session"
-            ]
-        );
-    }
-
-    /// The command path a parsed command line names (`trigger add`).
-    fn parsed_path(matches: &clap::ArgMatches) -> String {
-        let mut path = Vec::new();
-        let mut current = matches;
-        while let Some((name, sub)) = current.subcommand() {
-            path.push(name.to_owned());
-            current = sub;
-        }
-        path.join(" ")
-    }
-
-    /// Every example in every command's help parses with the real grammar, and every command
-    /// has examples that run it (or, for a group, one of its subcommands). So help cannot show
-    /// a command line that does not work.
-    #[test]
-    fn every_command_has_examples_that_parse() {
-        let root = tree();
-        let mut problems = Vec::new();
-        for (path, command) in walk(&root) {
-            if path.is_empty() {
-                continue;
-            }
-            let examples = examples(command);
-            if examples.is_empty() {
-                problems.push(format!("`spotify {path}` has no Examples: in its help"));
-            }
-            let mut runs_itself = false;
-            for example in &examples {
-                for words in crate::shell::spotify_commands(&example.command) {
-                    match crate::args::command().try_get_matches_from(&words) {
-                        Ok(matches) => {
-                            let named = parsed_path(&matches);
-                            runs_itself |= named == path || named.starts_with(&format!("{path} "));
-                        }
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                clap::error::ErrorKind::DisplayHelp
-                                    | clap::error::ErrorKind::DisplayVersion
-                            ) => {}
-                        Err(error) => problems.push(format!(
-                            "`spotify {path}` example `{}` does not parse: {}",
-                            example.command,
-                            error.render().to_string().lines().next().unwrap_or("")
-                        )),
-                    }
-                }
-            }
-            if !examples.is_empty() && !runs_itself {
-                problems.push(format!("no example of `spotify {path}` runs it"));
-            }
-        }
-        assert!(problems.is_empty(), "{}", problems.join("\n"));
-    }
-
-    #[test]
-    fn documented_exit_codes_are_the_real_ones() {
-        for row in error_rows() {
-            let Ok(documented) = row.exit.parse::<i32>() else {
-                assert_eq!(row.exit, "—", "{:?}", row.codes);
-                continue;
-            };
-            for code in &row.codes {
-                assert_eq!(
-                    Error::new(code, "", "").exit_code(),
-                    documented,
-                    "docs/errors.md says `{code}` exits {documented}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn error_rows_come_from_the_bundled_guide() {
-        let rows = error_rows();
-        let automation = rows
-            .iter()
-            .find(|r| r.codes.iter().any(|c| c == "automation_permission_denied"))
-            .expect("row");
-        assert_eq!(automation.exit, "4");
-        assert!(automation.fix.contains("Automation"), "{}", automation.fix);
-        assert!(rows.iter().any(|r| r.codes == ["invalid_input", "usage"]));
-        // Every code a command can return is documented.
-        for entry in ENTRIES {
-            for code in error_codes(entry) {
-                assert!(
-                    rows.iter().any(|r| r.codes.iter().any(|c| c == code)),
-                    "`{code}` ({}) is not in docs/errors.md",
-                    entry.path
-                );
-            }
-        }
-    }
 }

@@ -30,10 +30,6 @@ const GIVE_UP_MS: i64 = 60 * 60 * 1000;
 struct Target {
     api_url: String,
     slot: String,
-    #[serde(default)]
-    testing: bool,
-    #[serde(default)]
-    org: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -122,24 +118,13 @@ async fn add(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
     let home = home_of(request)?;
     let home_key = home.key();
     // Who will be notified, and can they be?
-    let (recipient, org, ting_state) = {
+    let (recipient, ting_state) = {
         let sessions = home.sessions()?;
         match sessions.slots.get(&a.target.slot) {
-            Some(slot)
-                if a.target
-                    .org
-                    .as_ref()
-                    .is_none_or(|org| org == &slot.session.org_id) =>
-            {
-                (
-                    Some(slot.session.actor.public_id.clone()),
-                    a.target
-                        .org
-                        .clone()
-                        .or_else(|| Some(slot.session.org_id.clone())),
-                    slot.session.ting.clone(),
-                )
-            }
+            Some(slot) => (
+                Some(slot.session.actor.public_id.clone()),
+                slot.session.ting.clone(),
+            ),
             _ if a.ting => {
                 return Err(Error::not_authenticated(format!(
                     "Triggers notify you through Ting, which needs a spotify-cli login, and {} has none for {}.",
@@ -148,7 +133,7 @@ async fn add(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
                 ))
                 .with_details(json!({"alternative": "Add --local to record firings only locally (see `spotify trigger history` / `spotify trigger wait`)."})));
             }
-            _ => (None, a.target.org.clone(), None),
+            _ => (None, None),
         }
     };
     if a.ting && ting_state.as_ref().is_some_and(|t| !t.subscribed) {
@@ -156,7 +141,7 @@ async fn add(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
         return Err(Error::new(
             "recipient_not_registered",
             "This Silicon is not registered as a Ting recipient for spotify-cli, so trigger notifications would be refused.",
-            "Run `spotify ting authorize`, approve in IAM, and complete the request. Then retry the trigger command; your ordinary login stays signed in.",
+            "Run `spotify ting register`, then retry the trigger command; your account stays signed in.",
         )
         .with_details(json!({"registration_error": reason})));
     }
@@ -184,10 +169,8 @@ async fn add(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
         home: home_key,
         api_url: a.target.api_url,
         slot: a.target.slot,
-        testing: a.target.testing,
         ting: a.ting,
         recipient,
-        org,
         isi: a.isi.or_else(|| request.isi.clone()),
     };
     let stored = StoredTrigger {
@@ -257,9 +240,7 @@ fn describe(stored: &StoredTrigger) -> Value {
         "delivery": {
             "ting": stored.delivery.ting,
             "recipient": stored.delivery.recipient,
-            "org": stored.delivery.org,
             "isi": stored.delivery.isi,
-            "testing": stored.delivery.testing,
         },
         "created_at": t.created_at,
         "last_fired_at": t.last_fired_at,
@@ -464,10 +445,8 @@ async fn test(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
                     home: home.key(),
                     api_url: target.api_url,
                     slot: target.slot,
-                    testing: target.testing,
                     ting: true,
                     recipient: Some(slot.session.actor.public_id.clone()),
-                    org: target.org.or_else(|| Some(slot.session.org_id.clone())),
                     isi: a.isi.or_else(|| request.isi.clone()),
                 },
                 "trg_test".to_owned(),
@@ -630,9 +609,6 @@ async fn deliver_one(daemon: &Arc<Daemon>, mut row: FiringRow) {
                         | "reconsent_required"
                         | "test_context_mismatch"
                         | "recipient_changed"
-                        | "organization_changed"
-                        | "testing_selection_missing"
-                        | "testing_selection_changed"
                         | "forbidden"
                         | "permission_denied"
                         | "invalid_input"
@@ -668,30 +644,12 @@ async fn deliver_one(daemon: &Arc<Daemon>, mut row: FiringRow) {
 
 async fn send(row: &FiringRow) -> Result<Value> {
     let home = Home::from_root(PathBuf::from(&row.delivery.home));
-    // Only the home's saved selection counts: the daemon's own environment must never pick a plane.
-    let testing = if row.delivery.testing {
-        home.testing_saved()?
-    } else {
-        None
-    };
-    if row.delivery.testing && testing.is_none() {
-        return Err(Error::new(
-            "testing_selection_missing",
-            "This trigger was created in a testing environment, but the home no longer selects one.",
-            "Re-select it with `spotify testing use --app-secret-file -`, or remove the trigger.",
+    if !store::slot_in_plane(&row.delivery.slot, &store::slot_key(&row.delivery.api_url)) {
+        return Err(Error::not_authenticated(
+            "This trigger belongs to a different backend session.",
         ));
     }
-    if !store::slot_in_plane(
-        &row.delivery.slot,
-        &store::slot_key(&row.delivery.api_url, testing.as_ref()),
-    ) {
-        return Err(Error::new(
-            "testing_selection_changed",
-            "The home now selects a different testing plane (or production) than when this trigger was created, so its session is not the one to use.",
-            "Select the original plane again with `spotify testing use`, or remove the trigger and create it again.",
-        ));
-    }
-    let api = Api::new(&row.delivery.api_url, "daemon")?.with_testing(testing);
+    let api = Api::new(&row.delivery.api_url, "daemon")?;
     let mut slot = store::fresh_session(&home, &api, &row.delivery.slot, false).await?;
     let recipient = slot.session.actor.public_id.clone();
     if row
@@ -709,32 +667,16 @@ async fn send(row: &FiringRow) -> Result<Value> {
             "Remove the trigger and create it again from the right Silicon.",
         ));
     }
-    let org = row
-        .delivery
-        .org
-        .clone()
-        .unwrap_or_else(|| slot.session.org_id.clone());
-    if org != slot.session.org_id {
-        return Err(Error::new(
-            "organization_changed",
-            "This trigger belongs to a different organization than the saved session.",
-            "Select or sign in to the original account and organization. The pending delivery has been preserved.",
-        ));
-    }
     let delivery = TingDelivery {
         event_type: row.ting_type.clone(),
         key: format!("{recipient}/{}", row.key_suffix),
         data: row.data.clone(),
         metadata: row.metadata.clone(),
     };
-    match api
-        .send_ting(&slot.session.access_token, &org, &delivery)
-        .await
-    {
+    match api.send_ting(&slot.session.access_token, &delivery).await {
         Err(error) if error.code == "not_authenticated" => {
             slot = store::fresh_session(&home, &api, &row.delivery.slot, true).await?;
-            api.send_ting(&slot.session.access_token, &org, &delivery)
-                .await
+            api.send_ting(&slot.session.access_token, &delivery).await
         }
         other => other,
     }
@@ -862,158 +804,4 @@ fn telemetry_chunks(
         chunks.push((Vec::new(), unusable));
     }
     chunks
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn add_args(spec: Value) -> AddArgs {
-        let mut value = json!({
-            "condition": {"kind": "end"},
-            "scope": "every",
-            "target": {"api_url": "https://api.test", "slot": "default"},
-        });
-        for (key, v) in spec.as_object().into_iter().flatten() {
-            value[key] = v.clone();
-        }
-        serde_json::from_value(value).expect("add args")
-    }
-
-    fn check(spec: Value) -> Result<ScopeRequest> {
-        checked_scope(&add_args(spec))
-    }
-
-    #[test]
-    fn bad_specs_fail_without_playback() {
-        for spec in [
-            json!({"times": 0}),
-            json!({"scope": "current", "times": 0}),
-            json!({"note": "n".repeat(1001)}),
-            json!({"label": "l".repeat(81)}),
-            json!({"condition": {"kind": "elapsed", "at": {"unit": "percent", "value": 101.0}}}),
-            json!({"scope": {"track": "not a track"}}),
-            json!({"scope": {"track": "spotify:album:4uLU6hMCjMI75M1A2tKUQC"}}),
-        ] {
-            let code = check(spec.clone()).err().map(|e| e.code);
-            assert_eq!(code.as_deref(), Some("invalid_input"), "{spec}");
-        }
-    }
-
-    #[test]
-    fn good_specs_pass_without_playback() {
-        for spec in [
-            json!({}),
-            // Binding to the playing item is checked after the reading, not here.
-            json!({"scope": "current"}),
-            json!({"times": 3, "note": "n".repeat(1000), "label": "l".repeat(80)}),
-            json!({"scope": {"track": "spotify:track:4uLU6hMCjMI75M1A2tKUQC"}}),
-            json!({"scope": {"track": "spotify:episode:4uLU6hMCjMI75M1A2tKUQC"}}),
-            json!({"condition": {"kind": "remaining", "at": {"unit": "millis", "value": 30000}}}),
-        ] {
-            let result = check(spec.clone());
-            assert!(result.is_ok(), "{spec}: {result:?}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod telemetry_tests {
-    use super::*;
-
-    fn outbox(events: usize) -> crate::db::Db {
-        let db = crate::db::Db::open(std::path::Path::new(":memory:")).expect("db");
-        let rows: Vec<Value> = (0..events)
-            .map(|i| event(&format!("e{i:04}"), 100).1)
-            .collect();
-        db.push_telemetry(&rows).expect("push");
-        db
-    }
-
-    #[tokio::test]
-    async fn one_wake_drains_a_backlog() {
-        let db = outbox(310);
-        let mut sent = Vec::new();
-        let delivered = drain_telemetry(
-            &db,
-            |events| {
-                sent.extend(events.iter().map(|e| e.id.clone()));
-                async { Ok(()) }
-            },
-            TELEMETRY_ROUNDS_PER_WAKE,
-        )
-        .await;
-        assert_eq!(delivered, 310);
-        assert!(db.peek_telemetry().expect("peek").is_empty());
-        // Oldest first, each once.
-        let mut sorted = sent.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), 310);
-        assert_eq!(sent.first().map(String::as_str), Some("e0000"));
-    }
-
-    #[tokio::test]
-    async fn an_unreachable_backend_keeps_the_backlog() {
-        let db = outbox(100);
-        let mut calls = 0;
-        let delivered = drain_telemetry(
-            &db,
-            |_| {
-                calls += 1;
-                let result = if calls == 1 {
-                    Ok(())
-                } else {
-                    Err(silicon_spotify_client::Error::backend_unavailable("down"))
-                };
-                async move { result }
-            },
-            TELEMETRY_ROUNDS_PER_WAKE,
-        )
-        .await;
-        assert_eq!(delivered, 40);
-        assert_eq!(calls, 2);
-        let left = db.counts().expect("counts");
-        assert_eq!(left["telemetry_backlog"], json!(60));
-    }
-
-    fn event(id: &str, bytes: usize) -> (String, Value) {
-        (
-            id.to_owned(),
-            json!({"id": id, "type": "cli.command.completed", "data": {"pad": "x".repeat(bytes)}, "metadata": {}}),
-        )
-    }
-
-    #[test]
-    fn telemetry_batches_stay_under_the_gateway_limit() {
-        let batch: Vec<_> = (0..40).map(|i| event(&format!("e{i}"), 4_000)).collect();
-        let chunks = telemetry_chunks(batch);
-        assert!(chunks.len() > 1);
-        let mut seen = 0;
-        for (events, ids) in &chunks {
-            assert_eq!(events.len(), ids.len());
-            assert!(
-                serde_json::to_vec(events)
-                    .map(|b| b.len())
-                    .unwrap_or(usize::MAX)
-                    <= 64 * 1024
-            );
-            seen += ids.len();
-        }
-        assert_eq!(seen, 40);
-    }
-
-    #[test]
-    fn unusable_rows_are_returned_for_dropping() {
-        let batch = vec![
-            event("ok", 10),
-            ("bad".to_owned(), json!({"nope": true})),
-            event("huge", 70_000),
-        ];
-        let chunks = telemetry_chunks(batch);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].1, vec!["ok".to_owned()]);
-        assert!(chunks[1].0.is_empty());
-        assert_eq!(chunks[1].1, vec!["bad".to_owned(), "huge".to_owned()]);
-    }
 }

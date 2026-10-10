@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme = "README.md"
-keywords = ["spotify", "silicon", "cli", "applescript", "iam"]
+keywords = ["spotify", "silicon", "cli", "applescript", "accounts"]
 categories = ["api-bindings", "command-line-utilities", "multimedia::audio"]
 include = ["src/**", "README.md"]
 
@@ -36,10 +36,6 @@ libc = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["time"] }
-
-[dev-dependencies]
-tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

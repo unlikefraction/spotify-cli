@@ -1,11 +1,10 @@
-//! HTTP API (`/api/v1/*`, health, IAM webhook).
+//! HTTP API (`/api/v1/*`, health, Silicon Accounts webhook).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use axum::body::Bytes;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -17,35 +16,10 @@ use serde_json::{Value, json};
 
 use crate::config::Settings;
 use crate::error::{AppError, AppResult};
-use crate::identity::{self, AuthContext, Iam, Identity};
+use crate::identity::{self, Accounts, AuthContext, Identity};
 use crate::store::Store;
 use crate::telemetry::Recorder;
 use crate::ting::{self, TingApi};
-
-/// Resolves the identity adapter for a testing plane.
-#[async_trait]
-pub trait TestingPlanes: Send + Sync {
-    /// The adapter for this testing app secret.
-    async fn resolve(&self, secret: &str) -> AppResult<Arc<dyn Identity>>;
-}
-
-/// Resolves testing credentials on every request so cleanup is never hidden by a cached plane.
-pub struct IamTestingPlanes {
-    settings: Settings,
-}
-impl IamTestingPlanes {
-    /// New resolver.
-    #[must_use]
-    pub fn new(settings: Settings) -> Self {
-        Self { settings }
-    }
-}
-#[async_trait]
-impl TestingPlanes for IamTestingPlanes {
-    async fn resolve(&self, secret: &str) -> AppResult<Arc<dyn Identity>> {
-        Ok(Arc::new(Iam::discover(&self.settings, secret).await?))
-    }
-}
 
 /// Shared state.
 pub struct AppState {
@@ -53,8 +27,6 @@ pub struct AppState {
     pub settings: Settings,
     /// Production identity adapter.
     pub identity: Arc<dyn Identity>,
-    /// Testing plane resolver.
-    pub testing: Arc<dyn TestingPlanes>,
     /// Ting transport.
     pub ting: Arc<dyn TingApi>,
     /// SQLite.
@@ -72,21 +44,17 @@ pub fn router(state: Arc<AppState>) -> Router {
     let routes = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/api/v1/iam", get(iam))
+        .route("/api/v1/accounts", get(accounts))
         .route("/api/v1/version", get(version))
-        .route("/api/v1/auth/login", post(login))
-        .route("/api/v1/auth/refresh", post(refresh))
-        .route("/api/v1/auth/logout", post(logout))
-        .route("/api/v1/auth/me", get(me))
+        .route("/api/v1/auth/code", post(code).options(preflight))
+        .route("/api/v1/auth/login", post(login).options(preflight))
+        .route("/api/v1/auth/refresh", post(refresh).options(preflight))
+        .route("/api/v1/auth/logout", post(logout).options(preflight))
+        .route("/api/v1/auth/me", get(me).options(preflight))
         .route("/api/v1/ting/subscription", post(subscribe))
-        .route("/api/v1/ting/authorizations", post(ting_authorize))
-        .route("/api/v1/ting/authorizations/{id}", get(ting_authorization))
-        .route("/api/v1/ting/authorizations/{id}/complete", post(ting_complete))
         .route("/api/v1/tings", post(send_ting))
         .route("/api/v1/reports", post(report))
         .route("/api/v1/telemetry", post(telemetry).options(preflight))
-        .route("/webhook", post(webhook))
-        .route("/webhook/", post(webhook))
         .fallback(not_found)
         .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         // Outside the body limit, so its 413 gets a request id too.
@@ -126,7 +94,9 @@ async fn observe(State(state): Shared, request: Request, next: Next) -> Response
         .take(16)
         .collect::<String>();
     let request_id = format!("req_{}", uuid::Uuid::now_v7().simple());
+    let request_headers = request.headers().clone();
     let mut response = next.run(request).await;
+    cors(&state, &request_headers, &mut response);
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert("x-request-id", value);
     }
@@ -246,29 +216,8 @@ fn no_store(value: Value) -> Response {
     response
 }
 
-async fn identity_for(state: &AppState, headers: &HeaderMap) -> AppResult<Arc<dyn Identity>> {
-    match headers.get("x-testing-environment-key") {
-        None => Ok(Arc::clone(&state.identity)),
-        Some(value) => {
-            let secret = value
-                .to_str()
-                .map_err(|_| {
-                    AppError::invalid(
-                        "X-Testing-Environment-Key is not text.",
-                        "Send the testing plane's ask_… app secret as plain ASCII; `spotify testing use --app-secret-file -` sets it for the CLI.",
-                    )
-                })?;
-            state.testing.resolve(secret.trim()).await
-        }
-    }
-}
-
-async fn iam(State(state): Shared, headers: HeaderMap) -> AppResult<Response> {
-    let identity = identity_for(&state, &headers).await?;
-    Ok(no_store(identity::discovery(
-        &state.settings,
-        identity.environment_id(),
-    )))
+async fn accounts(State(state): Shared) -> Response {
+    no_store(identity::discovery(&state.settings))
 }
 
 fn idempotency_key(headers: &HeaderMap) -> AppResult<String> {
@@ -309,12 +258,61 @@ struct LoginInput {
 async fn login(State(state): Shared, headers: HeaderMap, body: Bytes) -> AppResult<Response> {
     let key = idempotency_key(&headers)?;
     let input: LoginInput = parse(&body)?;
-    let identity = identity_for(&state, &headers).await?;
-    let session = identity.login(&input.slt, &key).await?;
+    let identity = Arc::clone(&state.identity);
+    // Keep token rotation and its durable replay result alive after a client disconnects.
+    let session = tokio::spawn(async move { identity.login(&input.slt, &key).await })
+        .await
+        .map_err(AppError::internal)??;
     let mut value = serde_json::to_value(&session).map_err(AppError::internal)?;
     value["ting"] = json!({"subscribed": false});
-    state.telemetry.backend("auth.login.completed", "login", "ok", None, json!({"actor_type": session.actor.kind, "testing": session.testing_environment_id.is_some()}));
+    state.telemetry.backend(
+        "auth.login.completed",
+        "login",
+        "ok",
+        None,
+        json!({"actor_type": session.actor.kind}),
+    );
     Ok(no_store(value))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodeInput {
+    code: SecretString,
+    redirect_uri: String,
+    code_verifier: SecretString,
+}
+async fn code(State(state): Shared, headers: HeaderMap, body: Bytes) -> AppResult<Response> {
+    idempotency_key(&headers)?;
+    let input: CodeInput = parse(&body)?;
+    if !state
+        .settings
+        .web_origins
+        .iter()
+        .any(|origin| input.redirect_uri == format!("{}/", origin.trim_end_matches('/')))
+        || !(43..=128).contains(&input.code_verifier.expose_secret().len())
+        || !input
+            .code_verifier
+            .expose_secret()
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+    {
+        return Err(AppError::invalid(
+            "Invalid sign-in redirect or PKCE verifier.",
+            "Start sign-in again from the Spotify website.",
+        ));
+    }
+    let identity = Arc::clone(&state.identity);
+    let session = tokio::spawn(async move {
+        identity
+            .code(&input.code, &input.redirect_uri, &input.code_verifier)
+            .await
+    })
+    .await
+    .map_err(AppError::internal)??;
+    Ok(no_store(
+        serde_json::to_value(session).map_err(AppError::internal)?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -326,8 +324,10 @@ struct RefreshInput {
 async fn refresh(State(state): Shared, headers: HeaderMap, body: Bytes) -> AppResult<Response> {
     let key = idempotency_key(&headers)?;
     let input: RefreshInput = parse(&body)?;
-    let identity = identity_for(&state, &headers).await?;
-    let session = identity.refresh(&input.refresh_token, &key).await?;
+    let identity = Arc::clone(&state.identity);
+    let session = tokio::spawn(async move { identity.refresh(&input.refresh_token, &key).await })
+        .await
+        .map_err(AppError::internal)??;
     Ok(no_store(
         serde_json::to_value(&session).map_err(AppError::internal)?,
     ))
@@ -342,8 +342,10 @@ struct LogoutInput {
 async fn logout(State(state): Shared, headers: HeaderMap, body: Bytes) -> AppResult<Response> {
     let key = idempotency_key(&headers)?;
     let input: LogoutInput = parse(&body)?;
-    let identity = identity_for(&state, &headers).await?;
-    identity.logout(&input.token, &key).await?;
+    let identity = Arc::clone(&state.identity);
+    tokio::spawn(async move { identity.logout(&input.token, &key).await })
+        .await
+        .map_err(AppError::internal)??;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -351,78 +353,28 @@ async fn bearer(
     state: &AppState,
     headers: &HeaderMap,
 ) -> AppResult<(Arc<dyn Identity>, AuthContext)> {
-    // A bearer that cannot be an access token is refused before the organization is checked.
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
-        .filter(|t| identity::well_formed(t, "oat_"))
+        .filter(|t| identity::well_formed(t))
         .ok_or_else(AppError::unauthenticated)?;
-    let org = headers
-        .get("x-org-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|o| silicon_spotify_client::valid_handle(o, 3, 50))
-        .ok_or_else(|| {
-            AppError::invalid(
-                "X-Org-ID header with an organization handle is required.",
-                "The CLI sends the session's organization; pass --org to choose another.",
-            )
-        })?;
-    let identity = identity_for(state, headers).await?;
+    let identity = Arc::clone(&state.identity);
     let context = identity
-        .authenticate(&SecretString::from(token.to_owned()), org)
+        .authenticate(&SecretString::from(token.to_owned()))
         .await?;
     Ok((identity, context))
 }
 
 async fn me(State(state): Shared, headers: HeaderMap) -> AppResult<Response> {
-    let (identity, context) = bearer(&state, &headers).await?;
+    let (_, context) = bearer(&state, &headers).await?;
     Ok(no_store(json!({
         "authenticated": true,
         "actor": context.actor,
-        "org_id": context.org_id,
         "membership_id": context.membership_id,
-        "session_id": context.session_id,
         "scopes": context.scopes,
-        "feature_consent": "separate",
-        "ting_authorization": "/api/v1/ting/authorizations",
-        "testing_environment_id": identity.environment_id(),
     })))
-}
-
-async fn ting_authorize(State(state): Shared, headers: HeaderMap) -> AppResult<Response> {
-    let key = idempotency_key(&headers)?;
-    let (identity, context) = bearer(&state, &headers).await?;
-    Ok(no_store(identity.ting_authorize(&context, &key).await?))
-}
-async fn ting_authorization(
-    State(state): Shared,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> AppResult<Response> {
-    let (identity, context) = bearer(&state, &headers).await?;
-    Ok(no_store(identity.ting_authorization(&context, &id).await?))
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TingCode {
-    authorization_code: SecretString,
-}
-async fn ting_complete(
-    State(state): Shared,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> AppResult<Response> {
-    let input: TingCode = parse(&body)?;
-    let (identity, context) = bearer(&state, &headers).await?;
-    Ok(no_store(
-        identity
-            .ting_complete(&context, &id, input.authorization_code.expose_secret())
-            .await?,
-    ))
 }
 
 async fn subscribe(State(state): Shared, headers: HeaderMap) -> AppResult<Response> {
@@ -470,7 +422,7 @@ async fn send_ting(State(state): Shared, headers: HeaderMap, body: Bytes) -> App
         &input.event_type,
         if result.is_ok() { "ok" } else { "error" },
         result.as_ref().err().map(|e| e.code.as_str()),
-        json!({"type": input.event_type, "testing": identity.environment_id().is_some()}),
+        json!({"type": input.event_type}),
     );
     Ok(no_store(result?))
 }
@@ -520,21 +472,17 @@ async fn report(State(state): Shared, headers: HeaderMap, body: Bytes) -> AppRes
     } else {
         None
     };
-    let testing = headers.contains_key("x-testing-environment-key");
     let id = format!("rep_{}", uuid::Uuid::now_v7().simple());
     let stored = json!({"message": message, "pr": input.pr, "attachments": input.attachments, "context": input.context});
     let (id, mut status, mut issue_url) = state.store.save_report(
         &id,
         &key,
         reporter.as_ref().map(|c| c.actor.public_id.as_str()),
-        reporter.as_ref().map(|c| c.org_id.as_str()),
         message,
         input.pr.as_deref(),
         &stored,
-        if testing { "testing" } else { "production" },
     )?;
     if status == "stored"
-        && !testing
         && let Some(token) = &state.settings.github_token
     {
         match file_issue(
@@ -637,11 +585,11 @@ fn cors(state: &AppState, headers: &HeaderMap, response: &mut Response) {
         h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
         h.insert(
             header::ACCESS_CONTROL_ALLOW_METHODS,
-            HeaderValue::from_static("POST, OPTIONS"),
+            HeaderValue::from_static("GET, POST, OPTIONS"),
         );
         h.insert(
             header::ACCESS_CONTROL_ALLOW_HEADERS,
-            HeaderValue::from_static("content-type, x-spotify-telemetry, x-spotify-source"),
+            HeaderValue::from_static("content-type, authorization, idempotency-key, x-spotify-telemetry, x-spotify-source"),
         );
         h.insert(header::VARY, HeaderValue::from_static("Origin"));
     }
@@ -739,30 +687,12 @@ fn relay_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> AppResult
     Ok(())
 }
 
-async fn webhook(State(state): Shared, headers: HeaderMap, body: Bytes) -> AppResult<Response> {
-    let event = state.identity.verify_webhook(&headers, &body)?;
-    let first = state
-        .store
-        .first_webhook(&event.event_id.to_string(), &event.event_type)?;
-    if first {
-        tracing::info!(event = %event.event_type, id = %event.event_id, "IAM webhook");
-        state.telemetry.backend(
-            "iam.webhook.received",
-            &event.event_type,
-            "ok",
-            None,
-            json!({"event_type": event.event_type}),
-        );
-    }
-    Ok(Json(json!({"received": true, "duplicate": !first})).into_response())
-}
-
 /// Builds the production state.
 ///
 /// # Errors
 /// Configuration problems.
 pub fn production(settings: Settings) -> anyhow::Result<Arc<AppState>> {
-    let identity: Arc<dyn Identity> = Arc::new(Iam::new(&settings)?);
+    let identity: Arc<dyn Identity> = Arc::new(Accounts::new(&settings)?);
     let ting: Arc<dyn TingApi> = Arc::new(ting::TingHttp::new(
         settings.ting_url.clone(),
         settings.ting_timeout,
@@ -773,7 +703,6 @@ pub fn production(settings: Settings) -> anyhow::Result<Arc<AppState>> {
         .timeout(Duration::from_secs(10))
         .build()?;
     Ok(Arc::new(AppState {
-        testing: Arc::new(IamTestingPlanes::new(settings.clone())),
         settings,
         identity,
         ting,

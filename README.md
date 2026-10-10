@@ -1,7 +1,7 @@
 # spotify-cli
 
 Spotify from the command line, for Carbons and Silicons on macOS, with playback triggers
-delivered through Ting. New to Carbons, Silicons, IAM, SLTs or Ting? See
+delivered through Ting. New to Carbons, Silicons, Silicon Accounts, SLTs or Ting? See
 [Concepts](docs/usage.md#concepts).
 
 ```sh
@@ -13,7 +13,7 @@ spotify trigger add --remaining 30s --note 'wrap up' --local
 ```
 
 For Ting notifications, sign in with `spotify login`, then run `spotify ting authorize` and
-complete the IAM approval with `spotify ting complete REQUEST_ID --code-file FILE`. Login and
+complete the Silicon Accounts approval with `spotify ting complete REQUEST_ID --code-file FILE`. Login and
 notification consent are separate. See [Authentication](docs/auth.md).
 
 Installer options, where state lives and how to uninstall:
@@ -87,11 +87,12 @@ More: [Find anything](docs/usage.md#2-find-anything).
 ## Develop
 
 ```sh
-cargo test --workspace
-cargo run --example dev_backend --features dev -- 127.0.0.1:8787 /tmp/tings.jsonl   # fake IAM + Ting
-SPOTIFY_API_URL=http://127.0.0.1:8787 cargo run -p silicon-spotify-cli -- login si:dev
-SPOTIFY_API_URL=http://127.0.0.1:8787 cargo run -p silicon-spotify-cli -- trigger test
-scripts/package-release.sh      # all six targets + Honeycomb package
+cargo check --workspace --locked
+cp .env.example .env                 # configure your Silicon Accounts app
+cargo run -p silicon-spotify --bin spotify-api
+node docs-site/build.mjs
+node docs-site/check.mjs
+scripts/package-release.sh      # all six targets + Silicon Apps package
 ```
 
 Found a bug? Patch it, open a PR, then `spotify report '<what>' --pr <url>`.

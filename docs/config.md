@@ -28,7 +28,6 @@ Stemcell applies `silicon.app_configs.spotify` with exactly this command
 | --- | --- | --- | --- |
 | `api_url` | https origin | `https://backend.spotify.unlikefraction.com` | Backend. `SPOTIFY_API_URL` overrides. |
 | `telemetry` | bool | `true` | Usage and diagnostics to Space Station (`spotify docs telemetry`). |
-| `org` | org handle | `SILICON_ORG`, then the session's | Organization for Ting delivery. |
 | `strategy` | `auto` \| `spotify_player` \| `applescript` | `auto` | Playback path (`spotify docs playback`). `auto`: every start goes through the Web API first (songs, episodes, shows and Liked Songs directly, the rest through spotify_player), AppleScript is the fallback. `applescript` never uses the Web API, so every start goes through AppleScript (a radio cannot start). `spotify_player` never uses AppleScript. |
 | `launch_spotify` | bool | `true` | Launch Spotify.app hidden when a control command finds it closed. |
 | `verify_timeout_ms` | 200–15000 | `2500` | How long to wait for spotify_player's effect, or for a Web API start (a song, episode, show or Liked Songs) to show in Spotify.app, before falling back to AppleScript; a start whose Web API answer was lost is looked for as long before anything starts it again (`play`, `pause`, `toggle`, `volume` and `shuffle` wait at most 1.5 s); `like` waits up to this plus 1.1 s for spotify_player to catch up (`spotify docs playback`). |
@@ -38,7 +37,6 @@ Stemcell applies `silicon.app_configs.spotify` with exactly this command
 | `spotify_player_cache_dir` | absolute path | `~/.cache/spotify-player` | spotify_player `-C` (its Spotify tokens). |
 | `search_limit` | 1–10 | `10` | Results per kind for `spotify search` (spotify_player returns at most 10). A larger value saved by an earlier release (which allowed up to 50) is applied as 10. |
 | `notify_isi` | string | unset | ISI named in Ting metadata when `ISI` is not set. |
-| `auto_update` | bool | `true` | Daemon installs new releases hourly (script installs). |
 | `output` | `human` \| `json` | `human` | Default output format. |
 
 ## Bring your own (BYO)
@@ -47,7 +45,7 @@ Stemcell applies `silicon.app_configs.spotify` with exactly this command
   at https://developer.spotify.com/dashboard (redirect URI `http://127.0.0.1:8989/login`), put
   `client_id = "…"` in a spotify_player config folder, and point spotify-cli at it:
   `spotify config set '{"spotify_player_config_dir": "/path/to/folder"}'`, then `spotify auth login`.
-- **Backend.** Run your own backend (open source, `spotify docs development`) with your own IAM
+- **Backend.** Run your own backend (open source, `spotify docs development`) with your own Silicon Accounts
   app and point `api_url` at it.
 
 ## Environment
@@ -55,10 +53,8 @@ Stemcell applies `silicon.app_configs.spotify` with exactly this command
 | Variable | Effect |
 | --- | --- |
 | `SILICON_HOME` | Home whose `.spotify/` holds config and sessions (else `$HOME`). |
-| `SILICON_ORG` | Default organization. |
 | `ISI` | Recorded as `metadata.isi` on notifications from triggers you create. |
 | `SPOTIFY_API_URL` | Backend origin for this process. |
-| `SPOTIFY_TEST_APP_SECRET` | Select a testing plane for this process. |
 | `SPOTIFY_TELEMETRY`, `SPACE_STATION_TELEMETRY`, `SILICON_TELEMETRY` | `0`, `false`, `off` or `no` (any case) disables telemetry. |
 | `SPOTIFY_DAEMON_HOME` | Daemon state directory (else `~/.silicon-spotify`). |
 | `SPOTIFY_WARM_PLAYER=off` | Do not run the warm spotify_player instance (for the daemon; copies left by earlier daemons are still stopped). |

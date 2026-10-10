@@ -1,7 +1,7 @@
 # spotify-cli architecture
 
 How it is built and why, measured against two inputs: the product spec (a Spotify CLI with
-playback triggers delivered over Ting) and the ecosystem rules every IAM app follows.
+playback triggers delivered over Ting) and the ecosystem rules every Silicon Accounts app follows.
 
 ## Shape
 
@@ -17,8 +17,8 @@ playback triggers delivered over Ting) and the ecosystem rules every IAM app fol
             └───┼───────────────────────────┼──────────────────────────────────┘
                 │ SLT, refresh, report      │ Silicon's own oat_ token
                 ▼                           ▼
-             backend (spotify-api, holds the IAM app secret)
-                │ IAM: SLT exchange, introspection, OBO consent/tokens      │ Ting: subscriptions, tings
+             backend (spotify-api, holds the Silicon Accounts app secret)
+                │ Silicon Accounts: SLT exchange, introspection, App verification and User verification      │ Ting: subscriptions, tings
 ```
 
 - **Library (stateless)** — `silicon-spotify-client`: models, parsers, AppleScript builders and
@@ -30,7 +30,7 @@ playback triggers delivered over Ting) and the ecosystem rules every IAM app fol
 - **CLI** — a client of the library and the daemon; also does login/config/report/docs directly,
   and answers the discovery commands (`spotify` alone, `how`, `commands --json`, `completions`)
   offline from its own command tree and bundled guides.
-- **Backend** — exists to keep the IAM app secret server-side, as IAM requires.
+- **Backend** — exists to keep the Silicon Accounts app secret server-side, as Silicon Accounts requires.
 
 ## Decisions
 
@@ -46,17 +46,16 @@ playback triggers delivered over Ting) and the ecosystem rules every IAM app fol
 | Managed queue in the daemon | Neither the Web API nor AppleScript can remove or reorder Spotify's queue, and spotify_player's CLI cannot even append. "CRUD queue" is only possible with our own queue; Spotify's upcoming list is shown read-only. Automatic starts, managed `next` and resuming the interrupted context use the same verified controller as `play`, honoring the configured strategy (Web API first under `auto`). |
 | Trigger engine as pure code | Every rule (plays, completion, expiry, no retroactive fires, restart-safe play ids) is unit-tested without Spotify. |
 | Current-scope triggers expire loudly (`spotify.trigger.expired`) | A Silicon waiting for "30 s left" on a song that got skipped must not wait forever. |
-| Custody: the Silicon's session stays in its home; the daemon borrows it under the same lock | Matches IAM's guidance (session storage in the app's daemon) and the DM precedent; ordinary login tokens stay local; the backend encrypts separately approved OBO root tokens. Refresh keys are derived from the refresh token so any process can replay an uncertain refresh safely. |
+| Custody: the Silicon's session stays in its home; the daemon borrows it under the same lock | Matches Silicon Accounts's guidance (session storage in the app's daemon) and the DM precedent; ordinary login tokens stay local; the backend encrypts separately approved OBO root tokens. Refresh keys are derived from the refresh token so any process can replay an uncertain refresh safely. |
 | Backend stores each approved OBO root separately, encrypted; Ting verifies its reusable access token on every operation | Feature consent selects provider context. Stable notification keys deduplicate writes. |
 | Ting consent and registration are separate from login | `spotify ting authorize` requests feature permission; `spotify ting complete` stores it and registers. Ordinary logout preserves consent. |
 | Durable outbox with stable keys `<recipient>/<trigger>/<play>/<outcome>` | Retries never duplicate a notification (Ting dedupes keys for 14 days). |
-| Controls work without IAM login; triggers need it | Playing music is local; notifying someone needs an identity. `--local` triggers work without Ting. |
+| Controls work without Silicon Accounts login; triggers need it | Playing music is local; notifying someone needs an identity. `--local` triggers work without Ting. |
 | Auto-start the Spotify sign-in when a Silicon needs it (rate-limited) | The spec: "if not authenticated, run the authentication script when silicon tries to use it". A Carbon must click Agree, so the error says a browser tab was opened and to retry. |
-| Hourly updater in the daemon for script installs; Honeycomb installs update through Honeycomb | The IAM app rules require an hourly checker in the daemon; Honeycomb's worker already updates its own installs. Updates are verified against SHA256SUMS and swapped atomically; the CLI restarts older daemons. |
 | Telemetry via the backend gateway, keys only on the backend | Keys never ship in binaries; opt-out at config, env (incl. Stemcell's `SPACE_STATION_TELEMETRY=0`), header and server levels. |
-| One error shape and IAM exit-code taxonomy | Agents branch on stable codes and get the exact fix. |
+| One error shape and Silicon Accounts exit-code taxonomy | Agents branch on stable codes and get the exact fix. |
 | The CLI describes itself: grouped help, `spotify how`, `Next:` hints, `spotify commands --json`, orientation with no arguments, completions, unknown subcommands answered with the real ones; drift tests tie guides to the grammar | Silicons and Carbons should find a command without knowing its name. The manifest (arguments with types and allowed values, examples, output fields, errors, requirements, and whether a command changes anything: `mutates`, `changes`, `read_only_when`) lets a Silicon plan a call without parsing help text; `how` answers offline from the same help, guides and settings, with examples made for the question (a song name becomes a search, a setting a `config set`). Tests fail when a guide or README shows a command, flag, value or topic the CLI does not have, or when a help example does not parse, so docs and help cannot drift apart. Hints go to stderr and never into `--json`, so pipes and agents are unaffected. |
-| rustls with `ring` for CLI/daemon | Pure-Rust-friendly crypto so all six Honeycomb targets cross-compile (zig for Linux musl, xwin for Windows). |
+| rustls with `ring` for CLI/daemon | Pure-Rust-friendly crypto so all six Silicon Apps targets cross-compile (zig for Linux musl, xwin for Windows). |
 
 ## Spec coverage
 
@@ -71,13 +70,13 @@ playback triggers delivered over Ting) and the ecosystem rules every IAM app fol
 | podcast | `spotify podcast search/play/saved/now` |
 | trigger (X s left, 25% left, 50% passed, song over) | `spotify trigger add --remaining 30s / 25% / --elapsed 50% / --end` (+ `--change`, scopes, times, notes) |
 | all triggers via Ting | daemon outbox → backend → Ting (`spotify.trigger.fired` / `.expired`) |
-| silicon login via IAM SLT | `spotify iam --json`, `login`, `login status --json`, `logout` |
+| silicon login via Silicon Accounts SLT | `spotify accounts --json`, `login`, `login status --json`, `logout` |
 | spotify_player first, AppleScript fallback | `crates/client/src/control.rs` (song, episode, show and Liked Songs starts: `webapi.rs`; focus hand-back: `focus.rs`) |
 | backend for auth and registering tings | `src/` (`/api/v1/auth/*`, `/api/v1/ting/subscription`, `/api/v1/tings`) |
-| installation installs dependencies and keeps them running | `scripts/install.sh`, `packaging/honeycomb-install-macos.sh`, launchd agent, warm spotify_player |
+| installation installs dependencies and keeps them running | `scripts/install.sh`, `packaging/apps-install-macos.sh`, launchd agent, warm spotify_player |
 | run authentication when needed | daemon auto-starts `spotify_player authenticate` on `spotify_auth_required` |
 | clear errors | `docs/errors.md`, `crates/client/src/error.rs` |
-| IAM app rules: config set JSON, report with PR, docs in CLI, command tree, telemetry, BYO, testing, updates, versioning | `config`, `report`, `docs` (`--section`), `commands` (`--json` manifest), `how`, `docs/telemetry.md`, `docs/config.md`, `testing`, updater, `docs/versioning.md` |
+| Silicon Accounts app rules: config set JSON, report with PR, docs in CLI, command tree, telemetry, BYO, updates, versioning | `config`, `report`, `docs` (`--section`), `commands` (`--json` manifest), `how`, `docs/telemetry.md`, `docs/config.md`, `testing`, updater, `docs/versioning.md` |
 
 ## Known limits
 
@@ -96,3 +95,5 @@ playback triggers delivered over Ting) and the ecosystem rules every IAM app fol
   again after each build. Releases are Developer ID signed with the hardened runtime and notarized
   (`SPOTIFY_CODESIGN_IDENTITY`, `SPOTIFY_NOTARY_PROFILE`), so the answer survives updates. Bare
   executables cannot be stapled; Gatekeeper checks the ticket online.
+
+Silicon Apps owns updates for store installations. Native download users rerun the installer. There is no additional network update scheduler. Browser login uses state and PKCE; browser and CLI each retain their own account session until expiry or explicit logout.

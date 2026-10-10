@@ -50,20 +50,20 @@ pub mod store;
 
 pub use error::{Error, Result};
 
-/// The bare IAM application id. Stemcell and `iam` use it to mint short-lived tokens.
+/// The bare Silicon Accounts application id. The Accounts CLI and other apps use it to mint short-lived tokens.
 pub const APP_ID: &str = "spotify";
-/// The organization that owns the application in IAM and Honeycomb.
-pub const OWNER_ORG: &str = "unlikefraction";
+/// The Carbon or Silicon that owns the app in Silicon Apps.
+pub const OWNER_ACCOUNT: &str = "si:tos";
 /// Human name used in help text and documentation.
 pub const APP_NAME: &str = "spotify";
 /// This library's version; the CLI and daemon share it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Production backend origin. Override with `SPOTIFY_API_URL` or `spotify config set`.
 pub const DEFAULT_API_URL: &str = "https://backend.spotify.unlikefraction.com";
-/// IAM API origin (for discovery output only; the CLI never talks to IAM directly).
-pub const IAM_URL: &str = "https://backend.iam.teamofsilicons.com";
-/// IAM hosted login and consent page.
-pub const IAM_AUTH_URL: &str = "https://auth.iam.teamofsilicons.com";
+/// Silicon Accounts API origin (for discovery output only; the CLI never talks to Silicon Accounts directly).
+pub const ACCOUNTS_URL: &str = "https://accounts.teamofsilicons.com";
+/// Silicon Accounts hosted login and consent page.
+
 /// Source repository. Every bug can be reproduced, patched and sent as a pull request here.
 pub const REPOSITORY: &str = "https://github.com/unlikefraction/spotify-cli";
 /// Online documentation.
@@ -89,7 +89,7 @@ pub const TING_TYPES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Validates an IAM-style handle (org or app id): lowercase letters, digits, `_`, `-`, starting
+/// Validates a Silicon Accounts-style application handle: lowercase letters, digits, `_`, `-`, starting
 /// with a letter, `min..=max` bytes.
 #[must_use]
 pub fn valid_handle(value: &str, min: usize, max: usize) -> bool {

@@ -4,7 +4,7 @@ spotify-cli turns the Spotify desktop app on a Mac into a command-line app. Carb
 a terminal; Silicons use it as a tool, and can ask to be **notified through Ting** at playback
 checkpoints ("30 seconds left", "25% left", "halfway", "song over").
 
-The product is spotify-cli and its command is `spotify`. New to Carbons, Silicons, IAM, SLTs or
+The product is spotify-cli and its command is `spotify`. New to Carbons, Silicons, Silicon Accounts, SLTs or
 Ting? Read [Concepts](#concepts) at the end of this guide first.
 
 ## 1. Install (once per Mac)
@@ -45,7 +45,7 @@ spotify commands --json                            # the whole CLI as JSON (belo
 ```
 
 - **`spotify`** with no arguments checks what is set up (macOS, Spotify.app, spotify_player and
-  its Spotify sign-in, spotify-daemon, the permission to control Spotify, your IAM login), marks
+  its Spotify sign-in, spotify-daemon, the permission to control Spotify, your Silicon Accounts login), marks
   each ✓, · (optional) or ✗ with its fix, shows what is playing and up to five things to try,
   fixes first. It reads only local state: the daemon is asked over its socket only when it
   already runs, never started. It exits 0; `spotify doctor` does the full live check. `--json`
@@ -54,7 +54,7 @@ spotify commands --json                            # the whole CLI as JSON (belo
 - **`spotify --help`** lists the commands by goal: Listen, Find, Lyrics & details, Queue,
   Playlists, Podcasts, Triggers (Ting), Account & login, Setup & diagnose. Every command's
   `--help` lists its own flags under `Options:`, then under `Global options:` the ones every
-  command takes (`--json`, `--org`, `--api-url`, `-h`/`--help`, `-V`/`--version`), and ends with
+  command takes (`--json`, `--api-url`, `-h`/`--help`, `-V`/`--version`), and ends with
   examples you can run as they are.
 - **`spotify how "<question>"`** searches every command's help (summary, flags, allowed values,
   examples), the bundled guides, every setting and the error codes, and prints the best commands
@@ -221,49 +221,15 @@ source's description. Forks are imports: `spotify playlist sync` adds the tracks
 gained since, and with `--delete` also removes those it dropped. Playlists cannot be renamed
 (`spotify playlist rename` explains).
 
-## 4. For Silicons: log in once, then set triggers
-
-Triggers notify *you* (the Silicon that set them) through Ting, so they need your identity. The
-SLT comes from `iam`, Silicon IAM's own CLI, separate from spotify-cli (details in
-`spotify docs auth`):
+## Sign in as a Carbon or Silicon
 
 ```sh
-cargo install silicon-iam-cli                        # once: the iam CLI
-spotify iam --json                                   # app_id: spotify
-iam silicon-login --app-id spotify --grant-org "$SILICON_ORG" --approve-scopes   # prints an SLT
-spotify login '<SLT>'                                # one account and organization
-spotify ting authorize                              # review separate notification consent in IAM
-spotify ting complete REQUEST_ID --code-file /secure/consent-code
-spotify login status --json                          # {"authenticated": true, ...}
+spotify accounts --json
+silicon-accounts login --app spotify --json | jq -r .slt | spotify login --token-file -
+spotify login status --json
 ```
 
-`iam` mints for the Silicon whose `SILICON_HOME` it runs with. In a fresh `SILICON_HOME` it has no
-session yet and refuses to mint: sign that Silicon in to IAM once with its own credential first,
-`iam silicon-login --sid si:<handle>` (it asks for the Silicon's STK), then mint as above
-(`spotify docs auth`). Stemcell does these steps for you when `spotify` is in your `apps`.
-
-```sh
-spotify trigger add --remaining 30s --note 'wrap up the call'
-spotify trigger add --remaining 25%
-spotify trigger add --elapsed 50%
-spotify trigger add --end --note 'song over: check the build'
-spotify trigger add --end --scope every            # every song end, until removed
-spotify trigger list
-spotify trigger history
-spotify trigger remove <id>
-spotify trigger test                               # send yourself a test Ting now
-```
-
-When a checkpoint is reached you receive a `spotify.trigger.fired` Ting whose `data` holds the
-trigger (id, condition, note), the track and the position, and whose `metadata.isi` names the ISI
-that created it (from `$ISI`), so your flow can route it back. If a `current` trigger's song is
-skipped first you get `spotify.trigger.expired`. Details: `spotify docs triggers`, `spotify docs ting`.
-
-No Ting? Add `--local` and block on it instead: `spotify trigger wait <id> --timeout 10m`.
-
-Everything else a Silicon needs to plan a call is in `spotify commands --json`
-([The command manifest](#the-command-manifest)), and `spotify how '<task>' --json` finds the
-command for a task.
+This signs in the Silicon Accounts identity you selected. The session is retained across CLI invocations and refreshed until its lifetime ends or you log out. The website has a separate persistent browser session. See [Authentication](auth.md) for both flows and the separate Spotify music sign-in.
 
 ## 5. When something fails
 
@@ -290,7 +256,7 @@ spotify report 'daemon crash' --attach ~/.silicon-spotify/daemon.log
 
 `--attach` takes text files only, at most 5. A binary file (a NUL byte in its first 8 KiB or last
 64 KiB, or text that is not UTF-8), a directory, and any home's `.spotify/session.json` or
-`.spotify/testing.json` are refused with `invalid_input` (exit 2) before anything is sent. Of a
+a session from another API are refused with `invalid_input` (exit 2) before anything is sent. Of a
 longer file only its last 64 KiB are read and sent, starting at a whole character.
 
 ## The command manifest
@@ -330,7 +296,7 @@ Each command has:
 | `examples[]` | `{command, description}`: the runnable lines of its help |
 | `output[]` | `{field, description}`: the fields of its `--json` output |
 | `errors[]` | `{code, exit}`: the codes it can return, including those its requirements imply |
-| `requirements` | true or false for `macos`, `daemon`, `spotify_app`, `spotify_player_signed_in`, `iam_login`, `premium`, `controls_playback`, `network` |
+| `requirements` | true or false for `macos`, `daemon`, `spotify_app`, `spotify_player_signed_in`, `accounts_login`, `premium`, `controls_playback`, `network` |
 | `requirement_notes[]` | exceptions, e.g. for `lyrics`: with a target, Spotify.app is not needed |
 | `mutates` | true when running it can change something or send something out (`report`); false for commands that only read |
 | `changes[]` | what it can change, from the top-level `changes` (`["playback"]` for `play`, `[]` for `status`) |
@@ -340,7 +306,7 @@ Each command has:
 
 ```sh
 spotify commands --json | jq '.commands[] | select(.path == "lyrics")'
-spotify commands --json | jq -r '.commands[] | select(.requirements.iam_login) | .command'
+spotify commands --json | jq -r '.commands[] | select(.requirements.accounts_login) | .command'
 spotify commands --json | jq '.errors[] | select(.code == "premium_required")'
 spotify commands --json | jq -r '.commands[] | select(.mutates == false).command'   # only read
 spotify commands --json | jq -r '.commands[] | select(.mutates == false or .read_only_when != null).command'
@@ -376,15 +342,15 @@ curl -fsSL https://spotify.unlikefraction.com/install.sh | SPOTIFY_INSTALL_DIR="
 When the install directory is not on your PATH, the installer adds it to your shell's startup
 file (`~/.zshrc`, `~/.bash_profile`, fish's `config.fish`, else `~/.profile`) under a
 `# spotify-cli` line. On Linux it stops after copying the binaries (no dependencies, no daemon):
-login, config, docs and report work there, Spotify control needs macOS. Installs made with Honeycomb (`honeycomb install spotify`)
-are managed by Honeycomb, which also updates them.
+login, config, docs and report work there, Spotify control needs macOS. Installs made with Silicon Apps (`silicon-apps install spotify`)
+are managed by Silicon Apps, which also updates them.
 
 State lives in two places:
 
 | Where | Per | Holds |
 | --- | --- | --- |
 | `~/.silicon-spotify/` | macOS user | the daemon's state: its socket, database (triggers, queue), log, `install.json` (`spotify docs daemon`) |
-| `$SILICON_HOME/.spotify/` (else `~/.spotify/`) | Silicon home | that home's `config.json`, IAM session and testing selection |
+| `$SILICON_HOME/.spotify/` (else `~/.spotify/`) | Silicon home | that home's `config.json`, Silicon Accounts session |
 
 ## Uninstall
 
@@ -409,16 +375,13 @@ rm -rf ~/.cache/spotify-player           # its Spotify tokens
 - **Carbon**: a person. **Silicon**: an AI agent with its own identity (a public id such as
   `si:you`), home directory (`SILICON_HOME`) and organization (`SILICON_ORG`). spotify-cli keeps
   one session per Silicon home, so every Silicon on a Mac has its own login and triggers.
-- **IAM** (Silicon IAM): the identity service Carbons and Silicons sign in to. It decides which
-  apps may act for you and with which scopes. Its own CLI, `iam`, is a separate program from
-  spotify-cli: `cargo install silicon-iam-cli` (crate `silicon-iam-cli`, binary `iam`;
-  `spotify iam --json` names it under `iam_cli`). The service runs at
-  https://backend.iam.teamofsilicons.com; sign-in and consent pages are at
-  https://auth.iam.teamofsilicons.com.
-- **SLT** (short-lived token): what `iam silicon-login --app-id spotify` (a Silicon) or
-  `iam login --app-id spotify` (a Carbon) prints. It lasts about 2 minutes and works once;
-  `spotify login` exchanges it for a spotify-cli session. spotify-cli never sees passwords, SID or
-  STK (`spotify docs auth`).
+- **Silicon Accounts** (Silicon Silicon Accounts): the identity service Carbons and Silicons sign in to. It decides which
+  apps may act for you and with which account details. Its own CLI, `silicon-accounts`, is a separate program from
+  spotify-cli: `silicon-apps install silicon-accounts` (crate `silicon-accounts-cli`, binary `silicon-accounts`;
+  `spotify accounts --json` names it under `iam_cli`). The service runs at
+  https://accounts.teamofsilicons.com; sign-in and consent pages are at
+  https://accounts.teamofsilicons.com.
+- **SLT** (short-lived token): a one-use token from `silicon-accounts login --app spotify`, valid for two minutes. Exchange it with `spotify login`.
 - **Ting**: the notification service. spotify-cli sends trigger firings as Tings; Ting delivers
   them, with retries and muting, to the machine of the Silicon that set the trigger
   (`spotify docs ting`).
@@ -442,7 +405,7 @@ and published at https://spotify.unlikefraction.com/docs, where `/` jumps to the
 | Understand triggers and their exact semantics | `spotify docs triggers` |
 | Know how play/pause/seek decide between the Web API, spotify_player and AppleScript | `spotify docs playback` |
 | Queue, reorder and remove upcoming songs | `spotify docs queue` |
-| Log in, Spotify sign-in, testing planes | `spotify docs auth` |
+| Log in and Spotify sign-in | `spotify docs auth` |
 | Change settings, bring your own Spotify client id | `spotify docs config` |
 | Know what runs in the background and where state lives | `spotify docs daemon` |
 | Look up an error code and its exit code | `spotify docs errors` |

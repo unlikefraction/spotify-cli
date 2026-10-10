@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "app_id": "spotify",
+  "version": "0.3.0",
+  "command": "spotify",
+  "targets": {
+    "macos-aarch64": {
+      "binary": "targets/macos-aarch64/bin/spotify",
+      "install_script": "targets/macos-aarch64/install.sh"
+    },
+    "macos-x86_64": {
+      "binary": "targets/macos-x86_64/bin/spotify",
+      "install_script": "targets/macos-x86_64/install.sh"
+    },
+    "linux-aarch64": {
+      "binary": "targets/linux-aarch64/bin/spotify"
+    },
+    "linux-x86_64": {
+      "binary": "targets/linux-x86_64/bin/spotify"
+    },
+    "windows-aarch64": {
+      "binary": "targets/windows-aarch64/bin/spotify.exe"
+    },
+    "windows-x86_64": {
+      "binary": "targets/windows-x86_64/bin/spotify.exe"
+    }
+  }
+}

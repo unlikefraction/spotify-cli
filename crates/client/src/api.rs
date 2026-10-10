@@ -1,6 +1,6 @@
 //! HTTP client for the spotify-cli backend.
 //!
-//! The backend holds the IAM application secret; this client never sees it. It exchanges an IAM
+//! The backend holds the Silicon Accounts application secret; this client never sees it. It exchanges a Silicon Accounts
 //! short-lived token (SLT) for an application session, refreshes and revokes it, registers the
 //! Silicon as a Ting recipient, and asks the backend to deliver trigger notifications through Ting.
 
@@ -13,8 +13,6 @@ use url::Url;
 
 use crate::{Error, Result};
 
-/// Header carrying the testing application secret (`ask_…`) to select an IAM testing plane.
-pub const TESTING_HEADER: &str = "X-Testing-Environment-Key";
 /// Header announcing the caller's telemetry preference.
 pub const TELEMETRY_HEADER: &str = "X-Spotify-Telemetry";
 /// Header naming the calling surface (`cli`, `daemon`, `web`).
@@ -30,6 +28,9 @@ pub struct Actor {
     pub kind: String,
     /// `si:<handle>` or `c:<handle>`.
     pub public_id: String,
+    /// Stable Silicon Accounts identity.
+    #[serde(default)]
+    pub uuid: String,
 }
 
 /// Ting recipient registration result, separate from ordinary login.
@@ -48,10 +49,13 @@ pub struct TingRegistration {
 /// An application session returned by login and refresh.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Session {
-    /// `oat_…`, about 30 minutes.
+    /// `JWT`, about 30 minutes.
     pub access_token: String,
-    /// `ort_…`, rotating; every refresh consumes it.
+    /// `sar_…`, rotating; every refresh consumes it.
     pub refresh_token: String,
+    /// Fixed refresh family expiry supplied by Silicon Accounts.
+    #[serde(default)]
+    pub refresh_token_expires_at: Option<String>,
     /// `Bearer`.
     pub token_type: String,
     /// Access token lifetime in seconds.
@@ -60,17 +64,6 @@ pub struct Session {
     pub scope: String,
     /// Who logged in.
     pub actor: Actor,
-    /// Selected organization.
-    pub org_id: String,
-    /// Compatibility field; may contain only the selected organization.
-    #[serde(default)]
-    pub org_ids: Vec<String>,
-    /// Testing environment, when logged into a testing plane.
-    #[serde(default)]
-    pub testing_environment_id: Option<String>,
-    /// Opaque testing cleaning/key generation binding; absent in production.
-    #[serde(default)]
-    pub testing_generation: Option<String>,
     /// Ting registration (login only).
     #[serde(default)]
     pub ting: Option<TingRegistration>,
@@ -90,19 +83,11 @@ pub struct TingDelivery {
     pub metadata: Value,
 }
 
-/// Selects an IAM testing plane.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Testing {
-    /// The testing application secret (`ask_…`, 47 characters).
-    pub app_secret: String,
-}
-
 /// Backend client. Cheap to clone.
 #[derive(Clone, Debug)]
 pub struct Api {
     http: reqwest::Client,
     base: Url,
-    testing: Option<Testing>,
     telemetry: bool,
     source: &'static str,
     trace_id: Option<String>,
@@ -137,7 +122,6 @@ impl Api {
         Ok(Self {
             http,
             base,
-            testing: None,
             telemetry: true,
             source,
             trace_id: None,
@@ -148,13 +132,6 @@ impl Api {
     #[must_use]
     pub fn base_url(&self) -> &Url {
         &self.base
-    }
-
-    /// Routes every request to a testing plane.
-    #[must_use]
-    pub fn with_testing(mut self, testing: Option<Testing>) -> Self {
-        self.testing = testing;
-        self
     }
 
     /// Sends `X-Spotify-Telemetry: off` when false.
@@ -175,7 +152,7 @@ impl Api {
         &self,
         method: Method,
         path: &str,
-        bearer: Option<(&str, &str)>,
+        bearer: Option<&str>,
         idempotency_key: Option<&str>,
         body: Option<&Value>,
     ) -> Result<(StatusCode, Value)> {
@@ -192,14 +169,11 @@ impl Api {
         if let Some(trace) = &self.trace_id {
             request = request.header(TRACE_HEADER, trace);
         }
-        if let Some((token, org)) = bearer {
-            request = request.bearer_auth(token).header("X-Org-ID", org);
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
         }
         if let Some(key) = idempotency_key {
             request = request.header("Idempotency-Key", key);
-        }
-        if let Some(testing) = &self.testing {
-            request = request.header(TESTING_HEADER, &testing.app_secret);
         }
         if let Some(body) = body {
             request = request.json(body);
@@ -233,13 +207,13 @@ impl Api {
         Err(api_error(status, &value, request_id))
     }
 
-    /// `GET /api/v1/iam`: backend discovery (app id, IAM URL, testing environment).
+    /// `GET /api/v1/accounts`: backend discovery (app id, Silicon Accounts URL).
     ///
     /// # Errors
     /// Transport or backend errors.
-    pub async fn iam(&self) -> Result<Value> {
+    pub async fn accounts(&self) -> Result<Value> {
         Ok(self
-            .call(Method::GET, "/api/v1/iam", None, None, None)
+            .call(Method::GET, "/api/v1/accounts", None, None, None)
             .await?
             .1)
     }
@@ -260,7 +234,7 @@ impl Api {
     /// retry replays instead of consuming it twice.
     ///
     /// # Errors
-    /// `not_authenticated` when IAM rejects the SLT; transport errors.
+    /// `not_authenticated` when Silicon Accounts rejects the SLT; transport errors.
     pub async fn login(&self, slt: &str, idempotency_key: &str) -> Result<Session> {
         let (_, value) = self
             .call(
@@ -311,12 +285,12 @@ impl Api {
     ///
     /// # Errors
     /// `not_authenticated` on 401; transport errors.
-    pub async fn me(&self, access_token: &str, org: &str) -> Result<Value> {
+    pub async fn me(&self, access_token: &str) -> Result<Value> {
         Ok(self
             .call(
                 Method::GET,
                 "/api/v1/auth/me",
-                Some((access_token, org)),
+                Some(access_token),
                 None,
                 None,
             )
@@ -328,83 +302,14 @@ impl Api {
     ///
     /// # Errors
     /// Backend or Ting errors.
-    pub async fn register_ting(
-        &self,
-        access_token: &str,
-        org: &str,
-        idempotency_key: &str,
-    ) -> Result<Value> {
+    pub async fn register_ting(&self, access_token: &str, idempotency_key: &str) -> Result<Value> {
         Ok(self
             .call(
                 Method::POST,
                 "/api/v1/ting/subscription",
-                Some((access_token, org)),
+                Some(access_token),
                 Some(idempotency_key),
                 Some(&json!({})),
-            )
-            .await?
-            .1)
-    }
-
-    /// Start feature-level Ting consent; retry with the same persisted key.
-    ///
-    /// # Errors
-    /// Backend or IAM errors.
-    pub async fn authorize_ting(&self, token: &str, org: &str, key: &str) -> Result<Value> {
-        Ok(self
-            .call(
-                Method::POST,
-                "/api/v1/ting/authorizations",
-                Some((token, org)),
-                Some(key),
-                Some(&json!({})),
-            )
-            .await?
-            .1)
-    }
-
-    /// Inspect an authorization bound to the current account and organization.
-    ///
-    /// # Errors
-    /// Backend or IAM errors.
-    pub async fn ting_authorization(
-        &self,
-        token: &str,
-        org: &str,
-        request_id: &str,
-    ) -> Result<Value> {
-        check_request_id(request_id)?;
-        Ok(self
-            .call(
-                Method::GET,
-                &format!("/api/v1/ting/authorizations/{request_id}"),
-                Some((token, org)),
-                None,
-                None,
-            )
-            .await?
-            .1)
-    }
-
-    /// Redeem the approved one-use code. Credentials stay on the backend.
-    ///
-    /// # Errors
-    /// Backend or IAM errors.
-    pub async fn complete_ting(
-        &self,
-        token: &str,
-        org: &str,
-        request_id: &str,
-        code: &str,
-    ) -> Result<Value> {
-        check_request_id(request_id)?;
-        Ok(self
-            .call(
-                Method::POST,
-                &format!("/api/v1/ting/authorizations/{request_id}/complete"),
-                Some((token, org)),
-                None,
-                Some(&json!({"authorization_code": code})),
             )
             .await?
             .1)
@@ -414,18 +319,13 @@ impl Api {
     ///
     /// # Errors
     /// Backend or Ting errors (codes pass through, e.g. `recipient_not_registered`).
-    pub async fn send_ting(
-        &self,
-        access_token: &str,
-        org: &str,
-        delivery: &TingDelivery,
-    ) -> Result<Value> {
+    pub async fn send_ting(&self, access_token: &str, delivery: &TingDelivery) -> Result<Value> {
         let body = serde_json::to_value(delivery)?;
         Ok(self
             .call(
                 Method::POST,
                 "/api/v1/tings",
-                Some((access_token, org)),
+                Some(access_token),
                 Some(&delivery.key),
                 Some(&body),
             )
@@ -439,7 +339,7 @@ impl Api {
     /// Backend errors.
     pub async fn report(
         &self,
-        bearer: Option<(&str, &str)>,
+        bearer: Option<&str>,
         report: &Value,
         idempotency_key: &str,
     ) -> Result<Value> {
@@ -465,21 +365,6 @@ impl Api {
             .await
             .map(drop)
     }
-}
-
-fn check_request_id(id: &str) -> Result<()> {
-    if id.is_empty()
-        || id.len() > 128
-        || !id
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-    {
-        return Err(Error::invalid(
-            "Invalid authorization request ID.",
-            "Use the request_id returned by `spotify ting authorize`.",
-        ));
-    }
-    Ok(())
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T> {
@@ -570,36 +455,4 @@ pub fn validate_base(value: &str) -> Result<Url> {
         ));
     }
     Ok(url)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn base_urls() {
-        assert!(validate_base("https://backend.spotify.unlikefraction.com").is_ok());
-        assert!(validate_base("http://127.0.0.1:8787").is_ok());
-        assert!(validate_base("http://example.com").is_err());
-        assert!(validate_base("https://u:p@example.com").is_err());
-    }
-
-    #[test]
-    fn maps_backend_errors() {
-        let error = api_error(
-            StatusCode::FORBIDDEN,
-            &json!({"error":{"code":"recipient_not_registered","message":"m","hint":"h","retryable":false}}),
-            Some("req_1".into()),
-        );
-        assert_eq!(error.code, "recipient_not_registered");
-        assert_eq!(
-            error.details.as_ref().map(|d| d["request_id"].clone()),
-            Some(json!("req_1"))
-        );
-        let error = api_error(StatusCode::UNAUTHORIZED, &Value::Null, None);
-        assert_eq!(error.code, "not_authenticated");
-        assert!(!error.hint.is_empty());
-        let error = api_error(StatusCode::SERVICE_UNAVAILABLE, &Value::Null, None);
-        assert!(error.retryable);
-    }
 }

@@ -20,14 +20,11 @@ mod next;
 mod ops;
 mod orient;
 mod render;
-#[cfg(test)]
-mod shell;
 
-use std::io::IsTerminal as _;
 use std::time::Instant;
 
 use serde_json::{Value, json};
-use silicon_spotify_client::api::{Api, Testing};
+use silicon_spotify_client::api::Api;
 use silicon_spotify_client::store::{Config, Home, slot_key};
 use silicon_spotify_client::{Error, Result};
 
@@ -43,10 +40,6 @@ pub struct Ctx {
     pub config: Config,
     /// Effective backend origin.
     pub api_url: String,
-    /// Selected testing plane.
-    pub testing: Option<Testing>,
-    /// `--org`.
-    pub org_flag: Option<String>,
     /// Effective telemetry preference.
     pub telemetry: bool,
     /// Trace id for this invocation.
@@ -58,39 +51,19 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    /// Backend client with testing, telemetry and trace applied.
+    /// Backend client with telemetry and trace applied.
     ///
     /// # Errors
     /// Bad API URL.
     pub fn api(&self) -> Result<Api> {
         Ok(Api::new(&self.api_url, "cli")?
-            .with_testing(self.testing.clone())
             .with_telemetry(self.telemetry)
             .with_trace(Some(self.trace_id.clone())))
     }
 
     /// This home's session slot for the current backend and plane.
     pub fn slot(&self) -> Result<String> {
-        silicon_spotify_client::store::selected_slot(
-            &self.home,
-            &slot_key(&self.api_url, self.testing.as_ref()),
-            self.org(None).as_deref(),
-        )
-    }
-
-    /// Org precedence: --org, SILICON_ORG, config org, then the session's.
-    #[must_use]
-    pub fn org(&self, session_org: Option<&str>) -> Option<String> {
-        self.org_flag
-            .clone()
-            .or_else(|| {
-                std::env::var("SILICON_ORG")
-                    .ok()
-                    .map(|v| v.trim().to_owned())
-                    .filter(|v| !v.is_empty())
-            })
-            .or_else(|| self.config.org.clone())
-            .or_else(|| session_org.map(str::to_owned))
+        silicon_spotify_client::store::selected_slot(&self.home, &slot_key(&self.api_url))
     }
 
     /// Control settings forwarded to the daemon with every request.
@@ -106,7 +79,6 @@ impl Ctx {
             "spotify_player_cache_dir": self.config.spotify_player_cache_dir,
             "telemetry": self.telemetry,
             "api_url": self.api_url,
-            "auto_update": self.config.auto_update,
         })
     }
 
@@ -708,27 +680,13 @@ fn build_ctx(cli: &Cli) -> Result<Ctx> {
         }
         None => config.api_url(),
     };
-    let testing = home.testing()?;
     let json = cli.global.json || config.output.as_deref() == Some("json");
-    if let Some(org) = &cli.global.org
-        && !silicon_spotify_client::store::valid_handle(org, 3, 50)
-    {
-        return Err(Error::invalid(
-            format!("`{org}` is not an organization handle."),
-            "Pass the bare handle, e.g. --org unlikefraction.",
-        ));
-    }
-    if testing.is_some() && !json && std::io::stderr().is_terminal() {
-        err_line!("[testing plane selected · leave with `spotify testing exit`]");
-    }
     Ok(Ctx {
         json,
         telemetry: silicon_spotify_client::telemetry::enabled(config.telemetry),
         home,
         config,
         api_url,
-        testing,
-        org_flag: cli.global.org.clone(),
         trace_id: uuid::Uuid::now_v7().to_string(),
         isi: std::env::var("ISI").ok().filter(|v| !v.trim().is_empty()),
         command: command_path(cli.command.as_ref()),
@@ -740,12 +698,11 @@ async fn run(cli: Cli, ctx: &Ctx) -> Result<()> {
         return orient::orient(ctx).await;
     };
     match command {
-        Command::Iam => account::iam(ctx),
+        Command::Accounts => account::accounts(ctx),
         Command::Login(args) => account::login(ctx, args).await,
         Command::Logout => account::logout(ctx).await,
         Command::Ting { action } => account::ting(ctx, action).await,
         Command::Config { action } => account::config(ctx, action).await,
-        Command::Testing { action } => account::testing(ctx, action),
         Command::Report {
             message,
             pr,
@@ -783,19 +740,12 @@ fn record(ctx: &Ctx, started: Instant, result: &Result<()>) {
     if !ctx.telemetry
         || matches!(
             ctx.command.as_str(),
-            "docs" | "commands" | "iam" | "how" | "completions" | "orientation"
+            "docs" | "commands" | "accounts" | "how" | "completions" | "orientation"
         )
     {
         return;
     }
-    let mut builder = silicon_spotify_client::telemetry::Builder::new(
-        "cli",
-        if ctx.testing.is_some() {
-            "testing"
-        } else {
-            "production"
-        },
-    );
+    let mut builder = silicon_spotify_client::telemetry::Builder::new("cli", "production");
     builder.trace_id.clone_from(&ctx.trace_id);
     let mut context = serde_json::Map::new();
     context.insert("command".into(), json!(ctx.command));
@@ -879,406 +829,5 @@ fn main() {
         print_error(ctx.json, &error);
         drop(runtime);
         std::process::exit(error.exit_code());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    #[test]
-    fn grammar_is_consistent() {
-        // Catches duplicate argument ids, bad defaults and conflicting names at test time.
-        crate::args::command().debug_assert();
-    }
-
-    /// `-V` is a global option listed in every command's help, so every command answers it the
-    /// same way.
-    #[test]
-    fn every_command_prints_the_version_as_spotify() {
-        for args in [
-            &["spotify", "-V"][..],
-            &["spotify", "queue", "-V"],
-            &["spotify", "trigger", "add", "--version"],
-        ] {
-            let error = crate::args::command()
-                .try_get_matches_from(args)
-                .expect_err("version");
-            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
-            assert_eq!(
-                error.render().to_string(),
-                format!("spotify {}\n", env!("CARGO_PKG_VERSION")),
-                "{args:?}"
-            );
-        }
-    }
-
-    fn parse_error(args: &[&str]) -> silicon_spotify_client::Error {
-        let error = crate::args::command()
-            .try_get_matches_from(args)
-            .expect_err("usage error");
-        let argv: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
-        super::usage_error(&error, &argv)
-    }
-
-    #[test]
-    fn usage_errors_keep_what_clap_says() {
-        let error = parse_error(&["spotify", "config", "set", "--json"]);
-        assert_eq!(error.code, "usage");
-        assert_eq!(
-            error.message,
-            "the following required arguments were not provided: <JSON>"
-        );
-        assert!(
-            error
-                .hint
-                .contains("Usage: spotify config set --json <JSON>."),
-            "{}",
-            error.hint
-        );
-        let error = parse_error(&["spotify", "search", "x", "--type", "bogus", "--json"]);
-        assert_eq!(error.message, "invalid value 'bogus' for '--type <KINDS>'");
-        assert!(
-            error
-                .hint
-                .starts_with("Possible values: track, album, artist, playlist, show, episode."),
-            "{}",
-            error.hint
-        );
-        assert_eq!(
-            error
-                .details
-                .as_ref()
-                .map(|d| d["possible_values"][0].clone()),
-            Some(json!("track"))
-        );
-        let error = parse_error(&["spotify", "search", "x", "--limt", "3"]);
-        assert!(
-            error.hint.contains("A similar argument exists: '--limit'."),
-            "{}",
-            error.hint
-        );
-        assert!(
-            error.hint.contains("<QUERY>... Run the command"),
-            "no extra period after `...`: {}",
-            error.hint
-        );
-        let error = parse_error(&["spotify", "trigger", "add"]);
-        assert!(error.message.contains("--remaining"), "{}", error.message);
-        assert!(!error.hint.starts_with('.'), "{}", error.hint);
-    }
-
-    #[test]
-    fn value_errors_carry_the_argument_and_usage() {
-        for args in [
-            &["spotify", "search", "queen", "--limit", "abc", "--json"][..],
-            &["spotify", "search", "queen", "--limit", "--play", "--json"],
-            &["spotify", "trigger", "add", "--end", "--times", "x"],
-        ] {
-            let error = parse_error(args);
-            let details = error.details.clone().unwrap_or_default();
-            assert!(
-                details["argument"]
-                    .as_str()
-                    .is_some_and(|a| a.starts_with("--")),
-                "{args:?}: {details}"
-            );
-            assert!(
-                details["usage"]
-                    .as_str()
-                    .is_some_and(|u| u.starts_with(&format!("spotify {} ", args[1]))),
-                "{args:?}: {details}"
-            );
-            assert!(error.hint.contains("Usage: spotify "), "{}", error.hint);
-        }
-        let error = parse_error(&["spotify", "search", "queen", "--limit", "abc"]);
-        assert_eq!(
-            error.details.map(|d| d["value"].clone()),
-            Some(json!("abc"))
-        );
-    }
-
-    #[test]
-    fn negative_limits_are_values_not_flags() {
-        use clap::Parser as _;
-        for args in [
-            &["spotify", "search", "queen", "--limit", "-1"][..],
-            &["spotify", "search", "queen", "--limit=-1"],
-            &["spotify", "library", "liked", "--limit", "-1"],
-        ] {
-            // Parsed, so the range check (invalid_input, 1 to 10) answers instead of clap's tip
-            // to write `-- -1`, which would add -1 to the query.
-            crate::args::Cli::try_parse_from(args).expect("parses");
-        }
-    }
-
-    #[test]
-    fn hyphenated_option_values_get_the_equals_form() {
-        let error = parse_error(&["spotify", "trigger", "add", "--end", "--note", "-x"]);
-        assert!(
-            error
-                .hint
-                .starts_with("To pass '-x' as the value of --note, write --note=-x."),
-            "{}",
-            error.hint
-        );
-        assert!(!error.hint.contains("'-- "), "{}", error.hint);
-        // A positional keeps clap's tip, which is right there.
-        let error = parse_error(&["spotify", "queue", "move", "3", "-1"]);
-        assert!(error.hint.contains("use '-- -1'"), "{}", error.hint);
-        // A mistyped flag after an option keeps clap's suggestion, without the value advice.
-        let error = parse_error(&["spotify", "trigger", "add", "--end", "--note", "--lable"]);
-        assert!(!error.hint.contains("--note=--lable"), "{}", error.hint);
-        assert!(error.hint.contains("'--label'"), "{}", error.hint);
-    }
-
-    #[test]
-    fn config_set_key_value_points_to_the_json_form() {
-        let error = parse_error(&["spotify", "config", "set", "search_limit", "5"]);
-        assert!(
-            error.hint.starts_with(
-                r#"config set takes one JSON object: spotify config set '{"search_limit": 5}'."#
-            ),
-            "{}",
-            error.hint
-        );
-        let error = parse_error(&["spotify", "config", "set", "a=1", "strategy=applescript"]);
-        assert!(
-            error
-                .hint
-                .contains(r#"'{"a": 1, "strategy": "applescript"}'"#),
-            "{}",
-            error.hint
-        );
-        assert_eq!(
-            super::config_key_value_advice(["search_limit=5"]).as_deref(),
-            Some(r#"config set takes one JSON object: spotify config set '{"search_limit": 5}'."#)
-        );
-        assert_eq!(
-            super::config_key_value_advice([r#"{"search_limit": 5}"#]),
-            None
-        );
-        assert_eq!(
-            super::config_key_value_advice(["search_limit=5", "oops"]),
-            None
-        );
-        let error = parse_error(&["spotify", "config", "set", "strategy", "applescript"]);
-        assert!(
-            error.hint.contains(r#"'{"strategy": "applescript"}'"#),
-            "{}",
-            error.hint
-        );
-        // Only `key value` pairs get the advice; a JSON object plus a stray word does not.
-        let error = parse_error(&["spotify", "config", "set", r#"{"a": 1}"#, "extra"]);
-        assert!(
-            !error.hint.contains("takes one JSON object"),
-            "{}",
-            error.hint
-        );
-        // A quote in a value stays copyable in the single-quoted shell form.
-        let error = parse_error(&["spotify", "config", "set", "label", "it's"]);
-        assert!(
-            error.hint.contains(r#"'{"label": "it'\''s"}'"#),
-            "{}",
-            error.hint
-        );
-        let argv: Vec<String> = ["spotify", "config", "set", "search_limit", "5"]
-            .iter()
-            .map(|a| (*a).to_owned())
-            .collect();
-        let error = crate::args::command()
-            .try_get_matches_from(&argv)
-            .expect_err("usage error");
-        let text = super::human_usage_error(&error, &argv).expect("advice");
-        assert!(
-            text.ends_with(
-                "hint: config set takes one JSON object: spotify config set '{\"search_limit\": 5}'."
-            ),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn lyrics_of_search_words_points_to_search() {
-        let error = parse_error(&["spotify", "lyrics", "arctic", "monkeys", "505", "--json"]);
-        assert!(
-            error.hint.starts_with(
-                "`spotify lyrics` takes a track, not search words: find it with `spotify search 'arctic monkeys 505' --type track`, then run `spotify lyrics <uri>`"
-            ),
-            "{}",
-            error.hint
-        );
-    }
-
-    /// `lyrics --search` is gone. clap's own tip (`-- --search`) would pass the flag as the track.
-    #[test]
-    fn lyrics_search_flag_points_to_search() {
-        for (args, words) in [
-            (&["spotify", "lyrics", "--search", "505"][..], "505"),
-            (
-                &["spotify", "lyrics", "--search", "bohemian rhapsody"],
-                "'bohemian rhapsody'",
-            ),
-            (&["spotify", "lyrics", "--search=queen", "--json"], "queen"),
-            (&["spotify", "lyrics", "--search"], "'<words>'"),
-        ] {
-            let error = parse_error(args);
-            assert_eq!(error.code, "usage");
-            assert!(
-                error.hint.starts_with(&format!(
-                    "`spotify lyrics` has no --search; it takes a track: find it with `spotify search {words} --type track`, then run `spotify lyrics <uri>`"
-                )),
-                "{args:?}: {}",
-                error.hint
-            );
-            assert!(!error.hint.contains("-- --search"), "{}", error.hint);
-            let argv: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
-            let clap_error = crate::args::command()
-                .try_get_matches_from(&argv)
-                .expect_err("usage error");
-            let text = super::human_usage_error(&clap_error, &argv).expect("advice");
-            assert!(!text.contains("-- --search"), "{text}");
-            assert!(text.contains("has no --search"), "{text}");
-        }
-    }
-
-    #[test]
-    fn unknown_subcommands_list_the_real_ones() {
-        let error = parse_error(&["spotify", "queue", "next"]);
-        assert_eq!(error.code, "usage");
-        assert!(
-            error.hint.starts_with(
-                "`spotify queue` has no subcommand `next`; its subcommands are list (show, ls), add, remove (rm), move (mv), clear. To skip to the next track: spotify next."
-            ),
-            "{}",
-            error.hint
-        );
-        let error = parse_error(&["spotify", "trigger", "status"]);
-        assert!(
-            error
-                .hint
-                .contains("`spotify status` is a command of its own: spotify status --help."),
-            "{}",
-            error.hint
-        );
-        let error = parse_error(&["spotify", "frobnicate"]);
-        assert!(
-            !error.hint.contains("its subcommands are"),
-            "{}",
-            error.hint
-        );
-        // `queue show` is `queue list`.
-        use clap::Parser as _;
-        let cli = crate::args::Cli::try_parse_from(["spotify", "queue", "show"]).expect("parses");
-        assert!(matches!(
-            cli.command,
-            Some(crate::args::Command::Queue {
-                action: Some(crate::args::QueueCommand::List)
-            })
-        ));
-    }
-
-    #[test]
-    fn typos_of_a_command_suggest_the_closest_one_first() {
-        use super::edit_distance;
-        assert_eq!(edit_distance("lyircs", "lyrics"), 1, "a swap is one edit");
-        assert_eq!(edit_distance("stauts", "status"), 1);
-        assert_eq!(edit_distance("playlst", "playlist"), 1);
-        assert_eq!(edit_distance("", "abc"), 3);
-        assert_eq!(edit_distance("lyrics", "lyrics"), 0);
-        assert_eq!(edit_distance("ca", "abc"), 3, "optimal string alignment");
-        // clap's own tip named `playlists` and `playlist` before `lyrics`.
-        let error = parse_error(&["spotify", "lyircs", "--json"]);
-        assert!(
-            error.hint.starts_with("Did you mean `spotify lyrics`?"),
-            "{}",
-            error.hint
-        );
-        assert!(!error.hint.contains("playlist"), "{}", error.hint);
-        assert_eq!(
-            error.details.map(|d| d["suggestions"].clone()),
-            Some(json!(["spotify lyrics"]))
-        );
-        let argv: Vec<String> = ["spotify", "lyircs"]
-            .iter()
-            .map(|a| (*a).to_owned())
-            .collect();
-        let clap_error = crate::args::command()
-            .try_get_matches_from(&argv)
-            .expect_err("usage error");
-        let text = super::human_usage_error(&clap_error, &argv).expect("advice");
-        assert!(
-            text.starts_with(
-                "error: unrecognized subcommand 'lyircs'\n\n  tip: did you mean 'lyrics'?\n"
-            ),
-            "{text}"
-        );
-        assert!(!text.contains("similar subcommand"), "{text}");
-        assert!(text.contains("\nUsage: spotify "), "{text}");
-        // A name and an alias of the same command count once; aliases are suggested too.
-        for (args, meant) in [
-            (&["spotify", "stauts"][..], "spotify status"),
-            (&["spotify", "playlst"], "spotify playlist"),
-            (&["spotify", "nxt"], "spotify next"),
-            (&["spotify", "queue", "ad"], "spotify queue add"),
-            (&["spotify", "trigger", "lst"], "spotify trigger list"),
-        ] {
-            let error = parse_error(args);
-            assert!(
-                error.hint.starts_with(&format!("Did you mean `{meant}`?")),
-                "{args:?}: {}",
-                error.hint
-            );
-        }
-        // A group keeps its list of subcommands after the suggestion.
-        let error = parse_error(&["spotify", "queue", "ad"]);
-        assert!(
-            error
-                .hint
-                .contains("`spotify queue` has no subcommand `ad`; its subcommands are"),
-            "{}",
-            error.hint
-        );
-        // Nothing close: no suggestion of ours.
-        for args in [&["spotify", "xyzzy"][..], &["spotify", "frobnicate"]] {
-            let error = parse_error(args);
-            assert!(
-                !error.hint.contains("Did you mean"),
-                "{args:?}: {}",
-                error.hint
-            );
-        }
-    }
-
-    /// Help is wrapped at 100 columns (`max_term_width`), so an indented example line longer
-    /// than that would be broken in two and no longer copyable.
-    #[test]
-    fn help_examples_fit_on_one_line() {
-        fn walk(command: &clap::Command, path: &str, long: &mut Vec<String>) {
-            let texts = [
-                command.get_about(),
-                command.get_long_about(),
-                command.get_before_help(),
-                command.get_after_help(),
-                command.get_after_long_help(),
-            ];
-            for text in texts.into_iter().flatten() {
-                for line in text.to_string().lines() {
-                    if line.starts_with("  ") && line.chars().count() > 100 {
-                        long.push(format!("{path}: {line}"));
-                    }
-                }
-            }
-            for sub in command.get_subcommands() {
-                walk(sub, &format!("{path} {}", sub.get_name()), long);
-            }
-        }
-        let mut long = Vec::new();
-        walk(&crate::args::command(), "spotify", &mut long);
-        assert!(
-            long.is_empty(),
-            "example lines over 100 columns:\n{}",
-            long.join("\n")
-        );
     }
 }

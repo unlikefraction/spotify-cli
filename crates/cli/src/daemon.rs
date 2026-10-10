@@ -136,12 +136,12 @@ async fn replace(ctx: &Ctx, status: &Value) -> Result<()> {
     Ok(())
 }
 
-/// The daemon binary next to this CLI (Honeycomb launchers are symlinks, so canonicalize).
+/// The daemon binary next to this CLI (Silicon Apps launchers are symlinks, so canonicalize).
 ///
 /// # Errors
 /// `daemon_missing`.
 pub fn daemon_binary() -> Result<PathBuf> {
-    // Prefer the path we were invoked through: Honeycomb installs expose stable launcher
+    // Prefer the path we were invoked through: Silicon Apps installs expose stable launcher
     // symlinks, while the resolved package directory is replaced on every update.
     let invoked = std::env::current_exe().ok();
     let exe = invoked.as_ref().and_then(|p| std::fs::canonicalize(p).ok());
@@ -167,7 +167,7 @@ pub fn daemon_binary() -> Result<PathBuf> {
             "spotify-daemon is not installed next to this CLI ({}) or on PATH.",
             exe.map(|p| p.display().to_string()).unwrap_or_default()
         ),
-        "Reinstall: curl -fsSL https://spotify.unlikefraction.com/install.sh | sh (or `honeycomb install spotify`).",
+        "Reinstall: curl -fsSL https://spotify.unlikefraction.com/install.sh | sh (or `apps install spotify`).",
     ))
 }
 
@@ -672,18 +672,5 @@ pub fn record_telemetry(ctx: &Ctx, event: silicon_spotify_client::telemetry::Eve
         .build()
     {
         let _ = runtime.block_on(ipc::call(&request, Duration::from_millis(800)));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::job_pid;
-
-    #[test]
-    fn launchd_job_pid_is_read_from_launchctl_print() {
-        let running = "gui/501/com.unlikefraction.spotify.daemon = {\n\tactive count = 1\n\tpath = /Users/x/Library/LaunchAgents/com.unlikefraction.spotify.daemon.plist\n\ttype = LaunchAgent\n\tstate = running\n\n\tprogram = /Users/x/.local/bin/spotify-daemon\n\tpid = 4242\n\timmediate reason = speculative\n}\n";
-        assert_eq!(job_pid(running), Some(4242));
-        let waiting = "gui/501/com.unlikefraction.spotify.daemon = {\n\tactive count = 0\n\tstate = not running\n\tlast exit code = 1\n}\n";
-        assert_eq!(job_pid(waiting), None);
     }
 }

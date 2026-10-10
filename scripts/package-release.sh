@@ -1,8 +1,8 @@
 #!/bin/sh
 # Builds release artifacts for all six targets:
-#   dist/<tag>/spotify-<tag>-<triple>.tar.gz   (GitHub release; used by install.sh and the updater)
+#   dist/<tag>/spotify-<tag>-<triple>.tar.gz   (GitHub release; used by install.sh)
 #   dist/<tag>/SHA256SUMS
-#   dist/<tag>/spotify-<version>.tar.gz        (Honeycomb package: honeycomb.yaml + targets/)
+#   dist/<tag>/spotify-<version>.tar.gz        (Silicon Apps package: apps.yaml + targets/)
 #   dist/<tag>/install.sh
 # Needs: rustup targets, cargo-zigbuild + zig (Linux musl), cargo-xwin (Windows msvc).
 # macOS signing (scripts/macos-sign.sh; each macOS target is signed before anything is packed):
@@ -23,8 +23,8 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 tag="v$version"
 out="$root/dist/$tag"
 rm -rf "$out" && mkdir -p "$out"
-pkg="$out/honeycomb" && mkdir -p "$pkg/targets"
-sed "s/\"version\": \"[^\"]*\"/\"version\": \"$version\"/" honeycomb.yaml >"$pkg/honeycomb.yaml"
+pkg="$out/apps" && mkdir -p "$pkg/targets"
+sed "s/\"version\": \"[^\"]*\"/\"version\": \"$version\"/" apps.yaml >"$pkg/apps.yaml"
 
 build() { # triple tool
   case "$2" in
@@ -56,25 +56,25 @@ for spec in \
   dir="target/$triple/release"
   ext=""; case "$triple" in *windows*) ext=".exe" ;; esac
   for bin in spotify spotify-daemon; do check_arch "$dir/$bin$ext" "$arch"; done
-  # Sign (and notarize) before the binaries are copied into the Honeycomb package or an archive.
+  # Sign (and notarize) before the binaries are copied into the Silicon Apps package or an archive.
   case "$triple" in *apple-darwin) scripts/macos-sign.sh "$dir" "$triple" ;; esac
   mkdir -p "$pkg/targets/$target/bin"
   cp "$dir/spotify$ext" "$dir/spotify-daemon$ext" "$pkg/targets/$target/bin/"
-  case "$target" in macos-*) cp packaging/honeycomb-install-macos.sh "$pkg/targets/$target/install.sh" ;; esac
+  case "$target" in macos-*) cp packaging/apps-install-macos.sh "$pkg/targets/$target/install.sh" ;; esac
   case "$triple" in
     *windows*) (cd "$dir" && zip -q "$out/spotify-$tag-$triple.zip" spotify.exe spotify-daemon.exe) ;;
     *) tar --no-mac-metadata -czf "$out/spotify-$tag-$triple.tar.gz" -C "$dir" spotify spotify-daemon 2>/dev/null || tar -czf "$out/spotify-$tag-$triple.tar.gz" -C "$dir" spotify spotify-daemon ;;
   esac
 done
 
-if command -v honeycomb >/dev/null 2>&1; then
-  honeycomb pack "$pkg" --output "$out/spotify-$version.tar.gz" --json
+if command -v silicon-apps >/dev/null 2>&1; then
+  silicon-apps pack "$pkg" --output "$out/spotify-$version.tar.gz" --json
 else
-  (cd "$pkg" && tar --no-mac-metadata -czf "$out/spotify-$version.tar.gz" honeycomb.yaml targets 2>/dev/null || tar -czf "$out/spotify-$version.tar.gz" honeycomb.yaml targets)
+  (cd "$pkg" && tar --no-mac-metadata -czf "$out/spotify-$version.tar.gz" apps.yaml targets 2>/dev/null || tar -czf "$out/spotify-$version.tar.gz" apps.yaml targets)
 fi
 cp scripts/install.sh "$out/install.sh"
 (cd "$out" && shasum -a 256 spotify-* install.sh >SHA256SUMS)
-if command -v honeycomb >/dev/null 2>&1; then honeycomb validate "$out/spotify-$version.tar.gz" --json || echo "warning: honeycomb validate failed" >&2; fi
+if command -v silicon-apps >/dev/null 2>&1; then silicon-apps validate "$out/spotify-$version.tar.gz" --json || echo "warning: apps validate failed" >&2; fi
 if [ -z "${SPOTIFY_CODESIGN_IDENTITY:-}" ] || [ "$SPOTIFY_CODESIGN_IDENTITY" = - ]; then
   echo "macOS binaries: ad-hoc signed, not notarized (development build)"
 elif [ -z "${SPOTIFY_NOTARY_PROFILE:-}" ]; then

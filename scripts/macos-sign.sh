@@ -1,7 +1,7 @@
 #!/bin/sh
 # Signs one macOS architecture's two binaries (spotify, spotify-daemon), checks the signatures and,
 # when asked, has Apple notarize them. scripts/package-release.sh runs it for each macOS target
-# before it packs anything, so the release archives, the Honeycomb package and SHA256SUMS all
+# before it packs anything, so the release archives, the Silicon Apps package and SHA256SUMS all
 # carry the signed binaries. It never changes anything but the two files it signs.
 #
 #   scripts/macos-sign.sh --preflight        check the settings below (run before a long build)

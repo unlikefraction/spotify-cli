@@ -1,55 +1,21 @@
-# Backend API (v1)
+# Backend API
 
-Origin: `https://backend.spotify.unlikefraction.com`. JSON in and out. Every response carries an
-`X-Request-Id` header, and every error, including a wrong method (405 `method_not_allowed`, with
-`Allow`) or a body over 512 KiB (413 `payload_too_large`), is the same envelope the CLI uses:
-`{"error":{"code","message","hint","retryable","details"?}}` with a non-empty `hint`. A missing,
-expired or revoked token is 401 `unauthenticated` (the CLI reports it as `not_authenticated`).
-All codes: `spotify docs errors`. Credential-bearing responses are `Cache-Control: no-store`.
+The production API is `https://backend.spotify.unlikefraction.com/api/v1`. Every authenticated operation acts as the Carbon or Silicon account verified by Silicon Accounts. The app secret stays on the server.
 
-Common headers: `Idempotency-Key` (16–255 visible ASCII; required on auth mutations and reports),
-`Authorization: Bearer oat_…` + `X-Org-ID: <org>` on authenticated routes (a bearer that is not an
-`oat_` token is 401 before `X-Org-ID` is checked),
-`X-Testing-Environment-Key: <test ask_ secret>` to select an IAM testing plane,
-`X-Spotify-Telemetry: on|off`, `X-Spotify-Source: cli|daemon|web`.
+| Route | Purpose |
+| --- | --- |
+| `GET /healthz` | Service health, outside `/api/v1` |
+| `GET /api/v1/accounts` | App and account discovery |
+| `POST /api/v1/auth/login` | Exchange `{slt}` for an app session |
+| `POST /api/v1/auth/code` | Exchange `{code, redirect_uri, code_verifier}` from browser sign-in |
+| `POST /api/v1/auth/refresh` | Rotate `{refresh_token}` |
+| `POST /api/v1/auth/logout` | Revoke `{token}` |
+| `GET /api/v1/auth/me` | Verify the Bearer session and return the current account |
 
-| Method & path | Auth | Body → response |
-| --- | --- | --- |
-| `GET /healthz` | — | `{"status":"ok","service":"spotify-cli","version"}` |
-| `GET /readyz` | — | `{"status":"ready"}`, or 503 `{"status":"not_ready","reason":"database"}` |
-| `GET /api/v1/iam` | — | `{"app_id":"spotify","org_id":"unlikefraction","api_version":"v1","iam_url","ting_url","testing_environment_id","ting_types",…}` |
-| `GET /api/v1/version` | — | `{"version","api_versions":["v1"],"min_cli"}` |
-| `POST /api/v1/auth/login` | key | `{"slt"}` → session (below) + `"ting":{"subscribed","subscription_id"?,"error"?}`; a refused SLT → 401 `slt_rejected` |
-| `POST /api/v1/auth/refresh` | key | `{"refresh_token"}` → session; a refused refresh token → 401 `unauthenticated` |
-| `POST /api/v1/auth/logout` | key | `{"token"}` → 204 (revokes the refresh family; unknown, expired or malformed tokens also 204) |
-| `GET /api/v1/auth/me` | bearer | `{"authenticated":true,"actor","org_id","membership_id","session_id","scopes","feature_consent":"separate","testing_environment_id"}` |
-| `POST /api/v1/ting/authorizations` | bearer + key | `{}` → `{request_id,authorization,completed,roots}`; persist the key before sending |
-| `GET /api/v1/ting/authorizations/{request_id}` | bearer | live request status, bound to the same account/org/environment |
-| `POST /api/v1/ting/authorizations/{request_id}/complete` | bearer | `{authorization_code}` → completed request; backend persists root credentials and safely retries the identical code |
-| `POST /api/v1/ting/subscription` | bearer | `{}` → `{"id":"sub_…","app_id","for","active":true}` |
-| `POST /api/v1/tings` | bearer | `{"type","key","data","metadata"?}` → `{"id":"msg_…","created_at","key","silent","replayed"}` |
-| `POST /api/v1/reports` | key, bearer optional | `{"message","pr"?,"attachments"?,"context"?}` (at most 5 attachments) → `{"id":"rep_…","status","issue_url"?}`, `status` is `"stored"` or `"filed"` |
-| `POST /api/v1/telemetry` | — | `{"table","events":[…]}` (1–40 events, ≤64 KiB) → 204; over 64 KiB → 413 `payload_too_large`, 0 or over 40 events → 400 `invalid_input`; with `X-Spotify-Telemetry: off` → 204, nothing recorded |
-| `POST /webhook/` | IAM signature | IAM webhook deliveries → `{"received":true}`; unverified → 401 `webhook_unverified` |
+Token mutations send `Idempotency-Key`. Reuse the same key after a lost response. The backend stores encrypted replay results so it does not exchange a one-use login or refresh credential twice.
 
-Session:
+Session responses contain `access_token`, `refresh_token`, `expires_in`, `refresh_token_expires_at`, and the account identity. Never log these token fields. Browser CORS is restricted to configured frontend origins. Authorization-code redirects must be registered in Silicon Accounts and allowed by the backend.
 
-```json
-{"access_token":"oat_…","refresh_token":"ort_…","token_type":"Bearer","expires_in":1800,
- "scope":"self.identity.read self.profile.read",
- "actor":{"type":"silicon","public_id":"si:you"},"org_id":"unlikefraction","org_ids":["unlikefraction"],"testing_environment_id":null}
-```
+Playback stays local to the Mac. The backend handles identity, Ting delivery, bug reports, and telemetry. Ting calls use account-bound App verification and User verification; an incompatible or unavailable provider returns a clear dependency error and retains queued work.
 
-`POST /api/v1/tings` rules: `type` must be a registered spotify-cli type; `key` 1–200 bytes
-starting with `<your public id>/`; `data` and `metadata` objects; the backend adds `org_id` and
-`for` from the verified session (unknown fields such as `for` are rejected). Ting refusals pass
-through with their code (`recipient_not_registered`, `not_found` for an unregistered type, …).
-
-Refresh rotates the refresh token; retry an uncertain refresh with the *same* idempotency key
-within 10 minutes (IAM replays it); a consumed token under a new key revokes the family.
-
-## Configuration (operators)
-
-See `.env.example`: `SPOTIFY_IAM_APP_SECRET`, `SPOTIFY_IAM_WEBHOOK_SECRET`, `SPOTIFY_IAM_URL`,
-`SPOTIFY_TING_URL`, `SPOTIFY_ENCRYPTION_KEY` (64 hexadecimal characters; keep stable to decrypt stored OBO grants), `SPOTIFY_DATABASE_PATH`, Space Station table keys, optional
-`SPOTIFY_GITHUB_TOKEN` to file reports as GitHub issues. Deployment: `deploy/README.md`.
+Errors are structured objects with a code, message, and recovery hint. An outage is not a logout. See [Authentication](auth.md) for client session handling.

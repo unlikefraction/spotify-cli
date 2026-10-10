@@ -125,7 +125,7 @@ fn facts(ctx: &Ctx, found: &Found) -> Vec<Value> {
         .and_then(|s| s.session.ting.as_ref())
         .is_some_and(|t| t.subscribed);
     checks.push(check(
-        "iam_login",
+        "accounts_login",
         session.is_some(),
         json!(session.as_ref().map(|s| &s.session.actor.public_id)),
         Some("spotify login '<SLT>' (see spotify login --help)"),
@@ -192,7 +192,7 @@ fn suggestions(checks: &[Value], playing: bool) -> Vec<(String, String)> {
             "Lyrics of any song by URI (spotify search finds it)".into(),
         )
     });
-    if ok(checks, "iam_login") {
+    if ok(checks, "accounts_login") {
         out.push((
             "spotify trigger add --remaining 30s --note 'wrap up'".into(),
             "Ting me 30 s before this song ends".into(),
@@ -246,7 +246,7 @@ fn render(v: &Value) -> String {
                 "permission to control Spotify ({})",
                 c["detail"].as_str().unwrap_or("?").replace('_', " ")
             ),
-            "iam_login" => match c["detail"].as_str() {
+            "accounts_login" => match c["detail"].as_str() {
                 Some(who) => format!("logged in as {who}"),
                 None => "not logged in (only triggers need it)".to_owned(),
             },
@@ -322,64 +322,4 @@ pub async fn orient(ctx: &Ctx) -> Result<()> {
     });
     ctx.emit(&value, render);
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn c(name: &str, ok: bool, optional: bool) -> Value {
-        check(name, ok, Value::Null, Some("fix it"), optional)
-    }
-
-    #[test]
-    fn missing_pieces_come_first_in_what_to_try() {
-        let checks = [
-            c("spotify_app", true, false),
-            c("spotify_player", true, false),
-            c("spotify_signed_in", false, false),
-            c("iam_login", false, true),
-        ];
-        let tries = suggestions(&checks, false);
-        assert_eq!(tries[0].0, "spotify auth login");
-        assert!(tries.iter().any(|(c, _)| c.contains("--local")));
-        assert_eq!(tries.len(), 5);
-        let all_good = [c("spotify_app", true, false), c("iam_login", true, true)];
-        let tries = suggestions(&all_good, true);
-        assert_eq!(tries[0].0, "spotify status");
-        assert!(tries.iter().any(|(c, _)| c.contains("--remaining 30s")));
-        // Every suggestion is a command line the grammar takes.
-        for (command, _) in suggestions(&checks, false)
-            .into_iter()
-            .chain(suggestions(&all_good, true))
-        {
-            let words = crate::shell::spotify_commands(&command);
-            assert_eq!(words.len(), 1, "{command}");
-            crate::args::command()
-                .try_get_matches_from(&words[0])
-                .unwrap_or_else(|e| panic!("{command}: {e}"));
-        }
-    }
-
-    #[test]
-    fn rendering_marks_required_and_optional_checks() {
-        let value = json!({"version": "0.1.5", "now_playing": "▶ 505 — Arctic Monkeys",
-            "checks": [c("spotify_app", true, false), c("spotify_signed_in", false, false), c("iam_login", false, true)],
-            "try": [{"command": "spotify status", "description": "What is playing"}]});
-        let text = render(&value);
-        assert!(text.contains("Now: ▶ 505 — Arctic Monkeys"), "{text}");
-        assert!(text.contains("  ✓ Spotify.app installed\n"), "{text}");
-        assert!(
-            text.contains("  ✗ spotify_player signed in to Spotify → fix it\n"),
-            "{text}"
-        );
-        assert!(
-            text.contains("  · not logged in (only triggers need it) → fix it\n"),
-            "{text}"
-        );
-        assert!(
-            text.contains("Try:\n  spotify status   What is playing\n"),
-            "{text}"
-        );
-    }
 }

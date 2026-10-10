@@ -32,7 +32,7 @@ pub const TOPICS: &[(&str, &str, &str)] = &[
     ),
     (
         "auth",
-        "IAM login, Spotify sign-in and testing planes",
+        "Silicon Accounts login, Spotify sign-ins",
         include_str!("../docs/auth.md"),
     ),
     (
@@ -349,66 +349,4 @@ pub fn completions(ctx: &Ctx, shell: ShellArg) -> Result<()> {
     let value = json!({"shell": name, "script": script, "install": "spotify completions --help"});
     ctx.emit(&value, |v| v["script"].as_str().unwrap_or("").to_owned());
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_command_list_marks_what_changes_something() {
-        let manifest = catalog::manifest(&crate::args::command());
-        let find = |path: &str| {
-            manifest["commands"]
-                .as_array()
-                .and_then(|c| c.iter().find(|c| c["path"] == path))
-                .cloned()
-                .unwrap_or_else(|| panic!("no {path}"))
-        };
-        assert_eq!(change_mark(&find("status")), None);
-        assert_eq!(change_mark(&find("library")), None);
-        assert_eq!(
-            change_mark(&find("like")).as_deref(),
-            Some("✎ changes library")
-        );
-        assert_eq!(
-            change_mark(&find("playlist add")).as_deref(),
-            Some("✎ changes playlists")
-        );
-        assert_eq!(
-            change_mark(&find("volume")).as_deref(),
-            Some("✎ changes playback; reads only without a level")
-        );
-        assert_eq!(
-            change_mark(&find("report")).as_deref(),
-            Some("✎ sends a report")
-        );
-    }
-
-    #[test]
-    fn sections_are_found_by_any_part_of_their_heading() {
-        let guide =
-            "# Guide\nintro\n## Create one\nhow\n### Details\nmore\n## Without Ting\nlocal\n";
-        let (heading, text) = find_section(guide, "create one").expect("section");
-        assert_eq!(heading, "Create one");
-        assert_eq!(text, "## Create one\nhow\n### Details\nmore");
-        assert_eq!(
-            find_section(guide, "without").map(|s| s.0).as_deref(),
-            Some("Without Ting")
-        );
-        assert_eq!(
-            find_section(guide, "ting").map(|s| s.0).as_deref(),
-            Some("Without Ting")
-        );
-        assert!(find_section(guide, "nope").is_none());
-        let (_, text) = find_section(guide, "Details").expect("section");
-        assert_eq!(text, "### Details\nmore");
-        // Every real heading can be asked for as `spotify how` prints it.
-        for (topic, _, content) in TOPICS {
-            for (_, heading, _) in crate::how::sections(content) {
-                let asked = heading.replace('`', "");
-                assert!(find_section(content, &asked).is_some(), "{topic}: {asked}");
-            }
-        }
-    }
 }

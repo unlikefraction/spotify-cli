@@ -3,7 +3,7 @@
 //! One daemon per macOS user serves every Silicon home on the machine. It watches Spotify.app
 //! (distributed notifications plus adaptive AppleScript readings), fires playback triggers and
 //! delivers them through the backend to Ting, advances the managed queue, keeps a headless
-//! spotify_player warm, relays telemetry, and checks for updates hourly.
+//! spotify_player warm, relays telemetry, and reports Silicon Apps update ownership.
 //!
 //! Usage: `spotify-daemon` (foreground; launchd runs it) or `spotify-daemon --version`.
 //! The `spotify daemon …` commands start, stop, install and inspect it.

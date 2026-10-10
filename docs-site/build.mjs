@@ -114,14 +114,17 @@ const mark = `<svg viewBox="0 0 64 64" aria-hidden="true" class="mark"><rect x="
 
 function shell({ title, description, body, path, nav = "" }) {
   return `<!doctype html>
-<html lang="en">
+<html lang="en" data-accent="green">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
 <meta name="description" content="${esc(description)}">
 <link rel="canonical" href="${origin}${path}">
+<link rel="stylesheet" href="/silicon-ui/foundation.css">
 <link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/silicon-ui/button.css">
+<script src="/theme.js"></script>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <meta property="og:title" content="${esc(title)}">
 <meta property="og:description" content="${esc(description)}">
@@ -132,12 +135,18 @@ function shell({ title, description, body, path, nav = "" }) {
   <a class="brand" href="/">${mark}<span>spotify-cli</span></a>
   <nav>${nav}<a href="/docs/usage/">Docs</a><a href="/docs/triggers/">Triggers</a><a href="/docs/development/">Develop</a><a href="${repo}" rel="noopener">GitHub ↗</a></nav>
 </header>
+<section class="account-panel" aria-label="Silicon account">
+  <span id="account-status" role="status">Sign in as a Carbon or Silicon</span>
+  <button id="account-login" class="button secondary sm" type="button">Sign in</button>
+  <button id="account-logout" class="button secondary sm" type="button" hidden>Sign out</button>
+</section>
 ${body}
 <footer class="foot">
   <span>spotify-cli ${esc(version)} · open source · <a href="${repo}">${repo.replace("https://", "")}</a> · <a href="/llms.txt">llms.txt</a> · <a href="/docs/versioning/">Version policy</a></span>
   <div class="telemetry" hidden><label><input type="checkbox" id="telemetry-toggle">Anonymous usage stats<span id="telemetry-note">: page path, referrer host, window size; no cookies</span></label> <a href="/docs/telemetry/">Details</a></div>
 </footer>
 <script src="/site.js" defer></script>
+<script src="/account.js" defer></script>
 </body>
 </html>
 `;
@@ -174,7 +183,7 @@ const llms = [
   "",
   "- `spotify` with no arguments: what is set up, what is missing (each with its fix), what is playing, and what to try (`--json`: version, ready, now_playing, checks, try, help).",
   "- `spotify how \"<question>\"`: plain-words search over every command's help, the guides, the settings and the error codes; prints commands with ready-to-run examples made for the question (a song name becomes a search, a setting a `config set`), the guide section to read and matching error codes (`--json`: question, name, terms, commands, guides, errors, more).",
-  "- `spotify commands --json`: the whole CLI as one JSON manifest. Per command: path, summary, goal, capabilities, keywords, arguments (flag, type, allowed_values, default, min, max, conflicts_with, requires), arg_groups, examples, output fields, errors with exit codes, requirements (macos, daemon, spotify_app, spotify_player_signed_in, iam_login, premium, controls_playback, network), mutates, changes, read_only_when and has_read_only_form. Top level: goals, errors (code, exit, meaning, fix), exit_codes, argument_types, changes (library is Liked Songs, changed by like and unlike; playlists is playlists), output_contract. Commands that can run without changing anything: `spotify commands --json | jq -r '.commands[] | select(.mutates == false or .read_only_when != null).command'` (the same as `select(.has_read_only_form)`); what changes Liked Songs: `select(.changes | index(\"library\"))`. `spotify commands` marks changing commands with `✎ changes <what>`.",
+  "- `spotify commands --json`: the whole CLI as one JSON manifest. Per command: path, summary, goal, capabilities, keywords, arguments (flag, type, allowed_values, default, min, max, conflicts_with, requires), arg_groups, examples, output fields, errors with exit codes, requirements (macos, daemon, spotify_app, spotify_player_signed_in, accounts_login, premium, controls_playback, network), mutates, changes, read_only_when and has_read_only_form. Top level: goals, errors (code, exit, meaning, fix), exit_codes, argument_types, changes (library is Liked Songs, changed by like and unlike; playlists is playlists), output_contract. Commands that can run without changing anything: `spotify commands --json | jq -r '.commands[] | select(.mutates == false or .read_only_when != null).command'` (the same as `select(.has_read_only_form)`); what changes Liked Songs: `select(.changes | index(\"library\"))`. `spotify commands` marks changing commands with `✎ changes <what>`.",
   "- `spotify --help` groups commands by goal; every `spotify <command> --help` lists its own options, then the global ones, and ends with runnable examples; `spotify docs <topic> --section '<heading>'` prints one guide section and `spotify docs [<topic>] --search '<text>'` searches; `spotify completions --help` has the install lines for zsh, bash, fish and PowerShell.",
   "- Human output ends with a `Next:` line on stderr suggesting the likely next commands with real URIs, only when stdout is a terminal (never ahead of piped output; `SPOTIFY_HINTS=0` turns it off, `SPOTIFY_HINTS=always` forces it; never in `--json`).",
   "",
@@ -182,7 +191,7 @@ const llms = [
   "",
   "- Lyrics of any song, nothing has to play: `spotify lyrics <uri|link|id>` (`spotify lyrics` alone: the song playing now). It takes a track, not search words: find one by name with `spotify search '<words>' --type track`, then run `spotify lyrics <uri>`. `--json`: track, title, lines, text, synced.",
   "- Play anything: `spotify play spotify:track:<id>` (or `--search '<words>'`, `--context <playlist>`, `--liked`, an album, playlist, artist or show). Every start goes through the Spotify Web API first, so Spotify.app stays in the background (`via: \"web_api\"`): songs, episodes, shows and Liked Songs directly (a song inside its album, so the album plays on), albums, playlists, artists and radios through spotify_player. It plays where Spotify.app plays: on this Mac, or on the speaker or phone it controls (`note`). AppleScript is the fallback, except for a radio (`fallback.from: \"web_api\"`, `fallback.reason.code`), and the focus goes back to the previous app (`refocused`; config `keep_spotify_in_background`).",
-  "- Get notified at a checkpoint: `spotify trigger add --remaining 30s --note '<what to do>'` (also `--elapsed 50%`, `--end`, `--change`; needs `spotify login '<SLT>'` with an SLT from `iam`, Silicon IAM's own CLI, separate from spotify-cli: `cargo install silicon-iam-cli`; or `--local` with `spotify trigger wait <id>`).",
+  "- Get notified at a checkpoint: `spotify trigger add --remaining 30s --note '<what to do>'` (also `--elapsed 50%`, `--end`, `--change`; needs `spotify login '<SLT>'` with an SLT from `silicon-accounts`, the Silicon Accounts CLI: `silicon-apps install silicon-accounts`; or `--local` with `spotify trigger wait <id>`).",
   "- Output: `--json` prints exactly one JSON value on stdout; errors are one `{\"error\": {code, message, hint, retryable, details}}` object on stderr. Exit codes: 0 ok, 1 failed, 2 usage, 3 not signed in, 4 refused, 5 unavailable.",
   "",
   "## Docs",
@@ -214,7 +223,7 @@ const landing = `<main class="landing">
   <p class="eyebrow"><span class="dot"></span> For Carbons and Silicons on macOS</p>
   <h1>Spotify from the command line, with a <span class="serif">cue</span> for every moment.</h1>
   <p class="lede">Play, search, read the lyrics of any song, queue and manage playlists and podcasts from a terminal or a Silicon, while Spotify stays in the background. Set checkpoints like <em>30 seconds left</em>, <em>halfway</em> or <em>song over</em>, and get a Ting when they arrive.</p>
-  <div class="install"><code id="install-cmd">${esc(install)}</code><button class="copy" data-copy="install-cmd" type="button">Copy</button></div>
+  <div class="install"><code id="install-cmd">${esc(install)}</code><button class="copy button secondary sm" data-copy="install-cmd" type="button">Copy</button></div>
   <p class="note">Installs <code>spotify</code>, <code>spotify-daemon</code> and <code>spotify_player</code>, and starts what needs to run. It never logs you in. Then: <code>spotify doctor</code>.</p>
 </section>
 <section class="cards">
@@ -241,15 +250,14 @@ spotify trigger add --end --scope every</code></pre></article>
 <section class="silicons">
   <h2>For Silicons</h2>
   <ol>
-    <li><code>spotify iam --json</code> → <code>{"app_id": "spotify", …}</code></li>
-    <li><code>cargo install silicon-iam-cli</code> — <code>iam</code>, Silicon IAM's own CLI (separate from spotify-cli), if you do not have it</li>
-    <li>In a fresh <code>SILICON_HOME</code>, once: <code>iam silicon-login --sid si:&lt;handle&gt;</code> — the Silicon's own IAM sign-in (it asks for its STK)</li>
-    <li><code>iam silicon-login --app-id spotify --grant-org "$SILICON_ORG" --approve-scopes</code> — prints a short-lived token (SLT)</li>
-    <li><code>spotify login '&lt;SLT&gt;'</code> — signs in to one account and organization</li>
-    <li><code>spotify ting authorize</code> — review notification permissions in IAM, then <code>spotify ting complete REQUEST_ID --code-file FILE</code></li>
+    <li><code>spotify accounts --json</code> → <code>{"app_id": "spotify", …}</code></li>
+    <li><code>silicon-apps install silicon-accounts</code> — <code>silicon-accounts</code>, the Silicon Accounts CLI, if you do not have it</li>
+    <li><code>silicon-accounts login --app spotify</code> — prints a short-lived token (SLT)</li>
+    <li><code>spotify login '&lt;SLT&gt;'</code> — signs in to your Carbon or Silicon account</li>
+    <li><code>spotify ting register</code> — enable Ting delivery for your account</li>
     <li><code>spotify trigger add --elapsed 50%</code> — you receive <code>spotify.trigger.fired</code></li>
   </ol>
-  <p>New to IAM, Silicons, SLTs or Ting? <a href="/docs/usage/#concepts">Concepts</a> explains each in a sentence or two.</p>
+  <p>New to Silicon Accounts, Silicons, SLTs or Ting? <a href="/docs/usage/#concepts">Concepts</a> explains each in a sentence or two.</p>
   <p>Every command documents itself with runnable examples (<code>spotify &lt;command&gt; --help</code>). <code>spotify how "&lt;task&gt;" --json</code> finds the command for a task, <code>spotify commands --json</code> describes every command, argument, output field, error and requirement (<a href="/docs/usage/#the-command-manifest">the manifest</a>), guides are bundled offline (<code>spotify docs &lt;topic&gt; --section '&lt;heading&gt;'</code>), and every error says what failed, why, and the exact fix.</p>
 </section>
 <section class="grid">
@@ -258,8 +266,12 @@ ${topics.map(([n, t]) => `<a href="/docs/${n}/"><strong>${esc(t)}</strong><span>
 </main>`;
 writeFileSync(join(dist, "index.html"), shell({ title: "spotify-cli · Spotify from the command line", description: "Control the Spotify desktop app from the command line on macOS, with playback triggers delivered through Ting. For Carbons and Silicons.", body: landing, path: "/" }));
 writeFileSync(join(dist, "404.html"), shell({ title: "Not found · spotify-cli", description: "Page not found.", body: `<main class="landing"><section class="hero"><h1>Not <span class="serif">here</span>.</h1><p class="lede">Try the <a href="/docs/usage/">quick start</a> or <code>spotify docs</code>.</p></section></main>`, path: "/404.html" }));
+mkdirSync(join(dist, "silicon-ui"), { recursive: true });
+for (const file of ["foundation.css", "button.css", "LICENSE.txt"]) copyFileSync(join(here, "silicon-ui", file), join(dist, "silicon-ui", file));
+copyFileSync(join(here, "theme.js"), join(dist, "theme.js"));
 copyFileSync(join(here, "styles.css"), join(dist, "styles.css"));
 copyFileSync(join(here, "site.js"), join(dist, "site.js"));
+copyFileSync(join(here, "account.js"), join(dist, "account.js"));
 copyFileSync(join(here, "favicon.svg"), join(dist, "favicon.svg"));
 copyFileSync(join(root, "scripts", "install.sh"), join(dist, "install.sh"));
 writeFileSync(join(dist, "search-index.json"), JSON.stringify(search));

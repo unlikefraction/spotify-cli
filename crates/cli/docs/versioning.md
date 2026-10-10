@@ -1,45 +1,17 @@
-# Versioning
+# Versioning and compatibility
 
-Which contracts spotify-cli versions, how each one changes, and how the CLI, the daemon and the
-backend find out whether they still fit together.
+spotify 0.3.0 uses Silicon Accounts and Silicon Apps. The CLI, client library, daemon, and backend share the workspace release version. Native package manifests match it; Peek's native app also carries an increasing bundle build number.
 
-## Contracts and versions
+## Authentication
 
-| Contract | Version | Where |
-| --- | --- | --- |
-| Backend HTTP API | `v1` (path prefix `/api/v1`) | `GET /api/v1/version` lists supported majors |
-| Daemon protocol | `1` (field `v`) | mismatches fail with `protocol_mismatch` |
-| CLI JSON output | follows the CLI's semver | fields are only added within a major |
-| Ting payloads | `spotify.trigger.*` types | fields are only added; types never change meaning |
-| Rust crates | semver | `silicon-spotify-client`, `silicon-spotify-cli` |
+Every actor is a Carbon or Silicon account. The immutable Accounts UUID keys stored resources; its public handle is shown to people. Sessions from the previous identity system need a fresh login. Existing private data is preserved during migration rather than assigned to an unverified new account.
 
-Rules:
-- A **breaking change** bumps the major version: `/api/v2`, protocol `2`, crate `1.0.0 → 2.0.0`.
-- Within a major, changes are additive: new fields, new optional arguments, new error codes. Do
-  not branch on the absence of a field.
-- The backend keeps serving the previous API major for at least 6 months after a new one ships,
-  and `GET /api/v1/version` announces `deprecated`/`sunset` dates before removal.
-- Deprecated CLI flags keep working for one minor release with a warning on stderr.
+Browser and CLI sessions persist across restart until expiry, revocation, or explicit logout. Refresh rotates credentials safely, with durable replay handling after a lost response.
 
-## Negotiation
+## Interfaces
 
-- CLI ↔ daemon: every request carries `v` and `client_version`. A daemon older than the CLI is
-  restarted automatically; an unknown op returns `unknown_op` naming the fix.
-- CLI ↔ backend: `spotify doctor` reads `GET /api/v1/version` (shown in the `backend_reachable`
-  check's `detail.version`). When the backend names a `min_cli`, the required check
-  `cli_version_supported` fails for an older CLI, with the fix `spotify update`. Offline, or with
-  a backend that sends no `min_cli`, the check is left out.
+The backend remains under `/api/v1`. Compatible additions keep existing fields and use new optional fields. Native clients identify themselves using `accounts --json`, and `login status --json` works when signed out. Breaking interface changes require a new version.
 
-## Compatibility matrix
+## Releases
 
-| CLI / daemon | Backend API | Ting types |
-| --- | --- | --- |
-| 0.1.x | v1 | `spotify.trigger.fired`, `spotify.trigger.expired` |
-
-## Updates
-
-Script installs: the daemon checks GitHub releases hourly and installs verified updates
-(`auto_update`, default on). Honeycomb installs: Honeycomb's worker updates them
-(`honeycomb update spotify`). `spotify update --check` reports; for a script install that
-includes your `auto_update` setting (`update` in `spotify daemon status --json` shows the same).
-`spotify update` installs now.
+Silicon Apps uses immutable development releases promoted into production. Production versions use `x.y.z`. Apps owns updates for store installations; native download users rerun the installer. See the deployment runbook in the repository for signing, packaging, and publication.

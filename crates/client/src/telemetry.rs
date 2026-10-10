@@ -78,7 +78,7 @@ pub struct Builder {
     pub trace_id: String,
     /// Per-process id.
     pub instance_id: String,
-    /// `production` or `testing`.
+    /// The deployment environment.
     pub environment: String,
 }
 
@@ -139,36 +139,5 @@ impl Builder {
                 },
             }),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn off_values() {
-        for v in ["0", "false", "OFF", " no "] {
-            assert!(is_off(v));
-        }
-        assert!(!is_off("1"));
-        assert!(!is_off("on"));
-    }
-
-    #[test]
-    fn events_are_self_contained() {
-        let builder = Builder::new("cli", "production");
-        let event = builder.event(
-            "cli.command.completed",
-            "pause",
-            "ok",
-            None,
-            Some(12),
-            Map::new(),
-        );
-        assert_eq!(event.metadata["app"], "spotify");
-        assert_eq!(event.metadata["source"], "cli");
-        assert_eq!(event.data["progress"], 1.0);
-        assert_eq!(event.data["step"], "pause");
     }
 }

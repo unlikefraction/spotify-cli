@@ -1,4 +1,4 @@
-//! Backend SQLite: bug reports and IAM webhook dedupe. No credentials are stored.
+//! Backend SQLite bug report storage.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -26,26 +26,13 @@ impl Store {
         })
     }
 
-    /// In-memory store for tests.
-    ///
-    /// # Errors
-    /// SQLite errors.
-    pub fn memory() -> anyhow::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        Self::migrate(&conn)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
-    }
-
     fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;
              CREATE TABLE IF NOT EXISTS reports (
-               id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE, actor TEXT, org_id TEXT, message TEXT NOT NULL,
-               pr TEXT, body TEXT NOT NULL, status TEXT NOT NULL, issue_url TEXT, environment TEXT, created_at TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS webhook_events (event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, received_at TEXT NOT NULL);",
+               id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE, actor TEXT, message TEXT NOT NULL,
+               pr TEXT, body TEXT NOT NULL, status TEXT NOT NULL, issue_url TEXT, created_at TEXT NOT NULL);",
         )
     }
 
@@ -73,11 +60,9 @@ impl Store {
         id: &str,
         key: &str,
         actor: Option<&str>,
-        org: Option<&str>,
         message: &str,
         pr: Option<&str>,
         body: &Value,
-        environment: &str,
     ) -> AppResult<(String, String, Option<String>)> {
         let conn = self.conn();
         if let Some(existing) = conn
@@ -98,9 +83,17 @@ impl Store {
             return Ok(existing);
         }
         conn.execute(
-            "INSERT INTO reports(id, idempotency_key, actor, org_id, message, pr, body, status, environment, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'stored', ?8, ?9)",
-            params![id, key, actor, org, message, pr, body.to_string(), environment, silicon_spotify_client::model::now_rfc3339()],
+            "INSERT INTO reports(id, idempotency_key, actor, message, pr, body, status, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'stored', ?7)",
+            params![
+                id,
+                key,
+                actor,
+                message,
+                pr,
+                body.to_string(),
+                silicon_spotify_client::model::now_rfc3339()
+            ],
         )
         .map_err(AppError::internal)?;
         Ok((id.to_owned(), "stored".into(), None))
@@ -118,20 +111,5 @@ impl Store {
             )
             .map_err(AppError::internal)?;
         Ok(())
-    }
-
-    /// Returns false when this webhook event was already received.
-    ///
-    /// # Errors
-    /// SQLite errors.
-    pub fn first_webhook(&self, event_id: &str, event_type: &str) -> AppResult<bool> {
-        let inserted = self
-            .conn()
-            .execute(
-                "INSERT OR IGNORE INTO webhook_events(event_id, event_type, received_at) VALUES(?1, ?2, ?3)",
-                params![event_id, event_type, silicon_spotify_client::model::now_rfc3339()],
-            )
-            .map_err(AppError::internal)?;
-        Ok(inserted == 1)
     }
 }

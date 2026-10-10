@@ -1,184 +1,66 @@
-# Going live: runbook
+# Deploying Spotify
 
-Everything below is **outward-facing and mutating**. Run the steps in order; each names who can
-run it. Nothing here is run by the build.
+Spotify is authored and published by `si:tos` in [Silicon Apps](https://apps.teamofsilicons.com). The [developer portal](https://developers.teamofsilicons.com) and `silicon-apps` CLI manage app details, account configuration, packages, and releases. Every user is a Carbon or Silicon account.
 
-| # | Step | Needs |
-| --- | --- | --- |
-| 1 | Create the GitHub repo and push | `gh` as `unlikefraction` |
-| 2 | Backend infrastructure (CloudFormation) | AWS credentials for the production account, region `us-east-1` |
-| 3 | DNS `backend.spotify` → instance IP; `spotify` → Vercel | DNS provider for unlikefraction.com |
-| 4 | Register the IAM app through Honeycomb; save the secret | `unlikefraction` owner/admin (`honeycomb login`) |
-| 5 | Runtime secret → Secrets Manager; deploy the backend | AWS |
-| 6 | Approve the IAM webhook (step-up) | direct Carbon owner/admin of `unlikefraction` |
-| 7 | Register Ting types | Ting session of an `unlikefraction` owner/admin |
-| 8 | Space Station tables → keys into the secret; redeploy | `unlikefraction` member |
-| 9 | Release binaries (GitHub release + Honeycomb package) | macOS build host with zig and cargo-xwin; Developer ID certificate and notarytool profile |
-| 10 | Website + docs on Vercel | Vercel CLI |
-| 11 | End-to-end check with a real Silicon | a Carbon or Silicon with `iam` 5.2.1 |
-
-## 1. Repository
+## Sign in as the publisher
 
 ```sh
-gh repo create unlikefraction/spotify-cli --public --source . --push
+silicon-apps login status --json
+token=$(silicon-accounts login --app silicon-apps --json | jq -r .slt)
+silicon-apps login --slt "$token"
+unset token
 ```
 
-## 2. Infrastructure
+Check that the reported account is `si:tos` before publishing. Keep the app secret from initial app creation on the backend, in AWS Secrets Manager `unlikefraction-spotify/production/runtime`. Never put it in a package, frontend, or command-line argument. Use `silicon-accounts app config` to configure sign-in through the same account or through app credentials read from stdin.
+
+Enable `remember_browser`. Register `https://spotify.unlikefraction.com/` as the browser redirect URI and `https://spotify.unlikefraction.com` as an allowed origin. Browser state and PKCE bind authorization codes to the browser that started sign-in. Backend token exchanges and refreshes keep encrypted replay receipts so a lost response does not reuse a one-use credential with Accounts.
+
+## Backend
+
+The existing CloudFormation stack is `unlikefraction-spotify-production` in `us-east-1`. The service runs on a Linux ARM64 EC2 instance with Caddy and systemd. Deployments use S3 and SSM and retain the previous release for rollback.
 
 ```sh
-aws --region us-east-1 cloudformation deploy --stack-name unlikefraction-spotify-production \
-  --template-file deploy/stack.yaml --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides Vpc=<vpc-id> Subnet=<public-subnet-id> AllocateElasticIp=false \
-  --tags Service=silicon-spotify Environment=production
-aws --region us-east-1 cloudformation describe-stacks --stack-name unlikefraction-spotify-production --query 'Stacks[0].Outputs'
-```
-
-Set `AllocateElasticIp=true` only if the EIP quota allows; without it the IP changes on
-stop/start and the A record must follow.
-
-## 3. DNS (Namecheap, change only these records)
-
-- `A backend.spotify` → `PublicIp` output, TTL 300
-- `A spotify` → `76.76.21.21` (or what Vercel prints in step 10)
-
-Port 80 must stay open for Caddy's ACME challenge.
-
-## 4. IAM application (Honeycomb)
-
-```sh
-secret=$(openssl rand -hex 32)  # SPOTIFY_IAM_WEBHOOK_SECRET in step 5
-jq --arg s "$secret" '.webhook_secret = $s' deploy/honeycomb-application.json \
-  > deploy/honeycomb-application.local.json   # gitignored; never commit the real secret
-honeycomb --json --idempotency-key spotify-create-0001 apps create deploy/honeycomb-application.local.json
-# → save "app_secret" (ask_…, 47 chars) immediately; it is shown once.
-#   Lost response: rerun the same command with the same key within 10 minutes.
-honeycomb --json apps get spotify
-```
-
-The app starts `private` (only `unlikefraction` members can log in); private apps are exempt from Ting's
-critical-scope review. Going public: `honeycomb publication request spotify --revision <N> --message …`,
-then a Ting provider admin approves the Ting scopes (`honeycomb publication decide <request> ting
-approve --revision <N>`) and a Honeycomb validator approves the listing; once both gates pass,
-Honeycomb activates the publication and every prod archive. `spotify` went public this way on
-2026-09-26 (request `4cc3ef9c-8b6c-49c7-abdf-0a225615775f`), so any organization can install it and
-log in; `honeycomb --json publication get spotify` shows the state.
-
-## 5. Runtime secret and backend deploy
-
-Write a private JSON file (never pass values on the command line):
-
-```json
-{"SPOTIFY_ENCRYPTION_KEY":"<openssl rand -hex 32>","SPOTIFY_IAM_APP_SECRET":"ask_…","SPOTIFY_IAM_WEBHOOK_SECRET":"…","SPOTIFY_BACKUP_BUCKET":"<ArtifactBucket>",
- "SPOTIFY_PUBLIC_ORIGIN":"https://backend.spotify.unlikefraction.com","RUST_LOG":"info"}
-```
-
-```sh
-aws --region us-east-1 secretsmanager put-secret-value --secret-id unlikefraction-spotify/production/runtime --secret-string file:///secure/path/runtime.json
-cargo zigbuild --release -p silicon-spotify --bin spotify-api --target aarch64-unknown-linux-musl
-python3 deploy/deploy.py --caddy /path/to/caddy_linux_arm64
+cargo zigbuild --release --locked --target aarch64-unknown-linux-musl -p silicon-spotify
+python3 deploy/deploy.py --caddy /path/to/caddy-linux-arm64
 curl -fsS https://backend.spotify.unlikefraction.com/healthz
-curl -fsS https://backend.spotify.unlikefraction.com/api/v1/iam
 ```
 
-The encryption key protects durable Ting OBO token families in SQLite. Generate it once with
-`openssl rand -hex 32`, store it in the runtime secret, and retain it across deployments and restores.
-Back up the SQLite database and runtime secret together. IAM 5 login never grants Ting authority: users
-run `spotify ting authorize`, complete the displayed request with `spotify ting complete <request-id> --code-file -`,
-then `spotify ting register`. Logout preserves this independent grant.
+Use `.env.example` for current keys. Retain the encryption key and SQLite database together across releases and restores. Secrets use the new Silicon Accounts URL and newly created app secret. Old session credentials cannot be reused across identity systems; users sign in once through Silicon Accounts.
 
-## 6. Webhook approval
+## Build native packages
 
 ```sh
-honeycomb apps webhook status spotify
-iam -o json step-up application.webhook.approve <APP_UUID> | jq -r .step_up_token > /secure/stepup
-honeycomb apps webhook approve spotify --endpoint <PENDING_ENDPOINT_UUID> --revision <N> --step-up-file /secure/stepup
+cargo fmt --all -- --check
+cargo check --locked --workspace
+scripts/package-release.sh
 ```
 
-## 7. Ting types (per Ting context)
+`apps.yaml` uses the Silicon Apps schema: `schema_version`, `app_id`, `version`, `command`, and a `binary` plus optional `install_script` for each target. The CLI must answer `--help`, `accounts --json`, and `login status --json` without a saved login. Builds validate native formats and package safety. macOS releases are signed with Developer ID and notarized before publication.
+
+## Publish through Silicon Apps
 
 ```sh
-ting login --token-stdin   # Ting-bound SLT of an unlikefraction owner/admin
-deploy/ting-types.sh
+silicon-apps capabilities --json
+silicon-apps validate PACKAGE_DIRECTORY
+silicon-apps pack PACKAGE_DIRECTORY --output spotify.tar.gz
+silicon-apps upload spotify --target linux-aarch64 spotify.tar.gz
+silicon-apps packages spotify --json
+silicon-apps release spotify --version VERSION --package PACKAGE_ID
+silicon-apps promote spotify DEVELOPMENT_RELEASE_ID --version VERSION
+silicon-apps readiness spotify
+silicon-apps publish spotify
 ```
 
-Repeat inside each testing environment (with `IAM_TEST_APP_SECRET`/`IAM_TEST_KEY` for Ting).
+Repeat `--package` for each accepted target. Versions are immutable. Use an idempotency key when retrying a mutation. The store currently has Linux validation workers; publish macOS and Windows downloads on the matching GitHub release until their workers are available. `silicon-apps capabilities` is the source of truth for target readiness.
 
-## 8. Telemetry tables
+Silicon Apps owns updates for store installations. Native download users rerun the installer. There is no second network updater in Spotify.
 
-```sh
-spacestation login --org unlikefraction
-deploy/spacestation-tables.sh     # add the four keys to the runtime secret, then redeploy (step 5)
-```
+## Frontend
 
-## 9. Release
+The site uses source from [Silicon UI](https://ui.teamofsilicons.com). Run `docs-site/deploy.sh --prod` to build and publish the Spotify website.
 
-Once per Mac (the owner, interactively; never paste the credentials anywhere else):
+## Live verification
 
-```sh
-security find-identity -v -p codesigning     # lists "Developer ID Application: Shubham Gupta (LTBSK59BJ2)"
-xcrun notarytool store-credentials spotify-cli --apple-id <apple-id> --team-id LTBSK59BJ2   # asks for an app-specific password
-```
+Check the public health route, the site, and the three package discovery commands. With a real Silicon Accounts session, verify login, a subsequent invocation, access-token refresh, and explicit logout. Check browser restoration after a reload. Keep credentials out of logs and remove any temporary verification session when finished.
 
-Each release:
-
-```sh
-export SPOTIFY_CODESIGN_IDENTITY="Developer ID Application: Shubham Gupta (LTBSK59BJ2)"
-export SPOTIFY_NOTARY_PROFILE=spotify-cli
-scripts/package-release.sh                                    # dist/v0.1.0/*
-gh release create v0.1.0 dist/v0.1.0/spotify-v0.1.0-* dist/v0.1.0/SHA256SUMS dist/v0.1.0/install.sh --title v0.1.0 --notes-file CHANGELOG.md
-honeycomb validate dist/v0.1.0/spotify-0.1.0.tar.gz
-honeycomb releases upload spotify dist/v0.1.0/spotify-0.1.0.tar.gz --channel prod \
-  --revision "$(honeycomb --json apps get spotify | jq -r .revision)"
-```
-
-For each macOS target, `scripts/package-release.sh` runs `scripts/macos-sign.sh` before it packs
-anything, so the archives, the Honeycomb package and `SHA256SUMS` all carry the signed binaries:
-
-- `codesign --force --timestamp --options runtime` with identifiers `com.unlikefraction.spotify`
-  and `com.unlikefraction.spotify-daemon`; the daemon also gets
-  `packaging/spotify-daemon.entitlements` (`com.apple.security.automation.apple-events`, which
-  the hardened runtime needs for Apple Events) and carries its embedded Info.plist
-  (`crates/daemon/build.rs`).
-- Checks each signature (`codesign --verify --strict`, identifier, runtime flag, secure
-  timestamp, team, the daemon's Info.plist and exact entitlements) and stops on any mismatch.
-- With `SPOTIFY_NOTARY_PROFILE`: zips both binaries, runs
-  `xcrun notarytool submit --keychain-profile … --wait`, and stops unless the status is
-  `Accepted` (printing `notarytool log` otherwise) and the ticket lists both binaries' cdhashes.
-  The profile is checked before the build starts, and `SPOTIFY_NOTARY_PROFILE` without
-  `SPOTIFY_CODESIGN_IDENTITY` is an error.
-- Also before the build: `SPOTIFY_CODESIGN_IDENTITY` must match exactly one identity in
-  `security find-identity -v -p codesigning`, and a Developer ID Application one when notarizing.
-
-Bare executables cannot be stapled, so Gatekeeper looks the ticket up online the first time a
-browser-downloaded binary runs (install.sh and the daemon's updater download with curl or plain
-HTTP, which set no quarantine flag, so Gatekeeper does not assess those). Check a binary with
-`spctl --assess --type open --context context:primary-signature -vv <file>`
-(`source=Notarized Developer ID`); `spctl --type execute` rejects every bare executable, notarized
-or not. On the build Mac, Gatekeeper can keep answering `Unnotarized Developer ID` for a binary
-it assessed before notarization (a cached answer that cleared within about ten minutes in
-testing); that does not mean the ticket is missing.
-
-Without `SPOTIFY_CODESIGN_IDENTITY` (CI, contributors) the binaries are ad-hoc signed and not
-notarized: macOS then asks for the Automation permission again after each update. The script's
-last lines say which kind it built.
-
-## 10. Website
-
-```sh
-docs-site/deploy.sh --prod     # builds locally (the build reads ../docs, ../Cargo.toml), checks, uploads dist/
-vercel domains add spotify.unlikefraction.com   # once
-```
-
-## 11. End to end
-
-On a Mac with Spotify, as a Silicon:
-
-```sh
-curl -fsSL https://spotify.unlikefraction.com/install.sh | sh
-spotify doctor
-iam -o json silicon-login --app-id spotify --grant-org unlikefraction --approve-scopes | jq -r .slt | spotify login --token-file -
-spotify ting authorize       # review the separate Ting permission request in IAM
-spotify ting complete <request-id> --code-file -   # paste IAM's one-use code
-spotify ting register
-spotify trigger test          # a spotify.trigger.fired Ting reaches the selected account
-```
+Ting must support account-scoped App verification and User verification before remote notifications can succeed. An older Ting deployment that requires an `org_id` is incompatible; do not invent an organization to bypass it. Delivery errors retain queued work for retry after the provider is migrated.

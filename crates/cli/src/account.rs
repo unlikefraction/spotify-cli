@@ -1,4 +1,4 @@
-//! Identity, configuration and operations: iam, login, logout, ting, config, testing, report,
+//! Identity, configuration and operations: accounts, login, logout, ting, config, report,
 //! doctor, setup, update.
 
 use std::io::{IsTerminal as _, Read as _};
@@ -9,59 +9,27 @@ use serde_json::{Value, json};
 use silicon_spotify_client::api::Session;
 use silicon_spotify_client::store::{self, CONFIG_KEYS, Config, Slot};
 use silicon_spotify_client::{
-    APP_ID, APP_NAME, CLI_PACKAGE, DOCS_URL, Error, IAM_AUTH_URL, IAM_URL, INSTALL_COMMAND,
-    OWNER_ORG, REPOSITORY, RUST_PACKAGE, Result, TING_TYPES, VERSION, WEBSITE,
+    ACCOUNTS_URL, APP_ID, APP_NAME, CLI_PACKAGE, DOCS_URL, Error, INSTALL_COMMAND, OWNER_ACCOUNT,
+    REPOSITORY, RUST_PACKAGE, Result, TING_TYPES, VERSION, WEBSITE,
 };
 
 use crate::Ctx;
-use crate::args::{
-    AuthCommand, ConfigCommand, LoginArgs, LoginCommand, TestingCommand, TingCommand,
-};
+use crate::args::{AuthCommand, ConfigCommand, LoginArgs, LoginCommand, TingCommand};
 
-/// How to get the `iam` command that mints SLTs: Silicon IAM's own CLI, not part of this one.
-const IAM_CLI_INSTALL: &str = "cargo install silicon-iam-cli";
-const IAM_CLI_NOTE: &str =
-    "`iam` (it mints the SLT) is Silicon IAM's own CLI, separate from spotify-cli";
-/// Which `iam` session mints the SLT (`spotify docs auth`).
-const IAM_SESSION_NOTE: &str = "`iam` mints for the Silicon whose SILICON_HOME it runs with (its session: $SILICON_HOME/.silicon-iam); in a fresh SILICON_HOME it has none and refuses to mint, so sign that Silicon in to IAM once first with its own credential: iam silicon-login --sid si:<handle> (it asks for the Silicon's STK)";
-
-/// `spotify iam --json`: static, offline discovery.
-pub fn iam(ctx: &Ctx) -> Result<()> {
+/// Offline Silicon Accounts and Silicon Apps discovery.
+pub fn accounts(ctx: &Ctx) -> Result<()> {
     let value = json!({
-        "app_id": APP_ID,
-        "org_id": OWNER_ORG,
-        "name": APP_NAME,
-        "version": VERSION,
-        "api_url": ctx.api_url,
-        "iam_url": IAM_URL,
-        "auth_url": IAM_AUTH_URL,
-        "login_method": "short_lived_token",
-        "login": format!("Mint an SLT with `iam silicon-login --app-id {APP_ID} --grant-org \"$SILICON_ORG\" --approve-scopes` (Silicon; in a fresh SILICON_HOME, first `iam silicon-login --sid si:<handle>` with the Silicon's own credential) or `iam login --app-id {APP_ID} --grant-org <org>` (Carbon), then run `spotify login '<SLT>'`."),
-        "iam_session": IAM_SESSION_NOTE,
-        "credential_issuer": false,
-        "scopes": ["self.identity.read", "self.profile.read"],
-        "feature_permissions": {"ting": ["subscriptions.register", "tings.send"], "start": "spotify ting authorize"},
-        "ting_types": TING_TYPES.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
-        "docs": DOCS_URL,
-        "website": WEBSITE,
-        "repository": REPOSITORY,
-        "rust_package": RUST_PACKAGE,
-        "cli_package": CLI_PACKAGE,
-        "install": INSTALL_COMMAND,
-        "iam_cli": {
-            "name": "iam",
-            "description": IAM_CLI_NOTE,
-            "install": IAM_CLI_INSTALL,
-        },
-        "testing": ctx.testing.is_some(),
+        "app_id": APP_ID, "owner": OWNER_ACCOUNT, "name": APP_NAME, "version": VERSION,
+        "api_url": ctx.api_url, "accounts_url": ACCOUNTS_URL, "apps_url": "https://apps.teamofsilicons.com",
+        "developers_url": "https://developers.teamofsilicons.com", "login_method": "short_lived_token",
+        "login": "silicon-accounts login --app spotify --json | jq -r .slt | spotify login --token-file -",
+        "accounts_cli": {"name": "silicon-accounts", "install": "silicon-apps install silicon-accounts"},
+        "docs": DOCS_URL, "website": WEBSITE, "repository": REPOSITORY,
+        "rust_package": RUST_PACKAGE, "cli_package": CLI_PACKAGE, "install": INSTALL_COMMAND,
+        "scopes": ["profile"],
+        "ting_types": TING_TYPES.iter().map(|(t, _)| *t).collect::<Vec<_>>()
     });
-    ctx.emit(&value, |v| {
-        format!(
-            "{APP_NAME} {VERSION}\n  app_id: {APP_ID} (org {OWNER_ORG})\n  backend: {}\n  login: {}\n  iam CLI: {IAM_CLI_NOTE}; get it with `{IAM_CLI_INSTALL}`\n  iam session: {IAM_SESSION_NOTE}\n  docs: {DOCS_URL}\n  source: {REPOSITORY}\n  rust: {RUST_PACKAGE}",
-            v["api_url"].as_str().unwrap_or(""),
-            v["login"].as_str().unwrap_or("")
-        )
-    });
+    ctx.emit(&value, |v| format!("{APP_NAME} {VERSION}\n  app_id: {APP_ID} (owner {OWNER_ACCOUNT})\n  accounts: {ACCOUNTS_URL}\n  login: {}\n  docs: {DOCS_URL}", v["login"].as_str().unwrap_or("")));
     Ok(())
 }
 
@@ -71,7 +39,7 @@ fn read_token(path: &Path) -> Result<String> {
         if std::io::stdin().is_terminal() {
             return Err(Error::invalid(
                 "--token-file - reads the SLT from stdin, but stdin is a terminal.",
-                "Pipe it: iam -o json silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes | jq -r .slt | spotify login --token-file -",
+                "Mint a short-lived token: silicon-accounts login --app spotify --json | jq -r .slt | spotify login --token-file -",
             ));
         }
         std::io::stdin()
@@ -98,13 +66,10 @@ fn session_view(ctx: &Ctx, slot: &Slot) -> Value {
     json!({
         "authenticated": true,
         "actor": slot.session.actor,
-        "org_id": slot.session.org_id,
-        "org_ids": slot.session.org_ids,
         "scopes": slot.session.scope.split_whitespace().collect::<Vec<_>>(),
         "access_expires_at": expires,
+        "session_expires_at": slot.session.refresh_token_expires_at,
         "ting": slot.session.ting,
-        "testing_environment_id": slot.session.testing_environment_id,
-        "testing_generation": slot.session.testing_generation,
         "api_url": slot.api_url,
         "store": ctx.home.dir,
     })
@@ -115,10 +80,7 @@ pub async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
     match args.command {
         Some(LoginCommand::Status) => return status(ctx).await,
         Some(LoginCommand::Contexts) => return login_contexts(ctx),
-        Some(LoginCommand::Use {
-            account,
-            organization,
-        }) => return use_context(ctx, &account, &organization),
+        Some(LoginCommand::Use { account }) => return use_context(ctx, &account),
         None => {}
     }
     let slt = match (&args.slt, &args.token_file) {
@@ -132,24 +94,24 @@ pub async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
         (None, Some(path)) => read_token(path)?,
         (None, None) => {
             return Err(Error::invalid(
-                "`spotify login` needs an IAM short-lived token (SLT). The CLI accepts an IAM SLT for login.",
-                "Silicon: iam silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes (in a fresh SILICON_HOME, first iam silicon-login --sid si:<handle> with the Silicon's own credential), then spotify login '<SLT>'. Carbon: iam login --app-id spotify --grant-org <org>.",
+                "`spotify login` needs a Silicon Accounts short-lived token (SLT). The CLI accepts a Silicon Accounts SLT for login.",
+                "Mint a short-lived token: silicon-accounts login --app spotify --json | jq -r .slt | spotify login --token-file -",
             ));
         }
     };
     if slt.is_empty() || slt.len() > 8192 || !slt.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(Error::invalid(
             "The SLT is empty or contains spaces/control characters.",
-            "Pass the token exactly as iam printed it (usually oac_…).",
+            "Pass the token exactly as silicon-accounts printed it (usually slt_…).",
         ));
     }
-    // A short plain word is a typo, not a token (SLTs look like `oac_…`): never send it to the
+    // A short plain word is a typo, not a token (SLTs look like `slt_…`): never send it to the
     // backend as an SLT. Testing planes accept a test public id such as `si:test-silicon`.
     if slt.len() < 16 && !slt.contains('_') && !slt.starts_with("si:") && !slt.starts_with("c:") {
         let hint = if crate::edit_distance(&slt.to_ascii_lowercase(), "status") <= 2 {
             "Did you mean `spotify login status`?".to_owned()
         } else {
-            "Pass the token exactly as iam printed it (usually oac_…): spotify login '<SLT>'."
+            "Pass the token exactly as silicon-accounts printed it (usually slt_…): spotify login '<SLT>'."
                 .to_owned()
         };
         return Err(Error::invalid(
@@ -162,30 +124,28 @@ pub async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
         if error.code == "not_authenticated" {
             Error::new(
                 "slt_rejected",
-                "IAM rejected the short-lived token: it expired (they last ~2 minutes), was already used, or was minted for another app.",
-                "Mint a fresh one for app `spotify` and retry immediately: iam silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes",
+                "Silicon Accounts rejected the short-lived token: it expired (they last ~2 minutes), was already used, or was minted for another app.",
+                "Mint a short-lived token: silicon-accounts login --app spotify --json | jq -r .slt | spotify login --token-file -",
             )
-            .with_details(json!({"iam": error}))
+            .with_details(json!({"accounts": error}))
         } else {
             error
         }
     })?;
-    if ctx.org(None).is_some_and(|org| org != session.org_id) {
-        return Err(Error::invalid(
-            "The IAM login selected a different organization.",
-            "Mint an SLT for the selected --org, or change the explicit organization before logging in.",
-        ));
-    }
-    let base = store::slot_key(&ctx.api_url, ctx.testing.as_ref());
+    let base = store::slot_key(&ctx.api_url);
     let slot = store::save_login(&ctx.home, &base, &ctx.api_url, session)?;
     let view = session_view(ctx, &slot);
     ctx.emit(&view, |v| {
         let ting = if v.pointer("/ting/subscribed") == Some(&Value::Bool(true)) {
             "registered as a Ting recipient ✓".to_owned()
         } else {
-            "Ting notifications need separate permission: run `spotify ting authorize` when you want to use triggers.".to_owned()
+            "Enable Ting notifications with `spotify ting register` when you want to use triggers."
+                .to_owned()
         };
-        format!("Logged in as {} (org {}).\n  {ting}", v["actor"]["public_id"].as_str().unwrap_or("?"), v["org_id"].as_str().unwrap_or("?"))
+        format!(
+            "Logged in as {}.\n  {ting}",
+            v["actor"]["public_id"].as_str().unwrap_or("?")
+        )
     });
     ctx.next(&crate::next::after_login());
     Ok(())
@@ -193,10 +153,10 @@ pub async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
 
 fn login_contexts(ctx: &Ctx) -> Result<()> {
     let sessions = ctx.home.sessions()?;
-    let base = store::slot_key(&ctx.api_url, ctx.testing.as_ref());
+    let base = store::slot_key(&ctx.api_url);
     let selected = ctx.slot().ok();
     let items: Vec<Value> = sessions.slots.iter().filter(|(key, _)| store::slot_in_plane(key, &base)).map(|(key, slot)| {
-        json!({"account":slot.session.actor.public_id,"identity_kind":slot.session.actor.kind,"org_id":slot.session.org_id,"selected":selected.as_ref()==Some(key),"testing_environment_id":slot.session.testing_environment_id})
+        json!({"account":slot.session.actor.public_id,"identity_kind":slot.session.actor.kind,"selected":selected.as_ref()==Some(key)})
     }).collect();
     ctx.emit(&json!({"contexts": items}), |v| {
         v["contexts"]
@@ -205,10 +165,9 @@ fn login_contexts(ctx: &Ctx) -> Result<()> {
             .iter()
             .map(|item| {
                 format!(
-                    "{} {} / {}",
+                    "{} {}",
                     if item["selected"] == true { "*" } else { " " },
-                    item["account"].as_str().unwrap_or("?"),
-                    item["org_id"].as_str().unwrap_or("?")
+                    item["account"].as_str().unwrap_or("?")
                 )
             })
             .collect::<Vec<_>>()
@@ -217,30 +176,35 @@ fn login_contexts(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-fn use_context(ctx: &Ctx, account: &str, org: &str) -> Result<()> {
-    if ctx.org(None).is_some_and(|selected| selected != org) {
-        return Err(Error::invalid(
-            "An explicit organization setting selects another context.",
-            "Set --org, SILICON_ORG or config org to the desired organization before switching.",
-        ));
-    }
-    let base = store::slot_key(&ctx.api_url, ctx.testing.as_ref());
+fn use_context(ctx: &Ctx, account: &str) -> Result<()> {
+    let base = store::slot_key(&ctx.api_url);
     let lock = ctx.home.lock()?;
     let mut sessions = ctx.home.sessions()?;
-    let key = sessions.slots.iter().filter(|(key, slot)| store::slot_in_plane(key, &base) && slot.session.actor.public_id == account && slot.session.org_id == org).max_by_key(|(key, slot)| (sessions.active.get(&base) == Some(*key), slot.logged_in_at)).map(|(key, _)| key.clone()).ok_or_else(|| Error::not_authenticated("That account and organization have no saved session. Sign in to that context first."))?;
+    let key = sessions
+        .slots
+        .iter()
+        .filter(|(key, slot)| {
+            store::slot_in_plane(key, &base) && slot.session.actor.public_id == account
+        })
+        .max_by_key(|(key, slot)| (sessions.active.get(&base) == Some(*key), slot.logged_in_at))
+        .map(|(key, _)| key.clone())
+        .ok_or_else(|| {
+            Error::not_authenticated(
+                "That account have no saved session. Sign in to that context first.",
+            )
+        })?;
     sessions.active.insert(base, key);
     ctx.home.save_sessions(&sessions, &lock)?;
-    ctx.emit(
-        &json!({"account": account, "org_id": org, "selected": true}),
-        |_| format!("Selected {account} / {org}. Existing triggers retain their original context."),
-    );
+    ctx.emit(&json!({"account": account, "selected": true}), |_| {
+        format!("Selected {account}. Existing triggers retain their original context.")
+    });
     Ok(())
 }
 
 /// `spotify login status`: live check.
 async fn status(ctx: &Ctx) -> Result<()> {
     let key = ctx.slot()?;
-    let unauthenticated = |reason: &str| json!({"authenticated": false, "api_url": ctx.api_url, "store": ctx.home.dir, "reason": reason, "testing": ctx.testing.is_some()});
+    let unauthenticated = |reason: &str| json!({"authenticated": false, "api_url": ctx.api_url, "store": ctx.home.dir, "reason": reason});
     if !ctx.home.sessions()?.slots.contains_key(&key) {
         let value = unauthenticated("no session saved");
         ctx.emit(&value, |_| {
@@ -261,18 +225,17 @@ async fn status(ctx: &Ctx) -> Result<()> {
         }
         Err(error) => return Err(error),
     };
-    let org = slot.session.org_id.clone();
-    let me = match api.me(&slot.session.access_token, &org).await {
+    let me = match api.me(&slot.session.access_token).await {
         Err(error) if error.code == "not_authenticated" => {
             match store::fresh_session(&ctx.home, &api, &key, true).await {
                 Ok(fresh) => {
                     slot = fresh;
-                    api.me(&slot.session.access_token, &org).await
+                    api.me(&slot.session.access_token).await
                 }
                 Err(error) if error.code == "not_authenticated" => {
                     let value = unauthenticated("session revoked");
                     ctx.emit(&value, |_| {
-                        "Not logged in: IAM revoked the session. Run `spotify login '<SLT>'`."
+                        "Not logged in: Silicon Accounts revoked the session. Run `spotify login '<SLT>'`."
                             .into()
                     });
                     return Ok(());
@@ -299,9 +262,8 @@ async fn status(ctx: &Ctx) -> Result<()> {
     view["identity"] = me;
     ctx.emit(&view, |v| {
         format!(
-            "Logged in as {} (org {}) at {}.\n  Ting recipient: {}",
+            "Logged in as {} at {}.\n  Ting recipient: {}",
             v["actor"]["public_id"].as_str().unwrap_or("?"),
-            v["org_id"].as_str().unwrap_or("?"),
             v["api_url"].as_str().unwrap_or("?"),
             if v.pointer("/ting/subscribed") == Some(&Value::Bool(true)) {
                 "registered"
@@ -334,7 +296,7 @@ pub async fn logout(ctx: &Ctx) -> Result<()> {
         Ok(()) => true,
         Err(error) => {
             ctx.hint(&format!(
-                "Could not revoke the session in IAM ({}: {}); it was removed locally anyway.",
+                "Could not revoke the session in Silicon Accounts ({}: {}); it was removed locally anyway.",
                 error.code, error.message
             ));
             false
@@ -351,129 +313,24 @@ pub async fn ting(ctx: &Ctx, action: TingCommand) -> Result<()> {
     let key = ctx.slot()?;
     let api = ctx.api()?;
     let slot = store::fresh_session(&ctx.home, &api, &key, false).await?;
-    let token = &slot.session.access_token;
-    let org = &slot.session.org_id;
     match action {
-        TingCommand::Authorize { new } => {
-            let pending = {
-                let lock = ctx.home.lock()?;
-                let mut sessions = ctx.home.sessions()?;
-                let saved = sessions
-                    .slots
-                    .get_mut(&key)
-                    .ok_or_else(|| Error::not_authenticated("The selected session was removed."))?;
-                if new || saved.ting_authorization.is_none() {
-                    saved.ting_authorization = Some(store::TingAuthorization {
-                        idempotency_key: format!(
-                            "spotify-ting-consent-{}",
-                            uuid::Uuid::now_v7().simple()
-                        ),
-                        request_id: None,
-                        response: None,
-                    });
-                }
-                let pending = saved.ting_authorization.clone().expect("created above");
-                ctx.home.save_sessions(&sessions, &lock)?;
-                pending
-            };
-            let value = if let Some(id) = &pending.request_id {
-                api.ting_authorization(token, org, id).await?
-            } else {
-                api.authorize_ting(token, org, &pending.idempotency_key)
-                    .await?
-            };
-            save_authorization(ctx, &key, &pending.idempotency_key, &value)?;
-            emit_authorization(ctx, &value);
-        }
-        TingCommand::Complete {
-            request_id,
-            code_file,
-        } => {
-            let pending = slot.ting_authorization.as_ref().filter(|pending| pending.request_id.as_deref() == Some(&request_id)).ok_or_else(|| Error::invalid("This request does not belong to the selected account, organization and testing context.", "Select the original context with `spotify login use`, or run `spotify ting authorize` to inspect its request."))?;
-            let code = read_token(&code_file)?;
-            if code.is_empty() || code.len() > 8192 || !code.bytes().all(|c| c.is_ascii_graphic()) {
-                return Err(Error::invalid(
-                    "The consent code is empty or malformed.",
-                    "Write only the one-use code returned by IAM to the code file.",
-                ));
-            }
-            let value = api.complete_ting(token, org, &request_id, &code).await?;
-            save_authorization(ctx, &key, &pending.idempotency_key, &value)?;
-            if value["completed"] != true {
-                emit_authorization(ctx, &value);
-                return Ok(());
-            }
-            register_ting(ctx, &key, &slot).await?;
-        }
+        TingCommand::Authorize | TingCommand::Register => register_ting(ctx, &key, &slot).await?,
         TingCommand::Status => {
-            let authorization = if let Some(id) = slot
-                .ting_authorization
-                .as_ref()
-                .and_then(|pending| pending.request_id.as_deref())
-            {
-                Some(api.ting_authorization(token, org, id).await?)
-            } else {
-                None
-            };
-            let value = json!({"actor": slot.session.actor, "org_id": org, "ting": slot.session.ting, "authorization": authorization});
+            let value = json!({"actor": slot.session.actor, "ting": slot.session.ting});
             ctx.emit(&value, |v| {
                 format!(
-                    "{} / {}: {}",
+                    "{}: {}",
                     v["actor"]["public_id"].as_str().unwrap_or("?"),
-                    org,
                     if v.pointer("/ting/subscribed") == Some(&Value::Bool(true)) {
                         "registered"
                     } else {
-                        "permission/registration needed; spotify ting authorize"
+                        "run spotify ting register"
                     }
                 )
             });
         }
-        TingCommand::Register => register_ting(ctx, &key, &slot).await?,
     }
     Ok(())
-}
-
-fn save_authorization(ctx: &Ctx, key: &str, operation: &str, value: &Value) -> Result<()> {
-    let lock = ctx.home.lock()?;
-    let mut sessions = ctx.home.sessions()?;
-    let pending = sessions
-        .slots
-        .get_mut(key)
-        .and_then(|slot| slot.ting_authorization.as_mut())
-        .filter(|pending| pending.idempotency_key == operation)
-        .ok_or_else(|| {
-            Error::invalid(
-                "The consent request changed while this operation was running.",
-                "Run `spotify ting authorize` to inspect the current request.",
-            )
-        })?;
-    let id = value["request_id"]
-        .as_str()
-        .ok_or_else(|| Error::internal("The backend omitted the consent request ID."))?;
-    if pending
-        .request_id
-        .as_deref()
-        .is_some_and(|existing| existing != id)
-    {
-        return Err(Error::internal(
-            "The backend changed the consent request ID.",
-        ));
-    }
-    pending.request_id = Some(id.to_owned());
-    pending.response = Some(value.clone());
-    ctx.home.save_sessions(&sessions, &lock)
-}
-
-fn emit_authorization(ctx: &Ctx, value: &Value) {
-    ctx.emit(value, |v| {
-        let id = v["request_id"].as_str().unwrap_or("?");
-        if v["completed"] == true {
-            return format!("Ting consent {id} is complete. Run `spotify ting register` to enable notifications.");
-        }
-        let url = v.pointer("/authorization/authorization_url").or_else(|| v.pointer("/authorization/consent_url")).and_then(Value::as_str).unwrap_or("No approval URL is available; inspect `spotify ting status --json`.");
-        format!("Ting consent request {id}\nReview and approve as the represented user in IAM:\n{url}\nThen: spotify ting complete {id} --code-file /secure/consent-code\nDeclining keeps your login and existing work. Repeat `spotify ting authorize` to recover this request.")
-    });
 }
 
 async fn register_ting(ctx: &Ctx, key: &str, slot: &Slot) -> Result<()> {
@@ -495,7 +352,7 @@ async fn register_ting(ctx: &Ctx, key: &str, slot: &Slot) -> Result<()> {
         operation
     };
     let result = api
-        .register_ting(&slot.session.access_token, &slot.session.org_id, &attempt)
+        .register_ting(&slot.session.access_token, &attempt)
         .await;
     let registration = match &result {
         Ok(value) => silicon_spotify_client::api::TingRegistration {
@@ -564,7 +421,6 @@ pub async fn config(ctx: &Ctx, action: ConfigCommand) -> Result<()> {
             value["path"] = json!(ctx.home.config_path());
             value["env_overrides"] = json!({
                 "SPOTIFY_API_URL": std::env::var("SPOTIFY_API_URL").ok(),
-                "SILICON_ORG": std::env::var("SILICON_ORG").ok(),
                 "telemetry_kill_switch": silicon_spotify_client::telemetry::KILL_SWITCHES.iter().find(|k| std::env::var(k).is_ok_and(|v| silicon_spotify_client::telemetry::is_off(&v))),
             });
             ctx.emit(&value, |v| {
@@ -622,33 +478,6 @@ pub async fn config(ctx: &Ctx, action: ConfigCommand) -> Result<()> {
     Ok(())
 }
 
-/// `spotify testing …`.
-pub fn testing(ctx: &Ctx, action: TestingCommand) -> Result<()> {
-    match action {
-        TestingCommand::Use { app_secret_file } => {
-            let secret = read_token(&app_secret_file)?;
-            ctx.home.save_testing(Some(&secret))?;
-            let value = json!({"testing": true, "slot": store::slot_key(&ctx.api_url, Some(&silicon_spotify_client::api::Testing { app_secret: secret }))});
-            ctx.emit(&value, |_| "Testing plane selected. Log in inside it with `spotify login <SLT-or-test-public-id>`.".into());
-        }
-        TestingCommand::Status => {
-            let value = json!({"testing": ctx.testing.is_some(), "source": if std::env::var("SPOTIFY_TEST_APP_SECRET").is_ok() { "env" } else if ctx.testing.is_some() { "testing.json" } else { "none" }});
-            ctx.emit(&value, |v| {
-                if v["testing"] == Value::Bool(true) {
-                    "A testing plane is selected.".into()
-                } else {
-                    "Production (no testing plane selected).".into()
-                }
-            });
-        }
-        TestingCommand::Exit => {
-            ctx.home.save_testing(None)?;
-            ctx.emit(&json!({"testing": false}), |_| "Back to production.".into());
-        }
-    }
-    Ok(())
-}
-
 const PR_PREFIX: &str = "https://github.com/unlikefraction/spotify-cli/pull/";
 
 /// `spotify report`.
@@ -695,7 +524,7 @@ pub async fn report(ctx: &Ctx, message: &str, pr: Option<&str>, attach: &[PathBu
         "message": message,
         "pr": pr,
         "attachments": attachments,
-        "context": {"cli_version": VERSION, "os": std::env::consts::OS, "arch": std::env::consts::ARCH, "isi": ctx.isi, "daemon": daemon_version, "testing": ctx.testing.is_some()},
+        "context": {"cli_version": VERSION, "os": std::env::consts::OS, "arch": std::env::consts::ARCH, "isi": ctx.isi, "daemon": daemon_version},
     });
     let bearer = ctx
         .home
@@ -706,9 +535,7 @@ pub async fn report(ctx: &Ctx, message: &str, pr: Option<&str>, attach: &[PathBu
     let api = ctx.api()?;
     let sent = api
         .report(
-            bearer
-                .as_ref()
-                .map(|s| (s.session.access_token.as_str(), s.session.org_id.as_str())),
+            bearer.as_ref().map(|s| s.session.access_token.as_str()),
             &body,
             &key,
         )
@@ -754,14 +581,13 @@ fn attachment(ctx: &Ctx, path: &Path) -> Result<Value> {
         )
     };
     let canonical = std::fs::canonicalize(path).map_err(unreadable)?;
-    // This home's session and testing files, and those of any other home (`<home>/.spotify/`).
-    let secret = [ctx.home.session_path(), ctx.home.testing_path()]
+    // This home's session files and those of any other home (`<home>/.spotify/`).
+    let secret = [ctx.home.session_path()]
         .iter()
         .any(|p| std::fs::canonicalize(p).is_ok_and(|p| p == canonical))
         || [path, canonical.as_path()].iter().any(|p| {
             p.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new(".spotify"))
-                && p.file_name()
-                    .is_some_and(|name| name == "session.json" || name == "testing.json")
+                && p.file_name().is_some_and(|name| name == "session.json")
         });
     if secret {
         return Err(Error::invalid(
@@ -897,10 +723,10 @@ pub async fn doctor(ctx: &Ctx) -> Result<()> {
     // Backend reachability, whether it still supports this CLI (`min_cli`), and login. Both
     // requests run together; offline, the version check is simply left out.
     let api = ctx.api()?;
-    match tokio::join!(api.iam(), api.version()) {
+    match tokio::join!(api.accounts(), api.version()) {
         (Ok(value), version) => {
             let version = version.unwrap_or_else(|error| json!({"error": error}));
-            checks.push(json!({"check": "backend_reachable", "ok": value.get("app_id").and_then(Value::as_str) == Some(APP_ID), "detail": {"api_url": ctx.api_url, "iam": value, "version": version}, "fix": Value::Null}));
+            checks.push(json!({"check": "backend_reachable", "ok": value.get("app_id").and_then(Value::as_str) == Some(APP_ID), "detail": {"api_url": ctx.api_url, "accounts": value, "version": version}, "fix": Value::Null}));
             if let Some(check) = cli_version_check(&version, VERSION) {
                 checks.push(check);
             }
@@ -912,7 +738,7 @@ pub async fn doctor(ctx: &Ctx) -> Result<()> {
         .as_ref()
         .and_then(|s| s.session.ting.as_ref())
         .is_some_and(|t| t.subscribed);
-    checks.push(json!({"check": "iam_login", "ok": logged_in.is_some(), "detail": logged_in.as_ref().map(|s| &s.session.actor), "fix": if logged_in.is_some() { Value::Null } else { json!("Needed for Ting triggers: spotify login '<SLT>' (spotify login --help)") }, "optional": true}));
+    checks.push(json!({"check": "accounts_login", "ok": logged_in.is_some(), "detail": logged_in.as_ref().map(|s| &s.session.actor), "fix": if logged_in.is_some() { Value::Null } else { json!("Needed for Ting triggers: spotify login '<SLT>' (spotify login --help)") }, "optional": true}));
     checks.push(json!({"check": "ting_recipient", "ok": ting_ok, "detail": logged_in.as_ref().and_then(|s| s.session.ting.clone()), "fix": if ting_ok { Value::Null } else { json!("spotify ting register (after spotify login)") }, "optional": true}));
     let required_ok = checks.iter().all(|c| {
         c["ok"] == Value::Bool(true)
@@ -1113,8 +939,6 @@ fn clone_ctx(ctx: &Ctx) -> Ctx {
         home: ctx.home.clone(),
         config: ctx.config.clone(),
         api_url: ctx.api_url.clone(),
-        testing: ctx.testing.clone(),
-        org_flag: ctx.org_flag.clone(),
         telemetry: ctx.telemetry,
         trace_id: ctx.trace_id.clone(),
         isi: ctx.isi.clone(),
@@ -1164,115 +988,12 @@ pub async fn auth(ctx: &Ctx, action: AuthCommand) -> Result<()> {
 }
 
 /// `spotify update`.
-pub async fn update(ctx: &Ctx, check: bool) -> Result<()> {
-    let op = if check {
-        "update.check"
-    } else {
-        "update.apply"
-    };
-    let value = crate::daemon::call(ctx, op, json!({"settings": ctx.settings()})).await?;
-    ctx.emit(&value, |v| match v.get("manager").and_then(Value::as_str) {
-        Some("honeycomb") => format!(
-            "Installed by Honeycomb: {}",
-            v["note"].as_str().unwrap_or("")
-        ),
-        _ if v["update_available"] == Value::Bool(true) && v["restarting"] == Value::Bool(true) => {
-            format!(
-                "Updated {} → {}; the daemon restarted.",
-                VERSION,
-                v["latest"].as_str().unwrap_or("?")
-            )
-        }
-        _ if v["update_available"] == Value::Bool(true) => format!(
-            "Version {} is available (you have {VERSION}). Run `spotify update`.",
-            v["latest"].as_str().unwrap_or("?")
-        ),
-        _ => format!("Up to date ({VERSION})."),
+pub async fn update(ctx: &Ctx, _check: bool) -> Result<()> {
+    let value = json!({"current": VERSION, "manager": "silicon-apps", "command": "silicon-apps update spotify"});
+    ctx.emit(&value, |_| {
+        format!(
+            "Spotify {VERSION}. Silicon Apps manages updates: run `silicon-apps update spotify`."
+        )
     });
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn doctor_says_who_holds_the_warm_port() {
-        let detail = json!({"state": "running", "pid": 812, "port": 8080, "refresh_ms": 20000,
-            "serves_cli": true, "port_owner_pid_now": 999});
-        assert_eq!(
-            warm_check_state(&detail),
-            "running (pid 812, 127.0.0.1:8080, playback refresh every 20 s, serves spotify-cli); the port is held by pid 999 now"
-        );
-        // Before the note line, which stays on its own line.
-        let detail = json!({"state": "running", "pid": 812, "port": 8080, "serves_cli": null,
-            "note": "lsof could not confirm that this copy holds the client port.", "port_owner_pid_now": 7});
-        assert!(
-            warm_check_state(&detail).starts_with(
-                "running (pid 812, 127.0.0.1:8080); the port is held by pid 7 now\n    lsof"
-            ),
-            "{}",
-            warm_check_state(&detail)
-        );
-        // Its own copy, or no copy of its own (deferred): nothing to add.
-        let detail =
-            json!({"state": "starting", "pid": 812, "port": 8080, "port_owner_pid_now": 812});
-        assert!(!warm_check_state(&detail).contains("held by pid"));
-        let detail = json!({"state": "deferred", "port": 8080, "port_owner": {"pid": 5, "kind": "your_spotify_player"},
-            "port_owner_pid_now": 5});
-        assert!(
-            !warm_check_state(&detail).contains("now"),
-            "{}",
-            warm_check_state(&detail)
-        );
-    }
-
-    #[test]
-    fn doctor_flags_a_cli_older_than_min_cli() {
-        let version = json!({"version": "0.2.0", "api_versions": ["v1"], "min_cli": "0.1.0"});
-        let check = cli_version_check(&version, "0.1.1").expect("check");
-        assert_eq!(check["check"], "cli_version_supported");
-        assert_eq!(check["ok"], true);
-        assert!(check["fix"].is_null());
-        let check = cli_version_check(&json!({"min_cli": "0.3.0"}), "0.2.9").expect("check");
-        assert_eq!(check["ok"], false);
-        assert!(
-            check["fix"]
-                .as_str()
-                .expect("fix")
-                .starts_with("spotify update")
-        );
-        // An older backend without min_cli (or an unreachable one) adds no check.
-        assert!(cli_version_check(&json!({"error": {"code": "not_found"}}), "0.1.1").is_none());
-        assert!(cli_version_check(&json!({"min_cli": "soon"}), "0.1.1").is_none());
-    }
-
-    #[test]
-    fn attachments_are_text_only() {
-        assert_eq!(
-            attachment_text(b"line 1\nline 2\n", b"line 1\nline 2\n", false),
-            Some("line 1\nline 2\n")
-        );
-        // Binary: a NUL byte at the start (Mach-O, sqlite) or the end, or invalid UTF-8.
-        assert_eq!(
-            attachment_text(b"\xcf\xfa\xed\xfe\0\0", b"text", true),
-            None
-        );
-        assert_eq!(attachment_text(b"text", b"te\0xt", true), None);
-        assert_eq!(attachment_text(b"\xff\xfe", b"\xff\xfe", false), None);
-        // A character cut by the 64 KiB limit is dropped, not turned into U+FFFD or a refusal.
-        let tail = "é log line".as_bytes();
-        assert_eq!(
-            attachment_text(b"head", &tail[1..], true),
-            Some(" log line")
-        );
-        assert_eq!(attachment_text(b"head", &tail[1..], false), None);
-        // A last character still being written is dropped too; invalid bytes are not.
-        let text = "log line é".as_bytes();
-        assert_eq!(
-            attachment_text(b"log", &text[..text.len() - 1], false),
-            Some("log line ")
-        );
-        assert_eq!(attachment_text(b"log", b"log \xe9 line", false), None);
-    }
 }

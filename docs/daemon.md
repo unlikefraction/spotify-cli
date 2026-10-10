@@ -15,7 +15,7 @@ What it does:
 | Warm spotify_player | keeps one headless instance on a pseudo-terminal so Web API calls take ~20 ms, with its view of playback refreshed every 20 s ([below](#the-warm-spotify-player)) |
 | Library reads | retries a library or playlist read once after a network blip, and makes reads right after a change wait until they can see it ([below](#library-and-playlist-reads)) |
 | Telemetry relay | relays CLI and daemon events to the backend every minute, draining the whole backlog (when enabled) |
-| Updates | checks GitHub releases hourly and installs verified updates (script installs; Honeycomb updates its own installs) |
+| Updates | checks GitHub releases hourly and installs verified updates (script installs; Silicon Apps updates its own installs) |
 
 ## Commands
 
@@ -56,13 +56,13 @@ restarts it, so an updated binary takes over immediately.
   daemon.sqlite                triggers, firings/outbox, managed queue, tracker, settings (0600)
   daemon.log                   log (launchd and the CLI launcher append here)
   spotify-auth.log             output of `spotify auth login`
-  install.json                 written by the installer or Honeycomb: method, directory, version
+  install.json                 written by the installer or Silicon Apps: method, directory, version
   warm-player.json             pid and start time of the warm spotify_player this daemon started
 ~/Library/LaunchAgents/com.unlikefraction.spotify.daemon.plist
 ```
 
 Per Silicon home (`$SILICON_HOME/.spotify/`, else `~/.spotify/`): `config.json`, `session.json`,
-`session.lock`, `testing.json`. The daemon reads a home's session only to deliver that home's
+`session.lock`. The daemon reads a home's session only to deliver that home's
 triggers. Removing all of it: `spotify docs usage` (Uninstall).
 
 ## The warm spotify_player

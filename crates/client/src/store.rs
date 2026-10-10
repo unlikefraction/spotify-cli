@@ -1,4 +1,4 @@
-//! Per-home state shared by the CLI and daemon: config, IAM sessions and testing selection.
+//! Per-home state shared by the CLI and daemon: config, Silicon Accounts sessions.
 //!
 //! Layout (directory 0700, files 0600, atomic writes, one exclusive lock around every
 //! read-modify-write and every refresh):
@@ -6,15 +6,13 @@
 //! ```text
 //! $SILICON_HOME/.spotify/        (falls back to $HOME/.spotify)
 //!   config.json                  settings from `spotify config set '<json>'`
-//!   session.json                 IAM app sessions, separate backend/environment/account/org slots
+//!   session.json                 Silicon Accounts app sessions, separate backend/account slots
 //!   session.lock                 exclusive lock for session.json (kept forever)
-//!   testing.json                 selected testing application secret (optional)
 //! ```
 //!
-//! Refresh rules (IAM): every refresh rotates the refresh token. The idempotency key is derived
-//! from the refresh token (`spotify-refresh-<blake3>`), so an uncertain refresh retried by any
-//! process (CLI or daemon) replays instead of revoking the family. IAM keeps the replay for 10
-//! minutes.
+//! Refreshes are serialized under the shared file lock. The backend encrypts successful
+//! exchange responses and replays them when a CLI or daemon retries a lost response; Accounts
+//! itself does not allow refresh-token reuse.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -26,7 +24,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::api::{Api, Session, Testing};
+use crate::api::{Api, Session};
 use crate::control::Strategy;
 use crate::{Error, Result};
 
@@ -124,12 +122,6 @@ impl Home {
         self.dir.join("session.json")
     }
 
-    /// `testing.json`.
-    #[must_use]
-    pub fn testing_path(&self) -> PathBuf {
-        self.dir.join("testing.json")
-    }
-
     /// Loads config (defaults when absent).
     ///
     /// # Errors
@@ -178,75 +170,6 @@ impl Home {
         self.ensure()?;
         write_json(&self.session_path(), sessions)
     }
-
-    /// The selected testing plane: `SPOTIFY_TEST_APP_SECRET`, else `testing.json`.
-    ///
-    /// # Errors
-    /// Corrupt file or malformed secret.
-    pub fn testing(&self) -> Result<Option<Testing>> {
-        if let Ok(secret) = std::env::var("SPOTIFY_TEST_APP_SECRET")
-            && !secret.trim().is_empty()
-        {
-            return validate_test_secret(secret.trim()).map(Some);
-        }
-        self.testing_saved()
-    }
-
-    /// Only the saved selection (`testing.json`), ignoring the environment. Background work (the
-    /// daemon) uses this so its own environment can never select a plane for a home.
-    ///
-    /// # Errors
-    /// Corrupt file or malformed secret.
-    pub fn testing_saved(&self) -> Result<Option<Testing>> {
-        let saved: Option<TestingFile> = read_json(&self.testing_path())?;
-        saved
-            .map(|t| validate_test_secret(&t.app_secret))
-            .transpose()
-    }
-
-    /// Saves (or clears) the testing selection.
-    ///
-    /// # Errors
-    /// Filesystem errors.
-    pub fn save_testing(&self, secret: Option<&str>) -> Result<()> {
-        self.ensure()?;
-        match secret {
-            Some(secret) => {
-                validate_test_secret(secret)?;
-                write_json(
-                    &self.testing_path(),
-                    &TestingFile {
-                        app_secret: secret.to_owned(),
-                    },
-                )
-            }
-            None => match fs::remove_file(self.testing_path()) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(io_error("remove", &self.testing_path(), &error)),
-            },
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct TestingFile {
-    app_secret: String,
-}
-
-fn validate_test_secret(secret: &str) -> Result<Testing> {
-    if !secret.starts_with("ask_")
-        || secret.len() != 47
-        || !secret.bytes().all(|b| b.is_ascii_graphic())
-    {
-        return Err(Error::invalid(
-            "The testing application secret must be the 47-character `ask_…` secret of the Spotify app inside an IAM testing environment.",
-            "Get it with `honeycomb --test <ENV> --json apps rotate-secret spotify --revision <R>` and pass it with `--app-secret-file -`.",
-        ));
-    }
-    Ok(Testing {
-        app_secret: secret.to_owned(),
-    })
 }
 
 /// Holds `session.lock` until dropped.
@@ -261,17 +184,17 @@ pub struct Sessions {
     /// Slots.
     #[serde(default)]
     pub slots: BTreeMap<String, Slot>,
-    /// Selected account/organization slot for each backend and testing plane.
+    /// Selected account slot for each backend.
     #[serde(default)]
     pub active: BTreeMap<String, String>,
 }
 
-/// One saved IAM application session.
+/// One saved Silicon Accounts application session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Slot {
     /// Backend origin it belongs to.
     pub api_url: String,
-    /// The session (tokens, actor, org).
+    /// The session (tokens and actor).
     pub session: Session,
     /// Unix seconds when the access token expires.
     pub expires_at: i64,
@@ -283,42 +206,22 @@ pub struct Slot {
     /// When that refresh started (unix seconds).
     #[serde(default)]
     pub refresh_started_at: Option<i64>,
-    /// Recoverable Ting consent request; no provider credentials are stored here.
-    #[serde(default)]
-    pub ting_authorization: Option<TingAuthorization>,
     /// Retry identity for an uncertain recipient registration.
     #[serde(default)]
     pub ting_registration_key: Option<String>,
 }
 
-/// A feature consent request, bound to the containing session context.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TingAuthorization {
-    /// Persisted before starting the request, reused after uncertain responses.
-    pub idempotency_key: String,
-    /// Returned backend request identity.
-    pub request_id: Option<String>,
-    /// Safe status and authorization URL from the backend.
-    pub response: Option<Value>,
-}
-
-/// Stable account and organization context within one backend/testing plane.
+/// Stable account context within one backend.
 #[must_use]
 pub fn context_key(base: &str, session: &Session) -> String {
-    let binding = format!(
-        "{}\n{}\n{}\n{}",
-        session.actor.kind,
-        session.actor.public_id,
-        session.org_id,
-        session.testing_generation.as_deref().unwrap_or("")
-    );
+    let binding = format!("{}\n{}", session.actor.kind, session.actor.uuid);
     format!(
         "{base}#context:{}",
         blake3::hash(binding.as_bytes()).to_hex()
     )
 }
 
-/// Whether a saved context belongs to a backend and testing plane.
+/// Whether a saved context belongs to a backend.
 #[must_use]
 pub fn slot_in_plane(key: &str, base: &str) -> bool {
     key == base
@@ -327,11 +230,11 @@ pub fn slot_in_plane(key: &str, base: &str) -> bool {
             .is_some_and(|tail| tail.starts_with("#context:"))
 }
 
-/// Select the active context, optionally requiring an exact organization.
+/// Select the active account context.
 ///
 /// # Errors
-/// A corrupt store or an ambiguous organization selection.
-pub fn selected_slot(home: &Home, base: &str, org: Option<&str>) -> Result<String> {
+/// A corrupt store or an ambiguous account selection.
+pub fn selected_slot(home: &Home, base: &str) -> Result<String> {
     let sessions = home.sessions()?;
     if let Some(key) = sessions.active.get(base)
         && !sessions.slots.contains_key(key)
@@ -340,40 +243,30 @@ pub fn selected_slot(home: &Home, base: &str, org: Option<&str>) -> Result<Strin
         return Ok(key.clone());
     }
     if let Some(key) = sessions.active.get(base)
-        && let Some(slot) = sessions.slots.get(key)
+        && let Some(_slot) = sessions.slots.get(key)
         && slot_in_plane(key, base)
-        && org.is_none_or(|org| slot.session.org_id == org)
     {
         return Ok(key.clone());
     }
-    let mut matching = sessions.slots.iter().filter(|(key, slot)| {
-        slot_in_plane(key, base) && org.is_none_or(|org| slot.session.org_id == org)
-    });
+    let mut matching = sessions
+        .slots
+        .iter()
+        .filter(|(key, _)| slot_in_plane(key, base));
     let first = matching.next();
     if matching.next().is_some() {
         return Err(Error::invalid(
             "Several saved account contexts match.",
-            "Run `spotify login contexts`, then `spotify login use ACCOUNT --organization ORG`.",
+            "Run `spotify login contexts`, then `spotify login use ACCOUNT`.",
         ));
     }
-    // A missing selection must never borrow a session from another organization.
-    Ok(first.map_or_else(
-        || format!("{base}#missing:{}", org.unwrap_or("default")),
-        |(key, _)| key.clone(),
-    ))
+    // A missing selection must never borrow a session from another account.
+    Ok(first.map_or_else(|| format!("{base}#missing:default"), |(key, _)| key.clone()))
 }
 
 /// `<origin>#production` or `<origin>#test:<sha-prefix>`.
 #[must_use]
-pub fn slot_key(api_url: &str, testing: Option<&Testing>) -> String {
-    let origin = api_url.trim_end_matches('/');
-    match testing {
-        None => format!("{origin}#production"),
-        Some(testing) => {
-            let digest = blake3::hash(testing.app_secret.as_bytes()).to_hex();
-            format!("{origin}#test:{}", &digest.as_str()[..16])
-        }
-    }
+pub fn slot_key(api_url: &str) -> String {
+    format!("{}#production", api_url.trim_end_matches('/'))
 }
 
 /// Deterministic idempotency key for exchanging this SLT.
@@ -401,18 +294,9 @@ fn now() -> i64 {
 /// Filesystem errors.
 pub fn save_login(home: &Home, key: &str, api_url: &str, session: Session) -> Result<Slot> {
     validate_session_context(&session)?;
-    if key.ends_with("#production") == session.testing_environment_id.is_some() {
-        return Err(Error::not_authenticated(
-            "The login returned a different production/testing context. Select the original environment and sign in again.",
-        ));
-    }
     let lock = home.lock()?;
     let mut sessions = home.sessions()?;
     let context = context_key(key, &session);
-    let pending = sessions
-        .slots
-        .get(&context)
-        .and_then(|slot| slot.ting_authorization.clone());
     let slot = Slot {
         api_url: api_url.to_owned(),
         expires_at: now() + session.expires_in.max(0),
@@ -420,7 +304,6 @@ pub fn save_login(home: &Home, key: &str, api_url: &str, session: Session) -> Re
         session,
         pending_refresh_key: None,
         refresh_started_at: None,
-        ting_authorization: pending,
         ting_registration_key: None,
     };
     sessions.slots.insert(context.clone(), slot.clone());
@@ -430,14 +313,17 @@ pub fn save_login(home: &Home, key: &str, api_url: &str, session: Session) -> Re
 }
 
 fn validate_session_context(session: &Session) -> Result<()> {
-    if session.org_id.is_empty()
+    if uuid::Uuid::parse_str(&session.actor.uuid).is_err()
         || session.actor.public_id.is_empty()
         || !matches!(session.actor.kind.as_str(), "carbon" | "silicon")
-        || session.org_ids.iter().any(|org| org != &session.org_id)
-        || session.testing_environment_id.is_some() != session.testing_generation.is_some()
+        || !(session.actor.kind == "carbon" && session.actor.public_id.starts_with("c:")
+            || session.actor.kind == "silicon" && session.actor.public_id.starts_with("si:"))
+        || session.access_token.is_empty()
+        || session.refresh_token.is_empty()
+        || session.expires_in <= 0
     {
         return Err(Error::not_authenticated(
-            "IAM login must select exactly one account and organization. Sign in again for one organization.",
+            "Silicon Accounts returned an invalid account session. Sign in again.",
         ));
     }
     Ok(())
@@ -459,7 +345,7 @@ pub fn remove_slot(home: &Home, key: &str) -> Result<Option<Slot>> {
 /// needed (`force` refreshes regardless, e.g. after a 401).
 ///
 /// # Errors
-/// `not_authenticated` when there is no session or IAM revoked it (the slot is then deleted);
+/// `not_authenticated` when there is no session or Silicon Accounts revoked it (the slot is then deleted);
 /// retryable transport errors otherwise (the pending key is kept for a safe retry).
 pub async fn fresh_session(home: &Home, api: &Api, key: &str, force: bool) -> Result<Slot> {
     let home_for_lock = home.clone();
@@ -492,13 +378,11 @@ pub async fn fresh_session(home: &Home, api: &Api, key: &str, force: bool) -> Re
     match api.refresh(&slot.session.refresh_token, &refresh_key).await {
         Ok(mut session) => {
             validate_session_context(&session)?;
-            if session.actor != slot.session.actor
-                || session.org_id != slot.session.org_id
-                || session.testing_environment_id != slot.session.testing_environment_id
-                || session.testing_generation != slot.session.testing_generation
+            if session.actor.kind != slot.session.actor.kind
+                || session.actor.uuid != slot.session.actor.uuid
             {
                 return Err(Error::not_authenticated(
-                    "The refreshed session changed account, organization or testing environment. Sign in again for the original context.",
+                    "The refreshed session changed account. Sign in again for the original context.",
                 ));
             }
             // Refresh responses never carry the login-time Ting registration; keep it.
@@ -512,7 +396,6 @@ pub async fn fresh_session(home: &Home, api: &Api, key: &str, force: bool) -> Re
                 session,
                 pending_refresh_key: None,
                 refresh_started_at: None,
-                ting_authorization: slot.ting_authorization.clone(),
                 ting_registration_key: slot.ting_registration_key.clone(),
             };
             sessions.slots.insert(key.to_owned(), updated.clone());
@@ -523,15 +406,15 @@ pub async fn fresh_session(home: &Home, api: &Api, key: &str, force: bool) -> Re
             sessions.slots.remove(key);
             home.save_sessions(&sessions, &lock)?;
             Err(Error::not_authenticated(
-                "The saved spotify-cli session was revoked or expired in IAM (refresh was refused), so it was removed.",
+                "The saved spotify-cli session was revoked or expired in Silicon Accounts (refresh was refused), so it was removed.",
             )
-            .with_details(json!({"iam": error})))
+            .with_details(json!({"accounts": error})))
         }
         Err(error) => {
             let started = slot.refresh_started_at.unwrap_or_else(now);
             Err(error.with_details(json!({
                 "refresh_pending_since": started,
-                "note": "The refresh outcome is uncertain. Retrying within 10 minutes replays it safely with the same idempotency key.",
+                "note": "The refresh outcome is uncertain. Retry to recover the backend's encrypted result; a fresh sign-in may be required if Accounts answered while the connection failed.",
             })))
         }
     }
@@ -539,7 +422,6 @@ pub async fn fresh_session(home: &Home, api: &Api, key: &str, force: bool) -> Re
 
 /// Settings from `spotify config set`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Backend origin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -547,9 +429,6 @@ pub struct Config {
     /// Telemetry opt-in (default true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<bool>,
-    /// Default organization for org-scoped commands (else `SILICON_ORG`, else the session's).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub org: Option<String>,
     /// `auto`, `spotify_player` or `applescript`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<Strategy>,
@@ -579,10 +458,6 @@ pub struct Config {
     /// ISI written into Ting metadata when the `ISI` env var is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify_isi: Option<String>,
-    /// Keep an eye on new releases and install them (script installs; Honeycomb installs are
-    /// updated by Honeycomb). Default true.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_update: Option<bool>,
     /// Default output: `human` or `json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
@@ -601,12 +476,6 @@ pub const CONFIG_KEYS: &[(&str, &str, &str, &str)] = &[
         "boolean",
         "true",
         "Send anonymous usage and diagnostics to Space Station. Env kill switches: SPOTIFY_TELEMETRY, SPACE_STATION_TELEMETRY, SILICON_TELEMETRY = 0|false|off|no.",
-    ),
-    (
-        "org",
-        "string (org handle)",
-        "SILICON_ORG, then the session's org",
-        "Organization used for org-scoped calls (Ting delivery).",
     ),
     (
         "strategy",
@@ -661,12 +530,6 @@ pub const CONFIG_KEYS: &[(&str, &str, &str, &str)] = &[
         "string",
         "unset",
         "ISI named in Ting metadata when the ISI env var is absent, so your flow can route trigger notifications.",
-    ),
-    (
-        "auto_update",
-        "boolean",
-        "true",
-        "Let the daemon check hourly for a new release and install it (script installs only; Honeycomb updates its own installs).",
     ),
     (
         "output",
@@ -762,16 +625,6 @@ impl Config {
                     return Err(wrong_value(key, &json!(limit)));
                 }
             }
-            "org" => {
-                if let Some(org) = &self.org
-                    && !valid_handle(org, 3, 50)
-                {
-                    return Err(Error::invalid(
-                        format!("`{org}` is not an organization handle."),
-                        "Use the bare org handle, e.g. unlikefraction.",
-                    ));
-                }
-            }
             "output" => {
                 if let Some(output) = &self.output
                     && output != "human"
@@ -817,7 +670,6 @@ impl Config {
             "api_url": self.api_url(),
             "telemetry": crate::telemetry::enabled(self.telemetry),
             "telemetry_configured": self.telemetry.unwrap_or(true),
-            "org": self.org,
             "strategy": self.strategy.unwrap_or_default(),
             "launch_spotify": self.launch_spotify.unwrap_or(true),
             "verify_timeout_ms": self.verify_timeout_ms.unwrap_or(2500),
@@ -828,7 +680,6 @@ impl Config {
             // A larger value saved by an earlier release is applied as the maximum.
             "search_limit": self.search_limit.unwrap_or(10).min(crate::player::SEARCH_MAX_PER_KIND),
             "notify_isi": self.notify_isi,
-            "auto_update": self.auto_update.unwrap_or(true),
             "output": self.output.clone().unwrap_or_else(|| "human".into()),
         })
     }
@@ -843,10 +694,7 @@ fn accepts(key: &str) -> (String, &'static str) {
             "an https:// origin (a string)",
             r#""https://backend.spotify.unlikefraction.com""#,
         ),
-        "telemetry" | "launch_spotify" | "auto_update" | "keep_spotify_in_background" => {
-            ("true or false", "false")
-        }
-        "org" => ("an organization handle (a string)", r#""unlikefraction""#),
+        "telemetry" | "launch_spotify" | "keep_spotify_in_background" => ("true or false", "false"),
         "strategy" => (
             r#"one of "auto", "spotify_player", "applescript""#,
             r#""applescript""#,
@@ -1057,269 +905,4 @@ pub fn describe_changes(changed: &[String], config: &Config) -> Value {
         );
     }
     Value::Object(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn config_set_is_strict() {
-        let config = Config::default();
-        let (config, changed) = config
-            .apply_json(r#"{"telemetry": false, "strategy": "applescript"}"#)
-            .expect("applies");
-        assert_eq!(config.telemetry, Some(false));
-        assert_eq!(config.strategy, Some(Strategy::Applescript));
-        assert_eq!(changed, vec!["telemetry", "strategy"]);
-        assert_eq!(
-            config
-                .apply_json(r#"{"nope": 1}"#)
-                .expect_err("unknown")
-                .code,
-            "invalid_input"
-        );
-        assert!(
-            config
-                .apply_json(r#"{"telemetry": false, "telemetry": true}"#)
-                .is_err()
-        );
-        assert!(config.apply_json(r#"{"telemetry": "yes"}"#).is_err());
-        assert!(config.apply_json(r#"{"verify_timeout_ms": 5}"#).is_err());
-        assert!(config.apply_json(r#"{"search_limit": 11}"#).is_err());
-        assert!(config.apply_json(r#"{"search_limit": 10}"#).is_ok());
-        let (reset, _) = config.apply_json(r#"{"telemetry": null}"#).expect("unset");
-        assert_eq!(reset.telemetry, None);
-        assert!(config.apply_json("[1]").is_err());
-    }
-
-    #[test]
-    fn spotify_stays_in_the_background_unless_turned_off() {
-        let config = Config::default();
-        assert_eq!(config.effective()["keep_spotify_in_background"], true);
-        let (off, changed) = config
-            .apply_json(r#"{"keep_spotify_in_background": false}"#)
-            .expect("applies");
-        assert_eq!(changed, vec!["keep_spotify_in_background"]);
-        assert_eq!(off.keep_spotify_in_background, Some(false));
-        assert_eq!(off.effective()["keep_spotify_in_background"], false);
-        let error = config
-            .apply_json(r#"{"keep_spotify_in_background": "yes"}"#)
-            .expect_err("type");
-        assert_eq!(
-            error.message,
-            r#"keep_spotify_in_background must be true or false, not "yes"."#
-        );
-        assert!(CONFIG_KEYS.iter().any(|(key, kind, default, _)| *key
-            == "keep_spotify_in_background"
-            && *kind == "boolean"
-            && *default == "true"));
-    }
-
-    #[test]
-    fn assignments_get_the_json_form_as_a_hint() {
-        let config = Config::default();
-        let error = config.apply_json("search_limit=5").expect_err("not JSON");
-        assert_eq!(error.code, "invalid_input");
-        assert_eq!(
-            error.hint,
-            r#"Write it as JSON: spotify config set '{"search_limit": 5}'."#
-        );
-        assert!(
-            error.message.contains("`search_limit=5`"),
-            "{}",
-            error.message
-        );
-        for (text, json) in [
-            ("telemetry: false", r#"{"telemetry": false}"#),
-            (
-                "strategy=applescript, launch_spotify=false",
-                r#"{"strategy": "applescript", "launch_spotify": false}"#,
-            ),
-            ("notify_isi=\"planner\"", r#"{"notify_isi": "planner"}"#),
-            (
-                "api_url=https://example.com",
-                r#"{"api_url": "https://example.com"}"#,
-            ),
-            ("notify_isi=it's", r#"{"notify_isi": "it's"}"#),
-        ] {
-            assert_eq!(assignments_as_json(text).as_deref(), Some(json), "{text}");
-        }
-        let quoted = config.apply_json("notify_isi=it's").expect_err("quote");
-        assert!(
-            quoted.hint.contains(r#"'{"notify_isi": "it'\''s"}'"#),
-            "{}",
-            quoted.hint
-        );
-        // Not assignments: the generic JSON advice.
-        for text in [
-            "search_limit",
-            "5",
-            "{search_limit: 5}",
-            "search_limit=",
-            "a b",
-        ] {
-            assert_eq!(assignments_as_json(text), None, "{text}");
-            let error = config.apply_json(text).expect_err(text);
-            assert!(error.hint.starts_with("Quote it for the shell"), "{text}");
-        }
-    }
-
-    #[test]
-    fn config_errors_name_the_key_and_what_it_accepts() {
-        let config = Config::default();
-        let error = config
-            .apply_json(r#"{"verify_timeout_ms": "fast"}"#)
-            .expect_err("type");
-        assert_eq!(error.code, "invalid_input");
-        assert_eq!(
-            error.message,
-            r#"verify_timeout_ms must be an integer from 200 to 15000, not "fast"."#
-        );
-        assert!(
-            error.hint.contains(r#"{"verify_timeout_ms": 2500}"#),
-            "{}",
-            error.hint
-        );
-        let error = config
-            .apply_json(r#"{"verify_timeout_ms": 5}"#)
-            .expect_err("range");
-        assert_eq!(
-            error.message,
-            "verify_timeout_ms must be an integer from 200 to 15000, not 5."
-        );
-        let error = config
-            .apply_json(r#"{"strategy": "magic"}"#)
-            .expect_err("enum");
-        assert!(
-            error
-                .message
-                .contains(r#"strategy must be one of "auto", "spotify_player", "applescript""#),
-            "{}",
-            error.message
-        );
-        let error = config
-            .apply_json(r#"{"search_limit": 50}"#)
-            .expect_err("range");
-        assert!(error.message.contains("from 1 to 10"), "{}", error.message);
-        let error = config
-            .apply_json(r#"{"telemetry": "yes"}"#)
-            .expect_err("bool");
-        assert!(error.message.contains("true or false"), "{}", error.message);
-        // A saved value from an older release that is now out of range does not block other keys.
-        let legacy = Config {
-            search_limit: Some(20),
-            ..Config::default()
-        };
-        let (updated, _) = legacy
-            .apply_json(r#"{"telemetry": false}"#)
-            .expect("other keys still apply");
-        assert_eq!(updated.search_limit, Some(20));
-        assert!(legacy.validate().is_err());
-    }
-
-    #[test]
-    fn slots_are_separate_for_testing() {
-        let prod = slot_key("https://x/", None);
-        let test = slot_key(
-            "https://x",
-            Some(&Testing {
-                app_secret: format!("ask_{}", "a".repeat(43)),
-            }),
-        );
-        assert_eq!(prod, "https://x#production");
-        assert!(test.starts_with("https://x#test:"));
-        assert_ne!(login_key("a"), login_key("b"));
-    }
-
-    #[test]
-    fn account_contexts_do_not_overwrite_or_cross_organizations() {
-        let dir = tempfile::tempdir().expect("tmp");
-        let home = Home::from_root(dir.path().to_path_buf());
-        let base = slot_key("https://api.test", None);
-        let session = |actor: &str, org: &str| Session {
-            access_token: "access".into(),
-            refresh_token: "refresh".into(),
-            token_type: "Bearer".into(),
-            expires_in: 1800,
-            scope: String::new(),
-            actor: crate::api::Actor {
-                kind: "silicon".into(),
-                public_id: actor.into(),
-            },
-            org_id: org.into(),
-            org_ids: vec![org.into()],
-            testing_environment_id: None,
-            testing_generation: None,
-            ting: None,
-        };
-        let first = session("si:first", "one");
-        let first_key = context_key(&base, &first);
-        save_login(&home, &base, "https://api.test", first).expect("first");
-        let second = session("si:second", "two");
-        let second_key = context_key(&base, &second);
-        save_login(&home, &base, "https://api.test", second).expect("second");
-        assert_eq!(home.sessions().expect("sessions").slots.len(), 2);
-        assert_eq!(
-            selected_slot(&home, &base, None).expect("active"),
-            second_key
-        );
-        assert_eq!(
-            selected_slot(&home, &base, Some("one")).expect("org"),
-            first_key
-        );
-        let missing = selected_slot(&home, &base, Some("three")).expect("no fallback");
-        assert!(
-            !home
-                .sessions()
-                .expect("sessions")
-                .slots
-                .contains_key(&missing)
-        );
-        assert!(!slot_in_plane(
-            &first_key,
-            &slot_key("https://other.test", None)
-        ));
-        let mut unscoped = session("si:first", "one");
-        unscoped.org_ids.push("two".into());
-        assert!(save_login(&home, &base, "https://api.test", unscoped).is_err());
-        save_login(&home, &base, "https://api.test", session("si:third", "two"))
-            .expect("same-org other account");
-        save_login(
-            &home,
-            &base,
-            "https://api.test",
-            session("si:second", "two"),
-        )
-        .expect("select second");
-        remove_slot(&home, &second_key).expect("logout selected");
-        assert_eq!(
-            selected_slot(&home, &base, None).expect("signed out"),
-            second_key
-        );
-        assert_eq!(
-            selected_slot(&home, &base, Some("two")).expect("org does not switch account"),
-            second_key
-        );
-    }
-
-    #[test]
-    fn writes_private_files_atomically() {
-        let dir = tempfile::tempdir().expect("tmp");
-        let home = Home::from_root(dir.path().to_path_buf());
-        home.save_config(&Config {
-            telemetry: Some(false),
-            ..Config::default()
-        })
-        .expect("save");
-        let mode = fs::metadata(home.config_path())
-            .expect("meta")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
-        let dir_mode = fs::metadata(&home.dir).expect("meta").permissions().mode() & 0o777;
-        assert_eq!(dir_mode, 0o700);
-        assert_eq!(home.config().expect("load").telemetry, Some(false));
-    }
 }

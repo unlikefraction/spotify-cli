@@ -54,11 +54,9 @@ Explore:
   spotify docs                         Offline guides (usage, triggers, playback, errors, …)
   spotify completions --help           Tab completion for zsh, bash, fish and PowerShell
 
-Authentication (Silicons; needed for triggers):
-  spotify iam --json                   Discover the IAM app id (spotify) before minting an SLT
-  cargo install silicon-iam-cli        Get `iam`: Silicon IAM's own CLI, separate from spotify-cli
-  iam silicon-login --sid si:<handle>  Once per SILICON_HOME: the Silicon's own IAM sign-in
-  iam silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes
+Authentication (Carbons and Silicons; needed for triggers):
+  spotify accounts --json              Discover the app and Silicon Accounts URLs
+  silicon-accounts login --app spotify --json | jq -r .slt | spotify login --token-file -
   spotify login '<SLT>'                Exchange the short-lived token
   spotify login status --json          Verify the saved identity (live)
   spotify auth login                   Separately: sign spotify_player in to Spotify (browser, once)
@@ -104,9 +102,6 @@ pub struct Global {
     /// Print one JSON value on stdout (errors as one JSON object on stderr).
     #[arg(long, global = true, help_heading = GLOBAL)]
     pub json: bool,
-    /// Organization for org-scoped calls (default: SILICON_ORG, then config `org`, then the session's).
-    #[arg(long, global = true, value_name = "ORG", help_heading = GLOBAL)]
-    pub org: Option<String>,
     /// Backend origin (default: SPOTIFY_API_URL, then config `api_url`, then production).
     #[arg(
         long,
@@ -327,20 +322,19 @@ pub enum Command {
     },
 
     // ---------------------------------------------------------------- accounts
-    /// IAM discovery: app id, owning org, scopes, URLs (works offline, before login).
+    /// Silicon Accounts discovery: app id, owner and service URLs (offline).
     #[command(
-        after_help = "Examples:\n  spotify iam\n  spotify iam --json | jq -r .app_id\n  cargo install silicon-iam-cli       The iam CLI itself (Silicon IAM's, separate)\n\nStemcell and agents run `spotify iam --json` to learn the app id before minting an SLT with `iam`, Silicon IAM's own CLI (separate from spotify-cli; get it with `cargo install silicon-iam-cli`):\n  iam silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes\n\n`iam` mints for the Silicon whose SILICON_HOME it runs with (its session: $SILICON_HOME/.silicon-iam). In a fresh SILICON_HOME it has no session and refuses to mint: sign that Silicon in to IAM once with its own credential first, `iam silicon-login --sid si:<handle>` (it asks for the Silicon's STK), then mint as above and run `spotify login '<SLT>'`. Details: spotify docs auth."
+        after_help = "Examples:\n  spotify accounts --json\n  silicon-accounts login --app spotify --json | jq -r .slt | spotify login --token-file -"
     )]
-    Iam,
-    /// Log in with an IAM short-lived token (SLT) so triggers can Ting you.
+    Accounts,
+    /// Sign in as a Carbon or Silicon using a Silicon Accounts short-lived token.
     #[command(
-        args_conflicts_with_subcommands = true,
         subcommand_precedence_over_arg = true,
-        long_about = "Exchanges an IAM short-lived token (SLT, ~2 minutes, single use) through the spotify-cli backend for an app session, saved in $SILICON_HOME/.spotify/session.json (0600), for exactly one account and organization. Ting notifications require separate feature consent (`spotify ting authorize`). The CLI never asks for passwords, OTPs or SID/STK: only the SLT.\n\nMint the SLT with `iam`, Silicon IAM's own CLI (a separate program, not part of spotify-cli; get it with `cargo install silicon-iam-cli`), or with the web consent screen:\n  Silicon: iam silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes\n  Carbon:  iam login --app-id spotify --grant-org <org>\n\n`iam` keeps its own session in $SILICON_HOME/.silicon-iam and mints for the Silicon whose SILICON_HOME it runs with. In a fresh SILICON_HOME it has no session and refuses to mint: first sign that Silicon in to IAM once with its own credential, `iam silicon-login --sid si:<handle>` (it asks for the Silicon's STK), then mint as above. Details: spotify docs auth.",
-        after_help = "Examples:\n  cargo install silicon-iam-cli        Once: the iam CLI (Silicon IAM's, separate)\n  iam silicon-login --sid si:<handle>  Once per SILICON_HOME: the Silicon's own IAM sign-in\n  spotify login 'oac_…'\n  iam -o json silicon-login --app-id spotify --grant-org \"$SILICON_ORG\" --approve-scopes \\\n    | jq -r .slt | spotify login --token-file -\n  spotify login status --json\n\nThe exchange uses an idempotency key derived from the SLT, so retrying after a network error replays instead of burning the token.\n\nNext: spotify ting authorize"
+        long_about = "Exchanges a Silicon Accounts short-lived token for a persistent account session. Tokens are saved in $SILICON_HOME/.spotify/session.json (0600), or $HOME/.spotify. The CLI and daemon share the session and refresh it until its fixed expiry or logout. Playback's Spotify sign-in is separate: spotify auth login.",
+        after_help = "Examples:\n  silicon-accounts login --app spotify --json | jq -r .slt | spotify login --token-file -\n  spotify login 'slt_…'\n  spotify login status\n  spotify login contexts\n  spotify login use si:planner\n\nNext: spotify ting register"
     )]
     Login(LoginArgs),
-    /// Log out: revoke the session in IAM and delete it locally.
+    /// Log out: revoke the session in Silicon Accounts and delete it locally.
     #[command(
         after_help = "Examples:\n  spotify logout\n  spotify logout --json | jq .revoked\n\nLogging out when not logged in succeeds too."
     )]
@@ -355,7 +349,7 @@ pub enum Command {
     },
     /// Sign spotify_player in to Spotify (once, in a browser) for search, lyrics, playlists.
     #[command(
-        long_about = "spotify_player needs its own Spotify sign-in (OAuth in the browser) for search, lyrics, playlists, library, devices and queue reads. `spotify auth login` starts it; a Carbon clicks Agree once on this Mac, then tokens are cached and refreshed by spotify_player. This is separate from `spotify login`, which is your IAM identity.",
+        long_about = "spotify_player needs its own Spotify sign-in (OAuth in the browser) for search, lyrics, playlists, library, devices and queue reads. `spotify auth login` starts it; a Carbon clicks Agree once on this Mac, then tokens are cached and refreshed by spotify_player. This is separate from `spotify login`, which is your Silicon Accounts identity.",
         after_help = "Examples:\n  spotify auth status                   Is spotify_player signed in?\n  spotify auth status --json | jq .authenticated\n  spotify auth login                    Opens Spotify's consent page in a browser on this Mac\n\nA headless Silicon cannot click Agree: ask a Carbon at this Mac to run `spotify auth login` once (spotify auth login --help)."
     )]
     Auth {
@@ -372,14 +366,7 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigCommand,
     },
-    /// Select or leave an IAM testing environment (isolated plane, same code paths).
-    #[command(
-        after_help = "Examples:\n  printf %s \"$TEST_APP_SECRET\" | spotify testing use --app-secret-file -\n  spotify login c:alice           In a testing plane an SLT may be a test public id\n  spotify testing status\n  spotify testing exit\n\nThe env var SPOTIFY_TEST_APP_SECRET selects a plane for one process."
-    )]
-    Testing {
-        #[command(subcommand)]
-        action: TestingCommand,
-    },
+
     /// Check Spotify.app, spotify_player, permissions, daemon, login, and how to fix each.
     #[command(
         after_help = "Examples:\n  spotify doctor\n  spotify doctor --json | jq '.checks[] | select(.ok == false)'\n\nExits 1 (doctor_failed) while a required check fails; every failing check has a `fix`.\n\nNext: spotify setup"
@@ -387,7 +374,7 @@ pub enum Command {
     Doctor,
     /// Install what is missing, run the daemon at login, start the Spotify sign-in.
     #[command(
-        after_help = "Examples:\n  spotify setup\n  spotify setup --check                 Only report\n  spotify setup --install-apps --no-auth\n\nWhat it does (idempotent):\n  1. Checks macOS, Spotify.app (installs with `brew install --cask spotify` when --install-apps)\n  2. Installs spotify_player with Homebrew when missing\n  3. Installs the launchd agent and starts spotify-daemon\n  4. If spotify_player is not signed in, starts `spotify auth login` (browser)\n\nIt never logs you in to IAM; run `spotify login '<SLT>'` for triggers."
+        after_help = "Examples:\n  spotify setup\n  spotify setup --check                 Only report\n  spotify setup --install-apps --no-auth\n\nWhat it does (idempotent):\n  1. Checks macOS, Spotify.app (installs with `brew install --cask spotify` when --install-apps)\n  2. Installs spotify_player with Homebrew when missing\n  3. Installs the launchd agent and starts spotify-daemon\n  4. If spotify_player is not signed in, starts `spotify auth login` (browser)\n\nIt never logs you in to Silicon Accounts; run `spotify login '<SLT>'` for triggers."
     )]
     Setup {
         /// Only check; change nothing.
@@ -450,9 +437,9 @@ pub enum Command {
         after_help = "Examples:\n  spotify commands                 By goal; ✎ marks the commands that change something\n  spotify commands --json          Every command, machine-readable (mutates, changes, needs, …)\n  spotify commands --json | jq '.commands[] | select(.path == \"lyrics\")'\n  spotify commands --json | jq -r '.commands[] | select(.mutates == false).command'  Read-only\n  spotify commands --json | jq -r '.commands[] | select(.has_read_only_form).command'\n  spotify commands --json | jq -r '.commands[] | select(.changes | index(\"library\")).command'\n  spotify commands --json | jq -r '.commands[].examples[].command'\n\n`mutates` is false for a command that only reads. For one that can change something, `read_only_when` names its form that only reads, if any (volume without a level, search without --play, setup and update with --check). `has_read_only_form` is true when either holds: select(.has_read_only_form) is the same as select(.mutates == false or .read_only_when != null). `changes` says what can change: `library` is your Liked Songs (like, unlike); playlists are `playlists`.\n\nNext: spotify how \"<what you want to do>\""
     )]
     Commands,
-    /// Check for a new version and install it (updates are also automatic).
+    /// Show the current version and Silicon Apps update command.
     #[command(
-        after_help = "Examples:\n  spotify update --check      Only report\n  spotify update"
+        after_help = "Examples:\n  spotify update --check      Report version\n  silicon-apps update spotify"
     )]
     Update {
         /// Only report; do not install.
@@ -946,7 +933,7 @@ pub enum ScopeArg {
 
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// The IAM short-lived token.
+    /// The Silicon Accounts short-lived token.
     #[arg(value_name = "SLT")]
     pub slt: Option<String>,
     /// Read the SLT from a file, or `-` for stdin (keeps it out of shell history).
@@ -963,46 +950,25 @@ pub enum LoginCommand {
         after_help = "Examples:\n  spotify login status\n  spotify login status --json | jq .authenticated"
     )]
     Status,
-    /// List saved account and organization contexts for this backend and testing plane.
+    /// List saved account contexts for this backend.
     #[command(after_help = "Examples:\n  spotify login contexts\n  spotify login contexts --json")]
     Contexts,
-    /// Select a saved account and organization without changing existing triggers.
-    #[command(after_help = "Examples:\n  spotify login use si:planner --organization tos")]
+    /// Select a saved account without changing existing triggers.
+    #[command(after_help = "Examples:\n  spotify login use si:planner")]
     Use {
-        /// IAM public account ID, such as si:planner or c:alice.
+        /// Silicon Accounts public account ID, such as si:planner or c:alice.
         account: String,
-        /// Exact organization selected during this account's login.
-        #[arg(long)]
-        organization: String,
     },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum TingCommand {
-    /// Request separate IAM consent for Ting notifications; prints the approval URL.
-    #[command(
-        after_help = "Examples:\n  spotify ting authorize\n  spotify ting authorize --new\n\nRepeat without --new to recover an interrupted request. Only the represented user can approve in IAM."
-    )]
-    Authorize {
-        /// Explicitly replace an expired, rejected or revoked request.
-        #[arg(long)]
-        new: bool,
-    },
-    /// Complete an approved request with its one-use code, then register as a recipient.
-    #[command(
-        after_help = "Examples:\n  spotify ting complete REQUEST_ID --code-file /secure/consent-code\n\nKeep the code file until success. Repeating this exact command safely recovers a lost response."
-    )]
-    Complete {
-        request_id: String,
-        #[arg(long, value_name = "PATH|-")]
-        code_file: PathBuf,
-    },
-    /// Register (or re-activate) this Silicon as a Ting recipient for spotify-cli.
-    #[command(after_help = "Examples:\n  spotify ting register")]
-    Register,
-    /// Show the registration and live status of any saved consent request.
-    #[command(after_help = "Examples:\n  spotify ting status\n  spotify ting status --json")]
+    /// Verify the signed-in Carbon or Silicon and register for Ting notifications.
+    Authorize,
+    /// Show this account's Ting recipient registration.
     Status,
+    /// Register this account for Ting notifications using Silicon Accounts user verification.
+    Register,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1014,7 +980,7 @@ pub enum AuthCommand {
     Status,
     /// Start spotify_player's browser sign-in (a Carbon clicks Agree once).
     #[command(
-        long_about = "Signs spotify_player in to Spotify, once per macOS user. The daemon starts `spotify_player authenticate`, which opens Spotify's consent page in the default browser on this Mac. A Carbon clicks Agree once; the page then returns to a local address on this Mac (127.0.0.1:8989), and spotify_player caches the tokens (~/.cache/spotify-player) and refreshes them from then on. Every Silicon home of this macOS user shares that sign-in. It is separate from `spotify login` (your IAM identity).\n\nA headless Silicon cannot click Agree: ask a Carbon at this Mac to run `spotify auth login` (or run it yourself and ask them to click Agree in the tab it opens), once. The consent completes only in a browser on this Mac, not from another machine. Until then playback still works through AppleScript (Spotify.app comes forward for a moment at each start), and search, lyrics, playlists, library, devices and queue reads fail with spotify_auth_required.",
+        long_about = "Signs spotify_player in to Spotify, once per macOS user. The daemon starts `spotify_player authenticate`, which opens Spotify's consent page in the default browser on this Mac. A Carbon clicks Agree once; the page then returns to a local address on this Mac (127.0.0.1:8989), and spotify_player caches the tokens (~/.cache/spotify-player) and refreshes them from then on. Every Silicon home of this macOS user shares that sign-in. It is separate from `spotify login` (your Silicon Accounts identity).\n\nA headless Silicon cannot click Agree: ask a Carbon at this Mac to run `spotify auth login` (or run it yourself and ask them to click Agree in the tab it opens), once. The consent completes only in a browser on this Mac, not from another machine. Until then playback still works through AppleScript (Spotify.app comes forward for a moment at each start), and search, lyrics, playlists, library, devices and queue reads fail with spotify_auth_required.",
         after_help = "Examples:\n  spotify auth login                    Opens Spotify's consent page in a browser on this Mac\n  spotify auth status                   Then check that the sign-in took\n  spotify auth status --json | jq .authenticated\n\nspotify_player's output goes to ~/.silicon-spotify/spotify-auth.log.\n\nNext: spotify auth status"
     )]
     Login,
@@ -1050,25 +1016,6 @@ pub enum ConfigCommand {
     /// Delete all settings (back to defaults).
     #[command(after_help = "Examples:\n  spotify config reset")]
     Reset,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum TestingCommand {
-    /// Select a testing plane by its spotify-cli test app secret.
-    #[command(
-        after_help = "Examples:\n  printf %s \"$TEST_APP_SECRET\" | spotify testing use --app-secret-file -\n  spotify testing use --app-secret-file ./test-app-secret.txt"
-    )]
-    Use {
-        /// File with the `ask_…` test secret, or `-` for stdin.
-        #[arg(long, value_name = "PATH|-")]
-        app_secret_file: PathBuf,
-    },
-    /// Show the selected plane.
-    #[command(after_help = "Examples:\n  spotify testing status\n  spotify testing status --json")]
-    Status,
-    /// Return to production.
-    #[command(after_help = "Examples:\n  spotify testing exit")]
-    Exit,
 }
 
 #[derive(Debug, Subcommand)]

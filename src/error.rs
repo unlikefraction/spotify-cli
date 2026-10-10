@@ -58,7 +58,7 @@ impl AppError {
         )
     }
 
-    /// 401 `slt_rejected`: IAM refused the short-lived login token itself.
+    /// 401 `slt_rejected`: Silicon Accounts refused the short-lived login token itself.
     ///
     /// 401 like `unauthenticated`, so clients that only branch on the status still treat it as
     /// "not signed in"; the code and hint name the SLT instead of a session refresh.
@@ -66,8 +66,8 @@ impl AppError {
         Self::new(
             StatusCode::UNAUTHORIZED,
             "slt_rejected",
-            "IAM rejected the short-lived login token (SLT): it expired (SLTs last about 2 minutes), was already used, or was minted for another app.",
-            "Mint a fresh SLT for app `spotify` and log in right away: iam silicon-login --app-id spotify --grant-org <org> --approve-scopes, then spotify login '<SLT>'.",
+            "Silicon Accounts rejected the short-lived login token (SLT): it expired (SLTs last about 2 minutes), was already used, or was minted for another app.",
+            "Mint a fresh SLT for app `spotify` and log in right away: silicon-accounts login --app spotify --json, then spotify login '<SLT>'.",
         )
     }
 
@@ -76,7 +76,7 @@ impl AppError {
         Self::new(StatusCode::FORBIDDEN, "forbidden", message, hint)
     }
 
-    /// 503 for an upstream (IAM, Ting) problem; never a user logout.
+    /// 503 for an upstream (Silicon Accounts, Ting) problem; never a user logout.
     pub fn dependency(name: &str) -> Self {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
