@@ -1,4 +1,4 @@
-//! Silicon Accounts sessions and user verification proofs, scoped to a Carbon or Silicon.
+//! Silicon Accounts sessions and Ting proofs, with recipient authority bound to an account UUID.
 use crate::config::Settings;
 use crate::error::{AppError, AppResult};
 use async_trait::async_trait;
@@ -381,10 +381,25 @@ impl Identity for Accounts {
         _body: &[u8],
         _attempt_key: &str,
     ) -> AppResult<TingAccess> {
-        let value = self.response(self.request("/v1/proofs/user-verification")?.json(&json!({"subject_token": context.token.expose_secret(), "receiving_app": "ting", "scopes": [endpoint.id()], "access_ttl_seconds": 600}))).await?;
-        if value["receiving_app"] != "ting"
-            || value.pointer("/user/id").and_then(Value::as_str)
-                != Some(context.actor.public_id.as_str())
+        let (path, kind) = match endpoint {
+            TingEndpoint::Register => ("/v1/proofs/user-verification", "user_verification"),
+            TingEndpoint::Send => ("/v1/proofs/app-verification", "app_verification"),
+        };
+        let mut request =
+            json!({"receiving_app": "ting", "scopes": [endpoint.id()], "access_ttl_seconds": 600});
+        if matches!(endpoint, TingEndpoint::Register) {
+            request["subject_token"] = json!(context.token.expose_secret());
+        }
+        let value = self.response(self.request(path)?.json(&request)).await?;
+        if value["kind"] != kind
+            || value["issuing_app"] != self.app_id
+            || value["receiving_app"] != "ting"
+            || !value["scopes"]
+                .as_array()
+                .is_some_and(|scopes| scopes.iter().any(|scope| scope == endpoint.id()))
+            || matches!(endpoint, TingEndpoint::Register)
+                && value.pointer("/user/uuid").and_then(Value::as_str)
+                    != Some(context.actor.uuid.as_str())
         {
             return Err(AppError::dependency("accounts"));
         }

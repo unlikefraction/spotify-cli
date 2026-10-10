@@ -16,7 +16,7 @@ pub const MAX_SEND_BYTES: usize = 256 * 1024;
 /// HTTP transport to Ting.
 #[async_trait]
 pub trait TingApi: Send + Sync {
-    /// POSTs exact bytes with a Silicon Accounts user verification proof; returns (status, JSON body).
+    /// POSTs exact bytes with a Silicon Accounts verification proof; returns (status, JSON body).
     async fn post(&self, path: &str, body: Vec<u8>, proof: &TingAccess) -> AppResult<(u16, Value)>;
 }
 
@@ -54,7 +54,7 @@ impl TingApi for TingHttp {
             .header("Ting-Client-Version", env!("CARGO_PKG_VERSION"))
             .header(
                 reqwest::header::AUTHORIZATION,
-                format!("Proof {}", proof.token.expose_secret()),
+                format!("Bearer {}", proof.token.expose_secret()),
             )
             .body(body);
         let response = request
@@ -156,7 +156,8 @@ pub async fn register(
     if !matches!(status, 200 | 201) {
         return Err(ting_error(status, &value));
     }
-    if value.get("for").and_then(Value::as_str) != Some(proof.actor.public_id.as_str())
+    if value.get("for").and_then(Value::as_str) != Some(proof.actor.uuid.as_str())
+        || value.get("app_id").and_then(Value::as_str) != Some(app_id)
         || value.get("active") != Some(&Value::Bool(true))
     {
         return Err(AppError::dependency("ting"));
@@ -265,6 +266,6 @@ pub async fn send(
 
 fn provider_body(body: &[u8], proof: &TingAccess) -> AppResult<Vec<u8>> {
     let mut value: Value = serde_json::from_slice(body).map_err(AppError::internal)?;
-    value["for"] = json!(proof.actor.public_id);
+    value["for"] = json!(proof.actor.uuid);
     serde_json::to_vec(&value).map_err(AppError::internal)
 }
