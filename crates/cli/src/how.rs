@@ -1764,10 +1764,6 @@ fn volume_example(raw: &[String]) -> Option<catalog::Example> {
 const SETTING_KEYWORDS: &[(&str, &[&str])] = &[
     ("api_url", &["backend url", "server url", "backend"]),
     (
-        "telemetry",
-        &["usage data", "analytics", "tracking", "diagnostics"],
-    ),
-    (
         "strategy",
         &[
             "applescript only",

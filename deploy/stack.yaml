@@ -86,7 +86,7 @@ Resources:
           dnf install -y python3 sqlite
           useradd --system --home-dir /var/lib/spotify --shell /sbin/nologin spotify
           useradd --system --home-dir /var/lib/caddy --shell /sbin/nologin caddy
-          install -d -o spotify -g spotify -m 0700 /var/lib/spotify /var/lib/spotify/telemetry
+          install -d -o spotify -g spotify -m 0700 /var/lib/spotify
           install -d -o caddy -g caddy -m 0700 /var/lib/caddy
           install -d -m 0700 /etc/spotify
           install -d -m 0755 /opt/spotify/releases /etc/caddy /etc/systemd/journald.conf.d

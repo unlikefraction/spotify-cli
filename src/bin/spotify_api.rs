@@ -22,13 +22,11 @@ async fn main() -> anyhow::Result<()> {
     let settings = silicon_spotify::config::Settings::from_env()?;
     let bind = settings.bind;
     let state = silicon_spotify::api::production(settings)?;
-    let telemetry = state.telemetry.clone();
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, version = env!("CARGO_PKG_VERSION"), "spotify-cli backend listening");
     axum::serve(listener, silicon_spotify::api::router(state))
         .with_graceful_shutdown(shutdown())
         .await?;
-    telemetry.flush();
     Ok(())
 }
 

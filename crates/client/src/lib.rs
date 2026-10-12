@@ -35,7 +35,6 @@ pub mod error;
 pub mod focus;
 pub mod model;
 pub mod player;
-pub mod telemetry;
 pub mod timing;
 pub mod trigger;
 pub mod uri;
@@ -98,4 +97,13 @@ pub fn valid_handle(value: &str, min: usize, max: usize) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// Whether an environment switch explicitly means "off".
+#[must_use]
+pub fn is_off(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
 }

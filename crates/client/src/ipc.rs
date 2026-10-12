@@ -5,7 +5,7 @@
 //! database, not `$HOME`/`$SILICON_HOME`), or `$SPOTIFY_DAEMON_HOME` when set.
 //!
 //! Request: `{"v":1,"id":"<uuid>","op":"player.pause","home":"/abs/silicon/home","args":{…},
-//! "client_version":"0.1.0","trace_id":"…","isi":"planner"}`
+//! "client_version":"0.1.0","isi":"planner"}`
 //! Reply: `{"v":1,"id":"<same>","ok":true,"data":{…}}` or `{"v":1,"id":"…","ok":false,"error":{…}}`.
 //! Unknown ops are refused by name. The socket is 0600 inside a 0700 directory, and both sides
 //! check that the peer runs as the same uid.
@@ -43,9 +43,6 @@ pub struct Request {
     /// Caller's version (the CLI restarts an older daemon).
     #[serde(default)]
     pub client_version: String,
-    /// Trace id for telemetry.
-    #[serde(default)]
-    pub trace_id: Option<String>,
     /// The caller's ISI, when known.
     #[serde(default)]
     pub isi: Option<String>,

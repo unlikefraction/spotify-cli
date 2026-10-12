@@ -402,10 +402,6 @@ pub async fn config(ctx: &Ctx, action: ConfigCommand) -> Result<()> {
             ctx.home.save_config(&config)?;
             let value = json!({"updated": store::describe_changes(&changed, &config), "path": ctx.home.config_path()});
             let next = vec!["spotify config show".to_owned()];
-            if changed.iter().any(|k| k == "telemetry") && config.telemetry == Some(false) {
-                // Clear a running daemon's backlog; never start one just for this.
-                let _ = crate::daemon::call_if_running(ctx, "telemetry.clear", json!({})).await;
-            }
             ctx.emit(&value, |v| {
                 format!(
                     "Saved {} to {}.",
@@ -421,7 +417,6 @@ pub async fn config(ctx: &Ctx, action: ConfigCommand) -> Result<()> {
             value["path"] = json!(ctx.home.config_path());
             value["env_overrides"] = json!({
                 "SPOTIFY_API_URL": std::env::var("SPOTIFY_API_URL").ok(),
-                "telemetry_kill_switch": silicon_spotify_client::telemetry::KILL_SWITCHES.iter().find(|k| std::env::var(k).is_ok_and(|v| silicon_spotify_client::telemetry::is_off(&v))),
             });
             ctx.emit(&value, |v| {
                 serde_json::to_string_pretty(v).unwrap_or_default()
@@ -939,10 +934,7 @@ fn clone_ctx(ctx: &Ctx) -> Ctx {
         home: ctx.home.clone(),
         config: ctx.config.clone(),
         api_url: ctx.api_url.clone(),
-        telemetry: ctx.telemetry,
-        trace_id: ctx.trace_id.clone(),
         isi: ctx.isi.clone(),
-        command: ctx.command.clone(),
     }
 }
 

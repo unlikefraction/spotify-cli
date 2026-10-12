@@ -320,7 +320,7 @@ impl Hints {
     #[must_use]
     pub fn from_env(value: Option<&str>) -> Self {
         match value.map(|v| v.trim().to_ascii_lowercase()) {
-            Some(v) if silicon_spotify_client::telemetry::is_off(&v) => Self::Off,
+            Some(v) if silicon_spotify_client::is_off(&v) => Self::Off,
             Some(v) if v == "always" => Self::Always,
             _ => Self::Terminal,
         }

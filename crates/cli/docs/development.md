@@ -13,7 +13,7 @@ crates/client   silicon-spotify-client   stateless library: models, URI/time par
                                          used by the CLI and daemon
 crates/cli      silicon-spotify-cli      the `spotify` command
 crates/daemon   silicon-spotify-daemon   `spotify-daemon` (macOS: objc2 NSAppleScript + notifications)
-src/            silicon-spotify          backend (`spotify-api`): Silicon Accounts exchange, Ting, reports, telemetry
+src/            silicon-spotify          backend (`spotify-api`): Silicon Accounts exchange, Ting, reports
 docs/           these guides (bundled into the CLI by scripts/sync-cli-docs.sh)
 docs-site/      static site generator for spotify.unlikefraction.com (+ install.sh)
 deploy/         backend deployment (systemd, Caddy, CloudFormation), Silicon Apps and Ting setup
@@ -120,8 +120,7 @@ Newline-delimited JSON over `~/.silicon-spotify/daemon.sock`, one request per co
 Ops: `daemon.status`, `daemon.shutdown`, `doctor`, `player.{status,play,pause,toggle,next,previous,seek,volume,shuffle,repeat,like}`,
 `spotify.{launch,auth.status,auth.login}`, `track.info`, `lyrics`, `search`, `library.get`,
 `devices.{list,connect}`, `queue.{list,add,remove,move,clear}`, `playlist.{list,show,create,delete,add,remove,rename,import,fork,sync}`,
-`podcast.saved`, `trigger.{add,list,get,remove,clear,history,test,wait,retry}`,
-`telemetry.{record,clear}`. Argument shapes: `crates/cli/src/ops.rs` (the
+`podcast.saved`, `trigger.{add,list,get,remove,clear,history,test,wait,retry}`. Argument shapes: `crates/cli/src/ops.rs` (the
 CLI is the reference client) and `crates/daemon/src/*.rs`. Unknown ops fail with `unknown_op`.
 The socket accepts only the same OS user. Some fields a client may rely on:
 
@@ -171,5 +170,5 @@ The backend uses `SPOTIFY_ACCOUNTS_URL`, `SPOTIFY_APP_ID`, and `SPOTIFY_APP_SECR
   API's rate-limit pause); never caches credentials, never updates behind the caller.
 - Errors: `{code, message, hint, retryable, details}` everywhere; add new codes to `docs/errors.md`.
 - Every playback command verifies its effect and reports `via`/`fallback`.
-- Never send lyrics, titles, queries, notes or tokens to telemetry or logs.
+- Never write lyrics, titles, queries, notes or tokens to logs.
 - Keep `crates/*` versions equal; the CLI restarts an older daemon automatically.

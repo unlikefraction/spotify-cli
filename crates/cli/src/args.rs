@@ -360,7 +360,7 @@ pub enum Command {
     // ---------------------------------------------------------------- configuration & ops
     /// Settings: set with one JSON object, show, get one, list keys, reset.
     #[command(
-        after_help = "Examples:\n  spotify config set '{\"telemetry\": false}'\n  spotify config set '{\"strategy\": \"applescript\", \"launch_spotify\": false}'\n  spotify config set '{\"notify_isi\": \"planner\"}'\n  spotify config set '{\"telemetry\": null}'          null resets a key\n  spotify config show\n  spotify config keys\n  SPOTIFY_HINTS=0 spotify status                    Turns off the `Next:` suggestions (environment)\n  SPOTIFY_HINTS=always spotify status | cat         `Next:` suggestions even when piped\n\nEnvironment variables (not settings) are listed in spotify docs config --section Environment: e.g. SPOTIFY_HINTS=0 turns off the `Next:` suggestions (printed on stderr only when stdout is a terminal; SPOTIFY_HINTS=always prints them when it is not), SPOTIFY_DAEMON_AUTOSTART=0 never starts the daemon, SPOTIFY_DEBUG=1 prints full error details."
+        after_help = "Examples:\n  spotify config set '{\"launch_spotify\": false}'\n  spotify config set '{\"strategy\": \"applescript\", \"launch_spotify\": false}'\n  spotify config set '{\"notify_isi\": \"planner\"}'\n  spotify config set '{\"launch_spotify\": null}'          null resets a key\n  spotify config show\n  spotify config keys\n  SPOTIFY_HINTS=0 spotify status                    Turns off the `Next:` suggestions (environment)\n  SPOTIFY_HINTS=always spotify status | cat         `Next:` suggestions even when piped\n\nEnvironment variables (not settings) are listed in spotify docs config --section Environment: e.g. SPOTIFY_HINTS=0 turns off the `Next:` suggestions (printed on stderr only when stdout is a terminal; SPOTIFY_HINTS=always prints them when it is not), SPOTIFY_DAEMON_AUTOSTART=0 never starts the daemon, SPOTIFY_DEBUG=1 prints full error details."
     )]
     Config {
         #[command(subcommand)]
@@ -990,10 +990,10 @@ pub enum AuthCommand {
 pub enum ConfigCommand {
     /// Set keys from one JSON object; null resets a key. Unknown keys are rejected.
     #[command(
-        after_help = "Examples:\n  spotify config set '{\"search_limit\": 5}'\n  spotify config set '{\"telemetry\": false, \"strategy\": \"applescript\"}'\n  spotify config set '{\"search_limit\": null}'     null resets a key\n\nKeys, types and defaults: spotify config keys"
+        after_help = "Examples:\n  spotify config set '{\"search_limit\": 5}'\n  spotify config set '{\"launch_spotify\": false, \"strategy\": \"applescript\"}'\n  spotify config set '{\"search_limit\": null}'     null resets a key\n\nKeys, types and defaults: spotify config keys"
     )]
     Set {
-        /// JSON object, e.g. '{"telemetry": false}'.
+        /// JSON object, e.g. '{"launch_spotify": false}'.
         #[arg(value_name = "JSON")]
         settings: String,
     },

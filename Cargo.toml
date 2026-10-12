@@ -4,7 +4,7 @@ default-members = [".", "crates/client", "crates/cli", "crates/daemon"]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -25,7 +25,6 @@ secrecy = { version = "0.10.3", features = ["serde"] }
 semver = "1.0.27"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-space-station = "=0.1.1"
 thiserror = "2.0.17"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync", "signal", "process", "fs"] }
@@ -34,7 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2.5.7"
 uuid = { version = "1.26.0", features = ["serde", "v4", "v7"] }
-silicon-spotify-client = { path = "crates/client", version = "0.3.0" }
+silicon-spotify-client = { path = "crates/client", version = "0.4.0" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -47,7 +46,7 @@ unwrap_used = "deny"
 
 [package]
 name = "silicon-spotify"
-description = "Backend for spotify-cli: Silicon Accounts sign-in, Ting recipient registration and trigger delivery, bug reports and telemetry relay."
+description = "Backend for spotify-cli: Silicon Accounts sign-in, Ting recipient registration and trigger delivery, and bug reports."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -74,7 +73,6 @@ secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 silicon-spotify-client.workspace = true
-space-station.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

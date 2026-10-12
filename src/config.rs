@@ -30,33 +30,12 @@ pub struct Settings {
     pub ting_url: Url,
     /// Ting timeout.
     pub ting_timeout: Duration,
-    /// Telemetry master switch (`SPOTIFY_TELEMETRY`).
-    pub telemetry: bool,
-    /// Space Station keys per table.
-    pub table_keys: TableKeys,
-    /// Space Station spool home.
-    pub telemetry_home: PathBuf,
-    /// Space Station URL.
-    pub telemetry_url: String,
     /// Optional GitHub token to file bug reports as issues.
     pub github_token: Option<SecretString>,
     /// `owner/repo` for issues.
     pub github_repository: String,
-    /// Browser origins allowed to use sign-in and telemetry APIs.
+    /// Browser origins allowed to use sign-in APIs.
     pub web_origins: Vec<String>,
-}
-
-/// Space Station table keys (write-only).
-#[derive(Clone, Debug, Default)]
-pub struct TableKeys {
-    /// `spotifybackend`.
-    pub backend: Option<SecretString>,
-    /// `spotifyclidaemon`.
-    pub clidaemon: Option<SecretString>,
-    /// `spotifyfrontendanalytics`.
-    pub frontend_analytics: Option<SecretString>,
-    /// `spotifyfrontendevents`.
-    pub frontend_events: Option<SecretString>,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -88,21 +67,6 @@ fn seconds(name: &str, default: u64) -> anyhow::Result<Duration> {
     })?;
     anyhow::ensure!((1..=120).contains(&value), "{name} must be 1-120 seconds");
     Ok(Duration::from_secs(value))
-}
-
-fn key(name: &str, table: &str) -> anyhow::Result<Option<SecretString>> {
-    match var(name) {
-        None => Ok(None),
-        Some(value) => {
-            let prefix = format!("table-{table}-");
-            let hex = value.strip_prefix(&prefix).unwrap_or_default();
-            anyhow::ensure!(
-                hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
-                "{name} must be table-{table}-<32 hex>"
-            );
-            Ok(Some(SecretString::from(value)))
-        }
-    }
 }
 
 impl Settings {
@@ -149,22 +113,6 @@ impl Settings {
                 "https://backend.ting.teamofsilicons.com",
             )?,
             ting_timeout: seconds("SPOTIFY_TING_TIMEOUT_SECONDS", 15)?,
-            telemetry: !var("SPOTIFY_TELEMETRY")
-                .is_some_and(|v| silicon_spotify_client::telemetry::is_off(&v)),
-            table_keys: TableKeys {
-                backend: key("SPOTIFY_BACKEND_TABLE_KEY", "spotifybackend")?,
-                clidaemon: key("SPOTIFY_CLIDAEMON_TABLE_KEY", "spotifyclidaemon")?,
-                frontend_analytics: key(
-                    "SPOTIFY_FRONTEND_ANALYTICS_TABLE_KEY",
-                    "spotifyfrontendanalytics",
-                )?,
-                frontend_events: key("SPOTIFY_FRONTEND_EVENTS_TABLE_KEY", "spotifyfrontendevents")?,
-            },
-            telemetry_home: PathBuf::from(
-                var("SPOTIFY_TELEMETRY_HOME").unwrap_or_else(|| "telemetry".into()),
-            ),
-            telemetry_url: var("SPOTIFY_TELEMETRY_URL")
-                .unwrap_or_else(|| "https://backend.spacestation.teamofsilicons.com".into()),
             github_token: var("SPOTIFY_GITHUB_TOKEN").map(SecretString::from),
             github_repository: var("SPOTIFY_GITHUB_REPOSITORY")
                 .unwrap_or_else(|| "unlikefraction/spotify-cli".into()),

@@ -7,7 +7,6 @@ dist/
 *.sqlite
 *.sqlite-*
 .vercel
-/telemetry/
 *.local.json
 # the owner's private spec notes (design lives in ARCHITECTURE.md)
 /understanding.md

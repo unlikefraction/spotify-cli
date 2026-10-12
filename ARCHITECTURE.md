@@ -52,7 +52,6 @@ playback triggers delivered over Ting) and the ecosystem rules every Silicon Acc
 | Durable outbox with stable keys `<recipient>/<trigger>/<play>/<outcome>` | Retries never duplicate a notification (Ting dedupes keys for 14 days). |
 | Controls work without Silicon Accounts login; triggers need it | Playing music is local; notifying someone needs an identity. `--local` triggers work without Ting. |
 | Auto-start the Spotify sign-in when a Silicon needs it (rate-limited) | The spec: "if not authenticated, run the authentication script when silicon tries to use it". A Carbon must click Agree, so the error says a browser tab was opened and to retry. |
-| Telemetry via the backend gateway, keys only on the backend | Keys never ship in binaries; opt-out at config, env (incl. Stemcell's `SPACE_STATION_TELEMETRY=0`), header and server levels. |
 | One error shape and Silicon Accounts exit-code taxonomy | Agents branch on stable codes and get the exact fix. |
 | The CLI describes itself: grouped help, `spotify how`, `Next:` hints, `spotify commands --json`, orientation with no arguments, completions, unknown subcommands answered with the real ones; drift tests tie guides to the grammar | Silicons and Carbons should find a command without knowing its name. The manifest (arguments with types and allowed values, examples, output fields, errors, requirements, and whether a command changes anything: `mutates`, `changes`, `read_only_when`) lets a Silicon plan a call without parsing help text; `how` answers offline from the same help, guides and settings, with examples made for the question (a song name becomes a search, a setting a `config set`). Tests fail when a guide or README shows a command, flag, value or topic the CLI does not have, or when a help example does not parse, so docs and help cannot drift apart. Hints go to stderr and never into `--json`, so pipes and agents are unaffected. |
 | rustls with `ring` for CLI/daemon | Pure-Rust-friendly crypto so all six Silicon Apps targets cross-compile (zig for Linux musl, xwin for Windows). |
@@ -76,7 +75,7 @@ playback triggers delivered over Ting) and the ecosystem rules every Silicon Acc
 | installation installs dependencies and keeps them running | `scripts/install.sh`, `packaging/apps-install-macos.sh`, launchd agent, warm spotify_player |
 | run authentication when needed | daemon auto-starts `spotify_player authenticate` on `spotify_auth_required` |
 | clear errors | `docs/errors.md`, `crates/client/src/error.rs` |
-| Silicon Accounts app rules: config set JSON, report with PR, docs in CLI, command tree, telemetry, BYO, updates, versioning | `config`, `report`, `docs` (`--section`), `commands` (`--json` manifest), `how`, `docs/telemetry.md`, `docs/config.md`, `testing`, updater, `docs/versioning.md` |
+| Silicon Accounts app rules: config set JSON, report with PR, docs in CLI, command tree, BYO, updates, versioning | `config`, `report`, `docs` (`--section`), `commands` (`--json` manifest), `how`, `docs/config.md`, `testing`, updater, `docs/versioning.md` |
 
 ## Known limits
 

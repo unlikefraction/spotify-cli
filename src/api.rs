@@ -1,7 +1,7 @@
 //! HTTP API (`/api/v1/*`, health, Silicon Accounts webhook).
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Request, State};
@@ -18,7 +18,6 @@ use crate::config::Settings;
 use crate::error::{AppError, AppResult};
 use crate::identity::{self, Accounts, AuthContext, Identity};
 use crate::store::Store;
-use crate::telemetry::Recorder;
 use crate::ting::{self, TingApi};
 
 /// Shared state.
@@ -31,8 +30,6 @@ pub struct AppState {
     pub ting: Arc<dyn TingApi>,
     /// SQLite.
     pub store: Arc<Store>,
-    /// Space Station.
-    pub telemetry: Recorder,
     /// Outbound HTTP (GitHub issues).
     pub http: reqwest::Client,
 }
@@ -54,11 +51,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/ting/subscription", post(subscribe))
         .route("/api/v1/tings", post(send_ting))
         .route("/api/v1/reports", post(report))
-        .route("/api/v1/telemetry", post(telemetry).options(preflight))
         .fallback(not_found)
         .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         // Outside the body limit, so its 413 gets a request id too.
-        .layer(middleware::from_fn_with_state(Arc::clone(&state), observe))
+        .layer(middleware::from_fn_with_state(Arc::clone(&state), response_headers))
         .with_state(state);
     // axum finishes a 405 (its `Allow` header) only after the per-route layers, so framework
     // errors are rewritten as JSON around the whole router.
@@ -70,29 +66,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// Largest request body any route reads.
 const MAX_BODY_BYTES: usize = 512 * 1024;
 
-/// Largest telemetry batch the gateway relays.
-const MAX_TELEMETRY_BYTES: usize = 64 * 1024;
-
-async fn observe(State(state): Shared, request: Request, next: Next) -> Response {
-    let started = Instant::now();
-    let method = request.method().clone();
-    let route = request
-        .extensions()
-        .get::<axum::extract::MatchedPath>()
-        .map(|p| p.as_str().to_owned());
-    let telemetry_off = request
-        .headers()
-        .get("x-spotify-telemetry")
-        .and_then(|v| v.to_str().ok())
-        == Some("off");
-    let source = request
-        .headers()
-        .get("x-spotify-source")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .chars()
-        .take(16)
-        .collect::<String>();
+async fn response_headers(State(state): Shared, request: Request, next: Next) -> Response {
     let request_id = format!("req_{}", uuid::Uuid::now_v7().simple());
     let request_headers = request.headers().clone();
     let mut response = next.run(request).await;
@@ -100,18 +74,6 @@ async fn observe(State(state): Shared, request: Request, next: Next) -> Response
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert("x-request-id", value);
     }
-    let route = route.unwrap_or_else(|| "unmatched".into());
-    if !telemetry_off && route != "/healthz" && route != "/readyz" && route != "/api/v1/telemetry" {
-        let status = response.status().as_u16();
-        state.telemetry.backend(
-            "http.completed",
-            &route,
-            if status < 400 { "ok" } else { "error" },
-            None,
-            json!({"method": method.as_str(), "route": route, "status": status, "duration_ms": started.elapsed().as_millis(), "source": source, "request_id": request_id}),
-        );
-    }
-    tracing::info!(method = %method, route, status = response.status().as_u16(), ms = started.elapsed().as_millis(), "request");
     response
 }
 
@@ -149,7 +111,7 @@ async fn json_error(method: Method, response: Response) -> Response {
                 "The request body exceeds the backend's {} KiB limit.",
                 MAX_BODY_BYTES / 1024
             ),
-            "Send less: shorten the report or its attachments, or split telemetry into batches of at most 64 KiB.",
+            "Send less: shorten the report or its attachments.",
         ),
         StatusCode::NOT_FOUND => not_found_error(),
         _ if status.is_client_error() => AppError::invalid(
@@ -265,13 +227,6 @@ async fn login(State(state): Shared, headers: HeaderMap, body: Bytes) -> AppResu
         .map_err(AppError::internal)??;
     let mut value = serde_json::to_value(&session).map_err(AppError::internal)?;
     value["ting"] = json!({"subscribed": false});
-    state.telemetry.backend(
-        "auth.login.completed",
-        "login",
-        "ok",
-        None,
-        json!({"actor_type": session.actor.kind}),
-    );
     Ok(no_store(value))
 }
 
@@ -417,13 +372,6 @@ async fn send_ting(State(state): Shared, headers: HeaderMap, body: Bytes) -> App
         &input.metadata,
     )?;
     let result = ting::send(identity.as_ref(), state.ting.as_ref(), &context, bytes).await;
-    state.telemetry.backend(
-        "ting.send.completed",
-        &input.event_type,
-        if result.is_ok() { "ok" } else { "error" },
-        result.as_ref().err().map(|e| e.code.as_str()),
-        json!({"type": input.event_type}),
-    );
     Ok(no_store(result?))
 }
 
@@ -507,7 +455,6 @@ async fn report(State(state): Shared, headers: HeaderMap, body: Bytes) -> AppRes
             }
         }
     }
-    state.telemetry.backend("report.received", "report", "ok", None, json!({"has_pr": input.pr.is_some(), "attachments": input.attachments.len(), "status": status}));
     Ok(no_store(
         json!({"id": id, "status": status, "issue_url": issue_url}),
     ))
@@ -589,7 +536,7 @@ fn cors(state: &AppState, headers: &HeaderMap, response: &mut Response) {
         );
         h.insert(
             header::ACCESS_CONTROL_ALLOW_HEADERS,
-            HeaderValue::from_static("content-type, authorization, idempotency-key, x-spotify-telemetry, x-spotify-source"),
+            HeaderValue::from_static("content-type, authorization, idempotency-key"),
         );
         h.insert(header::VARY, HeaderValue::from_static("Origin"));
     }
@@ -599,92 +546,6 @@ async fn preflight(State(state): Shared, headers: HeaderMap) -> Response {
     let mut response = StatusCode::NO_CONTENT.into_response();
     cors(&state, &headers, &mut response);
     response
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TelemetryInput {
-    table: String,
-    events: Vec<Value>,
-}
-
-async fn telemetry(State(state): Shared, headers: HeaderMap, body: Bytes) -> Response {
-    let mut response = match relay_batch(&state, &headers, &body) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => error.into_response(),
-    };
-    // Refusals carry CORS headers too, so the website can read why a batch was refused.
-    cors(&state, &headers, &mut response);
-    response
-}
-
-fn relay_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> AppResult<()> {
-    let off = headers
-        .get("x-spotify-telemetry")
-        .and_then(|v| v.to_str().ok())
-        == Some("off");
-    if off {
-        return Ok(());
-    }
-    if body.len() > MAX_TELEMETRY_BYTES {
-        return Err(AppError::payload_too_large(
-            format!(
-                "The telemetry batch is {} KiB; the gateway relays at most {} KiB.",
-                body.len().div_ceil(1024),
-                MAX_TELEMETRY_BYTES / 1024
-            ),
-            "Split it into smaller batches (at most 64 KiB and 40 events each) and send them separately.",
-        ));
-    }
-    let input: TelemetryInput = parse(body)?;
-    let allowed = [
-        silicon_spotify_client::telemetry::CLI_DAEMON_TABLE,
-        silicon_spotify_client::telemetry::WEB_ANALYTICS_TABLE,
-        silicon_spotify_client::telemetry::WEB_EVENTS_TABLE,
-    ];
-    if !allowed.contains(&input.table.as_str()) {
-        return Err(AppError::invalid(
-            format!("`{}` is not a relayable table.", input.table),
-            format!("Use one of: {}.", allowed.join(", ")),
-        ));
-    }
-    // Browser events must come from our own site.
-    let from_browser = headers.contains_key(header::ORIGIN);
-    if from_browser {
-        let origin = headers
-            .get(header::ORIGIN)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !state.settings.web_origins.iter().any(|o| o == origin)
-            || input.table == silicon_spotify_client::telemetry::CLI_DAEMON_TABLE
-        {
-            return Err(AppError::forbidden(
-                "This origin may not send telemetry.",
-                "Browsers may relay only the website tables, and only from the spotify-cli website; the CLI and daemon send without an Origin header.",
-            ));
-        }
-    }
-    if input.events.is_empty() || input.events.len() > 40 {
-        return Err(AppError::invalid(
-            "Send 1-40 events per batch.",
-            "Split larger batches into several requests; skip the request when there is nothing to send.",
-        ));
-    }
-    let source = headers
-        .get("x-spotify-source")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .chars()
-        .take(16)
-        .collect::<String>();
-    for mut event in input.events {
-        if !event.is_object() {
-            continue;
-        }
-        event["relay"] = json!({"received_at": silicon_spotify_client::model::now_rfc3339(), "source": source, "backend_version": env!("CARGO_PKG_VERSION")});
-        state.telemetry.relay(&input.table, event);
-    }
-    Ok(())
 }
 
 /// Builds the production state.
@@ -698,7 +559,6 @@ pub fn production(settings: Settings) -> anyhow::Result<Arc<AppState>> {
         settings.ting_timeout,
     )?);
     let store = Arc::new(Store::open(&settings.database_path)?);
-    let telemetry = Recorder::new(&settings);
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
@@ -707,7 +567,6 @@ pub fn production(settings: Settings) -> anyhow::Result<Arc<AppState>> {
         identity,
         ting,
         store,
-        telemetry,
         http,
     }))
 }

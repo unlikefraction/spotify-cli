@@ -3,7 +3,6 @@
 //! - `triggers`: every trigger with its runtime state and delivery target.
 //! - `firings`: the Ting outbox and trigger history (pending → sent | failed | local).
 //! - `kv`: the managed queue, the play tracker, the resume point and daemon settings.
-//! - `telemetry`: a bounded outbox of CLI/daemon events relayed to the backend.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -14,9 +13,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use silicon_spotify_client::trigger::Trigger;
 use silicon_spotify_client::{Error, Result};
-
-/// Telemetry events relayed per request batch.
-pub const TELEMETRY_PEEK: usize = 40;
 
 /// Where a trigger's notifications go.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -121,7 +117,7 @@ impl Db {
              CREATE INDEX IF NOT EXISTS firings_pending ON firings(state, next_attempt_ms);
              CREATE INDEX IF NOT EXISTS firings_home ON firings(home, created_at);
              CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS telemetry (id TEXT PRIMARY KEY, body TEXT NOT NULL, created_ms INTEGER NOT NULL);",
+             DROP TABLE IF EXISTS telemetry;",
         )
         .map_err(|e| db_error(&e))?;
         Ok(Self {
@@ -426,7 +422,6 @@ impl Db {
             "active_triggers": count("SELECT COUNT(*) FROM triggers WHERE status = 'active'")?,
             "pending_deliveries": count("SELECT COUNT(*) FROM firings WHERE state = 'pending'")?,
             "failed_deliveries": count("SELECT COUNT(*) FROM firings WHERE state = 'failed'")?,
-            "telemetry_backlog": count("SELECT COUNT(*) FROM telemetry")?,
         }))
     }
 
@@ -448,78 +443,41 @@ impl Db {
         .map_err(|e| db_error(&e))?;
         Ok(())
     }
+}
 
-    /// Queues telemetry events (bounded to 2 000; oldest dropped).
-    ///
-    /// # Errors
-    /// SQLite errors.
-    pub fn push_telemetry(&self, events: &[Value]) -> Result<()> {
-        let conn = self.conn();
-        let now = i64::try_from(silicon_spotify_client::model::now_ms()).unwrap_or(0);
-        for event in events {
-            let id = event
-                .get("id")
-                .and_then(Value::as_str)
-                .map_or_else(|| uuid::Uuid::now_v7().to_string(), str::to_owned);
-            conn.execute(
-                "INSERT OR IGNORE INTO telemetry(id, body, created_ms) VALUES(?1, ?2, ?3)",
-                params![id, event.to_string(), now],
-            )
-            .map_err(|e| db_error(&e))?;
-        }
-        conn.execute(
-            "DELETE FROM telemetry WHERE id NOT IN (SELECT id FROM telemetry ORDER BY created_ms DESC LIMIT 2000)",
-            [],
-        )
-        .map_err(|e| db_error(&e))?;
-        Ok(())
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// Takes up to [`TELEMETRY_PEEK`] telemetry events, oldest first.
-    ///
-    /// # Errors
-    /// SQLite or JSON errors.
-    pub fn peek_telemetry(&self) -> Result<Vec<(String, Value)>> {
-        let conn = self.conn();
-        let mut statement = conn
-            .prepare(&format!(
-                "SELECT id, body FROM telemetry ORDER BY created_ms, rowid LIMIT {TELEMETRY_PEEK}"
-            ))
-            .map_err(|e| db_error(&e))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| db_error(&e))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, body) = row.map_err(|e| db_error(&e))?;
-            out.push((id, serde_json::from_str(&body)?));
-        }
-        Ok(out)
-    }
-
-    /// Deletes relayed telemetry.
-    ///
-    /// # Errors
-    /// SQLite errors.
-    pub fn drop_telemetry(&self, ids: &[String]) -> Result<()> {
-        let conn = self.conn();
-        for id in ids {
-            conn.execute("DELETE FROM telemetry WHERE id = ?1", params![id])
+    #[test]
+    fn opening_an_existing_database_discards_queued_telemetry() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("spotify-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let path = dir.join("daemon.sqlite");
+        {
+            let db = Db::open(&path)?;
+            db.put("queue", &serde_json::json!(["saved playback"]))?;
+            db.conn()
+                .execute_batch("CREATE TABLE telemetry (body TEXT); INSERT INTO telemetry VALUES ('old event');")
                 .map_err(|e| db_error(&e))?;
         }
-        Ok(())
-    }
-
-    /// Clears the telemetry backlog (opt-out).
-    ///
-    /// # Errors
-    /// SQLite errors.
-    pub fn clear_telemetry(&self) -> Result<()> {
-        self.conn()
-            .execute("DELETE FROM telemetry", [])
-            .map_err(|e| db_error(&e))?;
+        {
+            let db = Db::open(&path)?;
+            let old_tables: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'telemetry'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| db_error(&e))?;
+            assert_eq!(old_tables, 0);
+            assert_eq!(
+                db.get::<Value>("queue")?,
+                Some(serde_json::json!(["saved playback"]))
+            );
+        }
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 }

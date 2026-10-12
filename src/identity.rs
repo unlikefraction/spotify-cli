@@ -131,6 +131,7 @@ impl Accounts {
         Ok(self
             .http
             .post(self.base.join(path).map_err(AppError::internal)?)
+            .header("X-Accounts-Telemetry", "off")
             .basic_auth(&self.app_id, Some(self.secret.expose_secret())))
     }
     async fn response(&self, request: reqwest::RequestBuilder) -> AppResult<Value> {

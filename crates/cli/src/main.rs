@@ -21,8 +21,6 @@ mod ops;
 mod orient;
 mod render;
 
-use std::time::Instant;
-
 use serde_json::{Value, json};
 use silicon_spotify_client::api::Api;
 use silicon_spotify_client::store::{Config, Home, slot_key};
@@ -40,25 +38,17 @@ pub struct Ctx {
     pub config: Config,
     /// Effective backend origin.
     pub api_url: String,
-    /// Effective telemetry preference.
-    pub telemetry: bool,
-    /// Trace id for this invocation.
-    pub trace_id: String,
     /// `ISI` env (routing hint only).
     pub isi: Option<String>,
-    /// The command path for telemetry (`trigger add`).
-    pub command: String,
 }
 
 impl Ctx {
-    /// Backend client with telemetry and trace applied.
+    /// Backend client.
     ///
     /// # Errors
     /// Bad API URL.
     pub fn api(&self) -> Result<Api> {
-        Ok(Api::new(&self.api_url, "cli")?
-            .with_telemetry(self.telemetry)
-            .with_trace(Some(self.trace_id.clone())))
+        Api::new(&self.api_url)
     }
 
     /// This home's session slot for the current backend and plane.
@@ -77,8 +67,6 @@ impl Ctx {
             "spotify_player_binary": self.config.spotify_player_binary,
             "spotify_player_config_dir": self.config.spotify_player_config_dir,
             "spotify_player_cache_dir": self.config.spotify_player_cache_dir,
-            "telemetry": self.telemetry,
-            "api_url": self.api_url,
         })
     }
 
@@ -123,15 +111,6 @@ impl Ctx {
             err_line!("{text}");
         }
     }
-}
-
-fn command_path(command: Option<&Command>) -> String {
-    let Some(command) = command else {
-        return "orientation".into();
-    };
-    let debug = format!("{command:?}");
-    let head: String = debug.chars().take_while(|c| c.is_alphanumeric()).collect();
-    head.to_ascii_lowercase()
 }
 
 fn print_error(json: bool, error: &Error) {
@@ -300,7 +279,7 @@ fn config_json_form(pairs: &[(&str, &str)]) -> String {
     format!("config set takes one JSON object: spotify config set '{object}'.")
 }
 
-/// `key=value` words (`search_limit=5 telemetry=false`) → the JSON form, when every word is one.
+/// `key=value` words (`search_limit=5 launch_spotify=false`) → the JSON form, when every word is one.
 pub(crate) fn config_key_value_advice<'a>(
     words: impl IntoIterator<Item = &'a str>,
 ) -> Option<String> {
@@ -683,13 +662,10 @@ fn build_ctx(cli: &Cli) -> Result<Ctx> {
     let json = cli.global.json || config.output.as_deref() == Some("json");
     Ok(Ctx {
         json,
-        telemetry: silicon_spotify_client::telemetry::enabled(config.telemetry),
         home,
         config,
         api_url,
-        trace_id: uuid::Uuid::now_v7().to_string(),
         isi: std::env::var("ISI").ok().filter(|v| !v.trim().is_empty()),
-        command: command_path(cli.command.as_ref()),
     })
 }
 
@@ -734,31 +710,6 @@ async fn run(cli: Cli, ctx: &Ctx) -> Result<()> {
         Command::Auth { action } => account::auth(ctx, action).await,
         other => ops::run(ctx, other).await,
     }
-}
-
-fn record(ctx: &Ctx, started: Instant, result: &Result<()>) {
-    if !ctx.telemetry
-        || matches!(
-            ctx.command.as_str(),
-            "docs" | "commands" | "accounts" | "how" | "completions" | "orientation"
-        )
-    {
-        return;
-    }
-    let mut builder = silicon_spotify_client::telemetry::Builder::new("cli", "production");
-    builder.trace_id.clone_from(&ctx.trace_id);
-    let mut context = serde_json::Map::new();
-    context.insert("command".into(), json!(ctx.command));
-    context.insert("json".into(), json!(ctx.json));
-    let event = builder.event(
-        "cli.command.completed",
-        &ctx.command,
-        if result.is_ok() { "ok" } else { "error" },
-        result.as_ref().err().map(|e| e.code.as_str()),
-        u64::try_from(started.elapsed().as_millis()).ok(),
-        context,
-    );
-    daemon::record_telemetry(ctx, event);
 }
 
 fn main() {
@@ -822,9 +773,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let started = Instant::now();
     let result = runtime.block_on(run(cli, &ctx));
-    record(&ctx, started, &result);
     if let Err(error) = result {
         print_error(ctx.json, &error);
         drop(runtime);

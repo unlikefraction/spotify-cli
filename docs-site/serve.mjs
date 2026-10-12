@@ -1,6 +1,6 @@
 // Tiny static server for previewing dist/ (node serve.mjs [port] [dir]). It sends vercel.json's
 // headers, so the CSP is exercised locally, except that connect-src is narrowed to 'self': a
-// preview never posts telemetry to the production backend. It listens on 127.0.0.1 only and never
+// preview never sends requests to the production backend. It listens on 127.0.0.1 only and never
 // serves a file outside the dist directory.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";

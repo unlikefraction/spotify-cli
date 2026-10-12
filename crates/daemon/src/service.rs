@@ -52,12 +52,6 @@ pub struct Settings {
     /// spotify_player `-C`.
     #[serde(default)]
     pub spotify_player_cache_dir: Option<String>,
-    /// Caller's telemetry preference.
-    #[serde(default)]
-    pub telemetry: Option<bool>,
-    /// Caller's backend origin (used for telemetry relay).
-    #[serde(default)]
-    pub api_url: Option<String>,
 }
 
 impl Settings {
@@ -335,21 +329,22 @@ pub fn args<T: for<'de> Deserialize<'de>>(request: &Request) -> Result<T> {
 #[derive(Deserialize)]
 struct WithSettings {
     #[serde(default)]
-    settings: Settings,
+    settings: Option<Settings>,
 }
 
 /// Extracts caller settings and remembers them for background work.
 pub fn settings_of(daemon: &Daemon, request: &Request) -> Settings {
-    let settings = serde_json::from_value::<WithSettings>(request.args.clone())
-        .map(|w| w.settings)
-        .unwrap_or_default();
-    if settings.strategy.is_some() || settings.api_url.is_some() || settings.telemetry.is_some() {
-        *daemon
-            .settings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = settings.clone();
-        let _ = daemon.db.put("settings", &settings);
-    }
+    let Some(settings) = serde_json::from_value::<WithSettings>(request.args.clone())
+        .ok()
+        .and_then(|w| w.settings)
+    else {
+        return Settings::default();
+    };
+    *daemon
+        .settings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = settings.clone();
+    let _ = daemon.db.put("settings", &settings);
     settings
 }
 

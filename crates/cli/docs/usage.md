@@ -390,8 +390,6 @@ rm -rf ~/.cache/spotify-player           # its Spotify tokens
 - **ISI**: the name of a part of a Silicon's flow that messages can be sent to, such as `planner`.
   When `ISI` is set, spotify-cli records it as `metadata.isi` on the triggers you create, so the
   flow can route the notification back (`notify_isi` in `spotify docs config` sets a default).
-- **Space Station**: the telemetry store. spotify-cli's usage and diagnostics go there through
-  the backend, never lyrics, titles or queries (`spotify docs telemetry`).
 
 ## Where to go next
 

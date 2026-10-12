@@ -1,9 +1,8 @@
-//! The Unix-socket server and the daemon-level ops (status, doctor, telemetry, update, shutdown).
+//! The Unix-socket server and the daemon-level ops (status, doctor, update, shutdown).
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use serde::Deserialize;
 use serde_json::{Value, json};
 use silicon_spotify_client::ipc::{self, MAX_FRAME, PROTOCOL, Reply, Request};
 use silicon_spotify_client::model::PlayerState;
@@ -12,7 +11,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, Buf
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::log;
-use crate::service::{self, Daemon, args, blocking, settings_of};
+use crate::service::{self, Daemon, blocking, settings_of};
 
 /// Binds the socket (0600) and serves forever.
 ///
@@ -75,7 +74,6 @@ async fn connection(daemon: Arc<Daemon>, stream: UnixStream) {
             ),
         ),
         Ok(request) => {
-            let started = Instant::now();
             let id = request.id.clone();
             let mut result = dispatch(&daemon, &request).await;
             if let Err(error) = &mut result
@@ -84,7 +82,6 @@ async fn connection(daemon: Arc<Daemon>, stream: UnixStream) {
             {
                 start_spotify_auth(&daemon, &request, error).await;
             }
-            record(&daemon, &request, &result, started.elapsed());
             match result {
                 Ok(data) => Reply::ok(id, data),
                 Err(error) => Reply::err(id, error),
@@ -145,40 +142,6 @@ async fn start_spotify_auth(daemon: &Arc<Daemon>, request: &Request, error: &mut
     );
 }
 
-fn record(daemon: &Daemon, request: &Request, result: &Result<Value>, elapsed: Duration) {
-    if request.op.starts_with("telemetry.") || request.op == "daemon.status" {
-        return;
-    }
-    if !silicon_spotify_client::telemetry::enabled(daemon.settings().telemetry) {
-        return;
-    }
-    let mut builder = silicon_spotify_client::telemetry::Builder::new("daemon", "production");
-    if let Some(trace) = &request.trace_id {
-        builder.trace_id.clone_from(trace);
-    }
-    let mut context = serde_json::Map::new();
-    context.insert("op".into(), json!(request.op));
-    if let Ok(value) = result {
-        if let Some(via) = value.get("via") {
-            context.insert("via".into(), via.clone());
-        }
-        if let Some(fallback) = value.pointer("/fallback/reason/code") {
-            context.insert("fallback_reason".into(), fallback.clone());
-        }
-    }
-    let event = builder.event(
-        "daemon.op.completed",
-        &request.op,
-        if result.is_ok() { "ok" } else { "error" },
-        result.as_ref().err().map(|e| e.code.as_str()),
-        u64::try_from(elapsed.as_millis()).ok(),
-        context,
-    );
-    if let Ok(value) = serde_json::to_value(event) {
-        let _ = daemon.db.push_telemetry(&[value]);
-    }
-}
-
 async fn dispatch(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
     match request.op.as_str() {
         "daemon.status" => status(daemon).await,
@@ -191,22 +154,6 @@ async fn dispatch(daemon: &Arc<Daemon>, request: &Request) -> Result<Value> {
             Ok(json!({"stopping": true}))
         }
         "doctor" => doctor(daemon, request).await,
-        "telemetry.record" => {
-            #[derive(Deserialize)]
-            struct A {
-                events: Vec<Value>,
-            }
-            let a: A = args(request)?;
-            let settings = settings_of(daemon, request);
-            if silicon_spotify_client::telemetry::enabled(settings.telemetry) {
-                daemon.db.push_telemetry(&a.events)?;
-            }
-            Ok(json!({"queued": a.events.len()}))
-        }
-        "telemetry.clear" => {
-            daemon.db.clear_telemetry()?;
-            Ok(json!({"cleared": true}))
-        }
         "update.check" | "update.apply" => crate::updater::check(daemon).await.inspect(|status| {
             if status.get("restarting").and_then(Value::as_bool) == Some(true) {
                 let d = Arc::clone(daemon);

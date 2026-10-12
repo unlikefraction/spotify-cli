@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 — 2026-10-12
+
+- Remove all usage and diagnostic telemetry from the CLI, daemon, backend, and website, including Space Station, the relay API, event queues, trace headers, and opt-out settings.
+- Delete the daemon’s previously queued events on startup.
+- Disable request telemetry on Silicon Accounts calls.
+
 ## 0.3.0
 
 - Use Silicon Accounts for Carbon and Silicon sign-in, with immutable account ownership and persistent, renewable browser and CLI sessions.

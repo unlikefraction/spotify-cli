@@ -62,11 +62,6 @@ pub const TOPICS: &[(&str, &str, &str)] = &[
     ),
     ("api", "Backend HTTP API", include_str!("../docs/api.md")),
     (
-        "telemetry",
-        "What telemetry records and how to turn it off",
-        include_str!("../docs/telemetry.md"),
-    ),
-    (
         "versioning",
         "Versions, compatibility and deprecation",
         include_str!("../docs/versioning.md"),

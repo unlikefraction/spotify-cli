@@ -13,13 +13,6 @@ use url::Url;
 
 use crate::{Error, Result};
 
-/// Header announcing the caller's telemetry preference.
-pub const TELEMETRY_HEADER: &str = "X-Spotify-Telemetry";
-/// Header naming the calling surface (`cli`, `daemon`, `web`).
-pub const SOURCE_HEADER: &str = "X-Spotify-Source";
-/// Header correlating one command across CLI, daemon and backend.
-pub const TRACE_HEADER: &str = "X-Spotify-Trace-Id";
-
 /// An authenticated actor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Actor {
@@ -88,9 +81,6 @@ pub struct TingDelivery {
 pub struct Api {
     http: reqwest::Client,
     base: Url,
-    telemetry: bool,
-    source: &'static str,
-    trace_id: Option<String>,
 }
 
 /// Installs the `ring` rustls provider once when no provider is installed yet (pure Rust, so every
@@ -106,7 +96,7 @@ impl Api {
     ///
     /// # Errors
     /// `invalid_input` for a bad URL.
-    pub fn new(base_url: &str, source: &'static str) -> Result<Self> {
+    pub fn new(base_url: &str) -> Result<Self> {
         let base = validate_base(base_url)?;
         ensure_crypto();
         let http = reqwest::Client::builder()
@@ -119,33 +109,13 @@ impl Api {
             ))
             .build()
             .map_err(|error| Error::internal(format!("HTTP client setup failed: {error}")))?;
-        Ok(Self {
-            http,
-            base,
-            telemetry: true,
-            source,
-            trace_id: None,
-        })
+        Ok(Self { http, base })
     }
 
     /// The backend origin.
     #[must_use]
     pub fn base_url(&self) -> &Url {
         &self.base
-    }
-
-    /// Sends `X-Spotify-Telemetry: off` when false.
-    #[must_use]
-    pub fn with_telemetry(mut self, enabled: bool) -> Self {
-        self.telemetry = enabled;
-        self
-    }
-
-    /// Correlates requests with a trace id.
-    #[must_use]
-    pub fn with_trace(mut self, trace_id: Option<String>) -> Self {
-        self.trace_id = trace_id;
-        self
     }
 
     async fn call(
@@ -164,11 +134,8 @@ impl Api {
             .http
             .request(method, url)
             .header(header::ACCEPT, "application/json")
-            .header(SOURCE_HEADER, self.source)
-            .header(TELEMETRY_HEADER, if self.telemetry { "on" } else { "off" });
-        if let Some(trace) = &self.trace_id {
-            request = request.header(TRACE_HEADER, trace);
-        }
+            // Older backend deployments also honor this fixed opt-out.
+            .header("X-Spotify-Telemetry", "off");
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
         }
@@ -353,17 +320,6 @@ impl Api {
             )
             .await?
             .1)
-    }
-
-    /// `POST /api/v1/telemetry`: relays CLI/daemon events to Space Station.
-    ///
-    /// # Errors
-    /// Backend errors.
-    pub async fn telemetry(&self, events: &[crate::telemetry::Event]) -> Result<()> {
-        let body = json!({"table": crate::telemetry::CLI_DAEMON_TABLE, "events": events});
-        self.call(Method::POST, "/api/v1/telemetry", None, None, Some(&body))
-            .await
-            .map(drop)
     }
 }
 

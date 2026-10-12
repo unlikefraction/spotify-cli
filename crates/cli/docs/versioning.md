@@ -1,6 +1,6 @@
 # Versioning and compatibility
 
-spotify 0.3.0 uses Silicon Accounts and Silicon Apps. The CLI, client library, daemon, and backend share the workspace release version. Native package manifests match it; Peek's native app also carries an increasing bundle build number.
+spotify 0.4.0 uses Silicon Accounts and Silicon Apps. The CLI, client library, daemon, and backend share the workspace release version. Native package manifests match it; Peek's native app also carries an increasing bundle build number.
 
 ## Authentication
 

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "app_id": "spotify",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "command": "spotify",
   "targets": {
     "macos-aarch64": {

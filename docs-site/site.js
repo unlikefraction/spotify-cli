@@ -1,5 +1,5 @@
-// Progressive enhancements only: copy buttons on code blocks and the installer, docs search, and
-// the telemetry opt-out toggle (localStorage). Pages work without it.
+// Progressive enhancements only: copy buttons on code blocks and the installer, and docs search.
+// Pages work without it.
 (() => {
   const copy = async (text, button) => {
     try { await navigator.clipboard.writeText(text); button.textContent = "Copied"; }
@@ -141,42 +141,4 @@
     });
     form.hidden = false;
   }
-
-  // Telemetry: anonymous page views and install-command copies, sent to the backend gateway (keys
-  // stay server-side). On by default; off when the browser sends Global Privacy Control or Do Not
-  // Track, or when the footer toggle is off (remembered in localStorage; no cookies).
-  const KEY = "spotify-cli.telemetry";
-  const OLD_KEY = "silicon-spotify.telemetry"; // the key before the rename, migrated once
-  let choice = null;
-  try {
-    choice = localStorage.getItem(KEY);
-    const old = localStorage.getItem(OLD_KEY);
-    if (old !== null) {
-      if (choice === null) localStorage.setItem(KEY, (choice = old));
-      localStorage.removeItem(OLD_KEY);
-    }
-  } catch {}
-  const refused = navigator.globalPrivacyControl === true ? "Global Privacy Control" : navigator.doNotTrack === "1" ? "Do Not Track" : null;
-  let enabled = !refused && choice !== "off";
-  const toggle = document.getElementById("telemetry-toggle");
-  if (toggle) {
-    toggle.checked = enabled;
-    if (refused) {
-      toggle.disabled = true;
-      document.getElementById("telemetry-note").textContent = `: off, because your browser sends ${refused}`;
-    }
-    toggle.addEventListener("change", () => {
-      enabled = toggle.checked;
-      try { localStorage.setItem(KEY, enabled ? "on" : "off"); } catch {}
-    });
-    toggle.closest(".telemetry").hidden = false;
-  }
-  const endpoint = "https://backend.spotify.unlikefraction.com/api/v1/telemetry";
-  const send = (table, type, data) => {
-    if (!enabled || refused) return;
-    const body = JSON.stringify({ table, events: [{ id: crypto.randomUUID(), type, data, metadata: { path: location.pathname, referrer: document.referrer ? new URL(document.referrer).host : null, viewport: innerWidth + "x" + innerHeight } }] });
-    try { fetch(endpoint, { method: "POST", headers: { "content-type": "application/json", "x-spotify-source": "web" }, body, keepalive: true, mode: "cors" }).catch(() => {}); } catch {}
-  };
-  send("spotifyfrontendanalytics", "page_view", {});
-  document.querySelectorAll("button[data-copy]").forEach((b) => b.addEventListener("click", () => send("spotifyfrontendevents", "install_command_copied", {})));
 })();

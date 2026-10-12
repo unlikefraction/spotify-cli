@@ -1514,7 +1514,6 @@ pub const ENTRIES: &[Entry] = &[
             "preferences",
             "options",
             "strategy",
-            "telemetry",
             "default",
             "environment",
             "hints",
@@ -1526,12 +1525,11 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         path: "config set",
         capabilities: &[
-            "change any setting: telemetry, the playback strategy (auto, spotify_player only or applescript only), launch_spotify, search_limit, keep_spotify_in_background",
+            "change any setting: the playback strategy (auto, spotify_player only or applescript only), launch_spotify, search_limit, keep_spotify_in_background",
             "change a default: search results, output format, verify timeout",
         ],
         keywords: &[
             "change setting",
-            "turn off telemetry",
             "set strategy",
             "change the default",
             "set the default",
@@ -2194,7 +2192,7 @@ pub const ARG_TYPES: &[(&str, &str)] = &[
     ("path_or_stdin", "a file path, or - for stdin"),
     (
         "json_object",
-        "one JSON object, e.g. '{\"telemetry\": false}'",
+        "one JSON object, e.g. '{\"launch_spotify\": false}'",
     ),
     ("config_key", "a key from `spotify config keys`"),
     (

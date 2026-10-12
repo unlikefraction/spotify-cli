@@ -778,9 +778,7 @@ fn holder_json(holder: &Holder) -> Value {
 /// Supervises the instance until shutdown.
 #[allow(unsafe_code, clippy::too_many_lines)]
 pub async fn run(daemon: Arc<Daemon>) {
-    if std::env::var("SPOTIFY_WARM_PLAYER")
-        .is_ok_and(|v| silicon_spotify_client::telemetry::is_off(&v))
-    {
+    if std::env::var("SPOTIFY_WARM_PLAYER").is_ok_and(|v| silicon_spotify_client::is_off(&v)) {
         // Copies left by earlier daemons would still hold the port and answer from stale state.
         let dir = daemon.dir.clone();
         off_thread(move || reap_stale(&dir, None), Vec::new()).await;

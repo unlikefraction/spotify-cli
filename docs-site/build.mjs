@@ -1,6 +1,6 @@
 // Builds spotify.unlikefraction.com: a landing page, one page per guide in ../docs, install.sh,
 // llms.txt, search-index.json, sitemap.xml, robots.txt and 404.html. Pages are readable without
-// JavaScript; site.js only adds copy buttons, search and the telemetry toggle.
+// JavaScript; site.js only adds copy buttons and search.
 import { readFileSync, writeFileSync, mkdirSync, rmSync, copyFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,7 +24,6 @@ const topics = [
   ["errors", "Errors", "Using it"],
   ["daemon", "The daemon", "How it works"],
   ["ting", "Ting integration", "How it works"],
-  ["telemetry", "Telemetry", "How it works"],
   ["development", "Building on it", "Develop"],
   ["api", "Backend API", "Develop"],
   ["versioning", "Versioning", "Develop"],
@@ -143,7 +142,6 @@ function shell({ title, description, body, path, nav = "" }) {
 ${body}
 <footer class="foot">
   <span>spotify-cli ${esc(version)} · open source · <a href="${repo}">${repo.replace("https://", "")}</a> · <a href="/llms.txt">llms.txt</a> · <a href="/docs/versioning/">Version policy</a></span>
-  <div class="telemetry" hidden><label><input type="checkbox" id="telemetry-toggle">Anonymous usage stats<span id="telemetry-note">: page path, referrer host, window size; no cookies</span></label> <a href="/docs/telemetry/">Details</a></div>
 </footer>
 <script src="/site.js" defer></script>
 <script src="/account.js" defer></script>

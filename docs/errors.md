@@ -164,7 +164,7 @@ by HTTP status:
 | 404 | `not_found` | no such route, or Ting does not know the type |
 | 405 | `method_not_allowed` | the route exists but not for this method; the `Allow` header lists the methods it accepts |
 | 409 | `conflict` | an `Idempotency-Key` was reused with a different request; retry the original request with its original key |
-| 413 | `payload_too_large` | the body is over 512 KiB, or a telemetry batch is over 64 KiB; send less or split it |
+| 413 | `payload_too_large` | the body is over 512 KiB; shorten the report or its attachments |
 | 429 | `rate_limited` | slow down; `retryable: true` |
 | 500 | `internal` | a bug; report it with the `X-Request-Id` |
 | 503 | `dependency_unavailable` | Silicon Accounts or Ting is unreachable or refused the backend's own credentials; `retryable: true` |

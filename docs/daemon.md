@@ -14,7 +14,6 @@ What it does:
 | Managed queue | hands over to the next queued item at the end of each song, resumes the interrupted context; `next`, `play <item>`, `previous` and hand-offs reach Spotify one at a time, never interleaved. When a hand-off brings Spotify.app to the front, the focus goes back (`keep_spotify_in_background`) |
 | Warm spotify_player | keeps one headless instance on a pseudo-terminal so Web API calls take ~20 ms, with its view of playback refreshed every 20 s ([below](#the-warm-spotify-player)) |
 | Library reads | retries a library or playlist read once after a network blip, and makes reads right after a change wait until they can see it ([below](#library-and-playlist-reads)) |
-| Telemetry relay | relays CLI and daemon events to the backend every minute, draining the whole backlog (when enabled) |
 | Updates | checks GitHub releases hourly and installs verified updates (script installs; Silicon Apps updates its own installs) |
 
 ## Commands
@@ -208,9 +207,6 @@ the same user. The daemon holds no credentials of its own; Silicon sessions stay
 It reads spotify_player's cached Spotify access tokens only for what spotify_player has no
 command for or cannot do: starting songs, episodes, shows and Liked Songs in the background, a
 search when spotify_player's fails, and a few lookups (`spotify docs auth`).
-It sends them only to `api.spotify.com` and never logs them. It never sends lyrics, titles,
-search queries or notes to telemetry.
-
-Telemetry (`spotify docs telemetry`) waits in `daemon.sqlite` (at most 2 000 events). Every minute
-the daemon relays all of it, in requests of at most 40 events and 64 KiB, and keeps the rest for
-the next minute when the backend cannot be reached.
+It sends them only to `api.spotify.com` and never logs them. The CLI, daemon, backend, and
+website do not collect or send usage analytics or diagnostic events. Updating the daemon
+removes its old event backlog.

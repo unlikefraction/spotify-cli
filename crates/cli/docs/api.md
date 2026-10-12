@@ -16,6 +16,6 @@ Token mutations send `Idempotency-Key`. Reuse the same key after a lost response
 
 Session responses contain `access_token`, `refresh_token`, `expires_in`, `refresh_token_expires_at`, and the account identity. Never log these token fields. Browser CORS is restricted to configured frontend origins. Authorization-code redirects must be registered in Silicon Accounts and allowed by the backend.
 
-Playback stays local to the Mac. The backend handles identity, Ting delivery, bug reports, and telemetry. Ting calls use account-bound App verification and User verification; an incompatible or unavailable provider returns a clear dependency error and retains queued work.
+Playback stays local to the Mac. The backend handles identity, Ting delivery, and bug reports. Ting calls use account-bound App verification and User verification; an incompatible or unavailable provider returns a clear dependency error and retains queued work.
 
 Errors are structured objects with a code, message, and recovery hint. An outage is not a logout. See [Authentication](auth.md) for client session handling.

@@ -4,7 +4,7 @@
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$root/crates/cli/docs"
-for topic in usage triggers playback queue auth config daemon errors ting development api telemetry versioning; do
+for topic in usage triggers playback queue auth config daemon errors ting development api versioning; do
   cp "$root/docs/$topic.md" "$root/crates/cli/docs/$topic.md"
 done
 if [ "${1:-}" = "--check" ]; then

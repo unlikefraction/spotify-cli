@@ -23,7 +23,6 @@ fn request(ctx: Option<&Ctx>, op: &str, args: Value) -> Request {
         home: ctx.map(|c| c.home.key()),
         args,
         client_version: VERSION.to_owned(),
-        trace_id: ctx.map(|c| c.trace_id.clone()),
         isi: ctx.and_then(|c| c.isi.clone()),
     }
 }
@@ -70,7 +69,7 @@ pub async fn ensure(ctx: &Ctx) -> Result<()> {
         return Err(Error::platform_unsupported("Controlling Spotify"));
     }
     let autostart = !std::env::var("SPOTIFY_DAEMON_AUTOSTART")
-        .is_ok_and(|v| silicon_spotify_client::telemetry::is_off(&v));
+        .is_ok_and(|v| silicon_spotify_client::is_off(&v));
     match probe().await {
         Err(error) if error.code == "daemon_unavailable" && !autostart => {
             Err(Error::daemon_unavailable(
@@ -638,39 +637,5 @@ pub async fn status_if_running(timeout: Duration) -> Found {
         Ok(Err(error)) if error.code == "daemon_unavailable" => Found::NotRunning,
         Ok(Err(error)) => Found::NotAnswering(error.code),
         Err(_) => Found::NotAnswering("timeout".into()),
-    }
-}
-
-/// Calls the daemon only if it is already running (never starts one).
-pub async fn call_if_running(ctx: &Ctx, op: &str, args: Value) -> Option<Value> {
-    if probe().await.is_err() {
-        return None;
-    }
-    ipc::call(&request(Some(ctx), op, args), Duration::from_secs(5))
-        .await
-        .ok()
-}
-
-/// Hands a telemetry event to a running daemon (never starts one just for this).
-pub fn record_telemetry(ctx: &Ctx, event: silicon_spotify_client::telemetry::Event) {
-    let Ok(socket) = ipc::socket_path() else {
-        return;
-    };
-    if !socket.exists() {
-        return;
-    }
-    let Ok(value) = serde_json::to_value(event) else {
-        return;
-    };
-    let request = request(
-        Some(ctx),
-        "telemetry.record",
-        json!({"events": [value], "settings": ctx.settings()}),
-    );
-    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        let _ = runtime.block_on(ipc::call(&request, Duration::from_millis(800)));
     }
 }

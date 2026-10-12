@@ -49,6 +49,7 @@ for attempt in {1..30}; do
     for g in {1..20}; do
       if curl -fsS --connect-timeout 2 --max-time 5 --resolve backend.spotify.unlikefraction.com:443:127.0.0.1 https://backend.spotify.unlikefraction.com/healthz; then
         systemctl start spotify-backup.timer
+        rm -rf -- /var/lib/spotify/telemetry
         printf '\nInstalled %s\n' "$release"
         exit 0
       fi

@@ -426,9 +426,6 @@ pub struct Config {
     /// Backend origin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_url: Option<String>,
-    /// Telemetry opt-in (default true).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub telemetry: Option<bool>,
     /// `auto`, `spotify_player` or `applescript`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<Strategy>,
@@ -470,12 +467,6 @@ pub const CONFIG_KEYS: &[(&str, &str, &str, &str)] = &[
         "string (https origin)",
         crate::DEFAULT_API_URL,
         "spotify-cli backend origin. SPOTIFY_API_URL overrides it.",
-    ),
-    (
-        "telemetry",
-        "boolean",
-        "true",
-        "Send anonymous usage and diagnostics to Space Station. Env kill switches: SPOTIFY_TELEMETRY, SPACE_STATION_TELEMETRY, SILICON_TELEMETRY = 0|false|off|no.",
     ),
     (
         "strategy",
@@ -581,7 +572,7 @@ impl Config {
         let config: Self = serde_json::from_value(merged).map_err(|error| {
             Error::invalid(
                 format!("A value has the wrong type: {error}."),
-                "Check `spotify config keys` for each key's type, e.g. {\"telemetry\": false, \"strategy\": \"applescript\"}.",
+                "Check `spotify config keys` for each key's type, e.g. {\"launch_spotify\": false, \"strategy\": \"applescript\"}.",
             )
         })?;
         for key in &changed {
@@ -668,8 +659,6 @@ impl Config {
     pub fn effective(&self) -> Value {
         json!({
             "api_url": self.api_url(),
-            "telemetry": crate::telemetry::enabled(self.telemetry),
-            "telemetry_configured": self.telemetry.unwrap_or(true),
             "strategy": self.strategy.unwrap_or_default(),
             "launch_spotify": self.launch_spotify.unwrap_or(true),
             "verify_timeout_ms": self.verify_timeout_ms.unwrap_or(2500),
@@ -694,7 +683,7 @@ fn accepts(key: &str) -> (String, &'static str) {
             "an https:// origin (a string)",
             r#""https://backend.spotify.unlikefraction.com""#,
         ),
-        "telemetry" | "launch_spotify" | "keep_spotify_in_background" => ("true or false", "false"),
+        "launch_spotify" | "keep_spotify_in_background" => ("true or false", "false"),
         "strategy" => (
             r#"one of "auto", "spotify_player", "applescript""#,
             r#""applescript""#,
@@ -788,12 +777,12 @@ pub fn strict_object(text: &str) -> Result<Vec<(String, Value)>> {
         }
         Error::invalid(
             format!("Config must be one JSON object: {error}."),
-            "Quote it for the shell, e.g. spotify config set '{\"telemetry\": false, \"strategy\": \"auto\"}'.",
+            "Quote it for the shell, e.g. spotify config set '{\"launch_spotify\": false, \"strategy\": \"auto\"}'.",
         )
     })
 }
 
-/// `search_limit=5`, `telemetry: false` or `a=1, b=x` (assignments where a JSON object belongs)
+/// `search_limit=5`, `launch_spotify: false` or `a=1, b=x` (assignments where a JSON object belongs)
 /// as the JSON object they mean: `{"search_limit": 5}`. Values that are JSON scalars stay as
 /// they are; anything else becomes a string. `None` when `text` is not such a list.
 fn assignments_as_json(text: &str) -> Option<String> {
