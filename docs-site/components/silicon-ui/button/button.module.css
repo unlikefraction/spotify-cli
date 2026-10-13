@@ -1,4 +1,3 @@
-/* Silicon UI: https://ui.teamofsilicons.com/r/button.json (MIT); static HTML adapter. */
 /* Press scale is driven by Motion (whileTap) alone, so transform never gets a CSS transition here. */
 .button { position: relative; display: inline-flex; min-height: var(--control-height-md); align-items: center; justify-content: center; gap: var(--space-related); border: 1px solid transparent; border-radius: var(--radius-control); corner-shape: var(--corner-shape); padding: 0 var(--space-inset); font: inherit; font-size: var(--text-sm); font-weight: 500; line-height: var(--leading-body); white-space: nowrap; cursor: pointer; -webkit-tap-highlight-color: transparent; transition: color var(--duration-fast) var(--ease-standard), background var(--duration-fast) var(--ease-standard), border-color var(--duration-fast) var(--ease-standard), opacity var(--duration-fast) var(--ease-standard), box-shadow var(--duration-fast) var(--ease-standard); }
 .button:disabled { cursor: not-allowed; opacity: .52; }
@@ -38,6 +37,3 @@
 .loadingLabel { opacity: 0; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .button { transition: none; } .labelSlot { transition: opacity var(--duration-instant) linear; } .spinner { animation-duration: .01ms; animation-iteration-count: 1; } }
-
-.button:active { transform: scale(.97); }
-@media (prefers-reduced-motion: reduce) { .button:active { transform: none; } }

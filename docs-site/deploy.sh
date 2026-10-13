@@ -2,9 +2,11 @@
 # Builds the site and deploys the static output to Vercel (project spotify-cli, domain
 # spotify.unlikefraction.com). Usage: docs-site/deploy.sh [--prod]
 set -eu
+export VERCEL_TELEMETRY_DISABLED=1
 cd "$(dirname "$0")"
-node build.mjs
-node check.mjs
+npm ci
+npm run build
+npm run check
 cp vercel.json dist/vercel.json
 VERCEL=${VERCEL:-$(command -v vercel || ls "$HOME"/.npm/_npx/*/node_modules/.bin/vercel 2>/dev/null | head -1)}
 SCOPE=${VERCEL_SCOPE:-shubham-guptas-projects-7ecb7811}

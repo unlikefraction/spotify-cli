@@ -11,3 +11,8 @@ dist/
 # the owner's private spec notes (design lives in ARCHITECTURE.md)
 /understanding.md
 /iam.md
+
+# Next.js generated types and build cache
+docs-site/.next/
+docs-site/next-env.d.ts
+docs-site/tsconfig.tsbuildinfo

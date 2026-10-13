@@ -1,0 +1,38 @@
+[
+  {
+    "title": "Every control",
+    "description": "Play anything by link, URI or search. Pause, skip, seek, volume, shuffle, repeat, likes, devices, playlists, podcasts, and a real queue you can reorder and trim.",
+    "code": "spotify play --search 'arctic monkeys 505'\nspotify seek 50%\nspotify queue add spotify:track:\u2026 --next\nspotify playlist create 'Deep focus'",
+    "language": "sh"
+  },
+  {
+    "title": "Lyrics of any song",
+    "description": "The song playing now, or any track by URI, link or id. Nothing has to play, and Spotify does not need to be open. Only know its name? Search for the track, then pass its URI.",
+    "code": "spotify lyrics\nspotify lyrics \\\n  spotify:track:0BxE4FqsDD1Ot4YuBXwAPp\nspotify search 'bohemian rhapsody' \\\n  --type track",
+    "language": "sh"
+  },
+  {
+    "title": "Find anything",
+    "description": "Ask in plain words, offline. spotify alone shows what is set up and what to try, --help groups every command by goal with an example, and each result suggests what comes next. Tab completion for zsh, bash, fish and PowerShell, with install lines that work as they are.",
+    "code": "spotify how \"play my liked songs shuffled\"\nspotify --help\nspotify completions --help",
+    "language": "sh"
+  },
+  {
+    "title": "Out of your way, and verified",
+    "description": "Every start goes through the Spotify Web API first, so Spotify.app stays in the background, a song's album plays on after it, and a speaker you picked keeps playing. Every effect is checked against Spotify.app; if AppleScript has to step in, your app gets the focus back. The result says which path worked and why.",
+    "code": "{\"action\": \"play\", \"via\": \"web_api\",\n \"playback\": {\"state\": \"playing\", \u2026}}",
+    "language": "json"
+  },
+  {
+    "title": "Triggers through Ting",
+    "description": "Checkpoints by time left, time played, percentage, song end or song change. Firings are durable, retried, never duplicated, and carry your note and ISI.",
+    "code": "spotify trigger add --remaining 30s \\\n  --note 'wrap up the call'\nspotify trigger add --end --scope every",
+    "language": "sh"
+  },
+  {
+    "title": "Describes itself",
+    "description": "One JSON manifest holds every command: arguments with types, allowed values and defaults, examples, output fields, error codes with exit codes, what each needs (daemon, Spotify.app, login, Premium) and whether it changes anything.",
+    "code": "spotify commands --json | jq \\\n  '.commands[] | select(.path == \"lyrics\")'",
+    "language": "sh"
+  }
+]

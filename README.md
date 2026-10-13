@@ -90,8 +90,9 @@ More: [Find anything](docs/usage.md#2-find-anything).
 cargo check --workspace --locked
 cp .env.example .env                 # configure your Silicon Accounts app
 cargo run -p silicon-spotify --bin spotify-api
-node docs-site/build.mjs
-node docs-site/check.mjs
+npm --prefix docs-site ci
+npm --prefix docs-site run build
+npm --prefix docs-site run check
 scripts/package-release.sh      # all six targets + Silicon Apps package
 ```
 

@@ -15,7 +15,7 @@ crates/cli      silicon-spotify-cli      the `spotify` command
 crates/daemon   silicon-spotify-daemon   `spotify-daemon` (macOS: objc2 NSAppleScript + notifications)
 src/            silicon-spotify          backend (`spotify-api`): Silicon Accounts exchange, Ting, reports
 docs/           these guides (bundled into the CLI by scripts/sync-cli-docs.sh)
-docs-site/      static site generator for spotify.unlikefraction.com (+ install.sh)
+docs-site/      Next.js App Router static export with native Silicon UI (+ install.sh)
 deploy/         backend deployment (systemd, Caddy, CloudFormation), Silicon Apps and Ting setup
 ```
 
